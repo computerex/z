@@ -112,10 +112,14 @@ new code here
 Description: Request to execute a CLI command on the system. Use this when you need to perform system operations or run specific commands to accomplish any step in the user's task. You must tailor your command to the user's system and provide a clear explanation of what the command does. Commands will be executed in the current working directory: {workspace_path}
 Parameters:
 - command: (required) The CLI command to execute. This should be valid for the current operating system. Ensure the command is properly formatted and does not contain any harmful instructions.
+- background: (optional) Set to "true" to run long-running commands (servers, watchers) in the background. The system will auto-detect server commands and background them automatically.
 Usage:
 <execute_command>
 <command>Your command here</command>
+<background>true</background>
 </execute_command>
+
+NOTE: Server commands (flask run, npm start, uvicorn, etc.) are automatically run in background mode. You'll get initial output and can continue working while the server runs.
 
 ## list_files
 Description: Request to list files and directories within the specified directory. If recursive is true, it will list all files and directories recursively. If recursive is false or not specified, it will only list the top-level contents.

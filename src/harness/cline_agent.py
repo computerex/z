@@ -85,6 +85,19 @@ class ClineAgent:
         # Conversation history
         self.messages: List[StreamingMessage] = []
         self._initialized = False
+        
+        # Background processes
+        self._background_procs: Dict[int, asyncio.subprocess.Process] = {}
+    
+    def cleanup_background_procs(self) -> None:
+        """Terminate all background processes."""
+        for pid, proc in list(self._background_procs.items()):
+            try:
+                if proc.returncode is None:
+                    proc.terminate()
+            except:
+                pass
+        self._background_procs.clear()
     
     def save_session(self, path: str) -> None:
         """Save conversation history."""
@@ -325,54 +338,106 @@ class ClineAgent:
         return f"Successfully made {changes} replacement(s) in {path}"
     
     async def _execute_command(self, params: Dict[str, str]) -> str:
-        """Execute a shell command with live output display."""
+        """Execute a shell command with live output display and interrupt support."""
         command = params.get("command", "")
+        background = params.get("background", "").lower() == "true"
+        
+        # Detect server-like commands that should run in background
+        server_patterns = [
+            'flask run', 'python.*app.py', 'npm start', 'npm run dev',
+            'node server', 'uvicorn', 'gunicorn', 'python -m http.server',
+            'ng serve', 'yarn start', 'yarn dev', 'vite', 'next dev',
+            'python manage.py runserver', 'rails server', 'rails s',
+        ]
+        
+        import re as regex_module
+        is_server_command = any(regex_module.search(p, command, regex_module.IGNORECASE) for p in server_patterns)
+        
+        if is_server_command and not background:
+            background = True
+            self.console.print(f"[yellow]⚠️  Detected server command - running in background[/yellow]")
         
         # Show command being executed
         print()
-        self.console.print(f"[dim]$ {command}[/dim]")
+        mode_indicator = "[bg] " if background else ""
+        self.console.print(f"[dim]$ {mode_indicator}{command}[/dim]")
         
+        if background:
+            # Run in background - don't wait for completion
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=self.workspace_path,
+            )
+            
+            # Store background process
+            proc_id = len(self._background_procs) + 1
+            self._background_procs[proc_id] = proc
+            
+            # Wait briefly to capture initial output
+            output_lines = []
+            try:
+                for _ in range(20):  # Read up to 20 lines or 2 seconds
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
+                    if not line:
+                        break
+                    decoded = line.decode("utf-8", errors="replace").rstrip()
+                    output_lines.append(decoded)
+                    self.console.print(f"[dim]  {decoded}[/dim]")
+            except asyncio.TimeoutError:
+                pass
+            
+            self.console.print(f"[green]↳ Running in background (PID: {proc.pid})[/green]")
+            return f"Command started in background (PID: {proc.pid}).\nInitial output:\n" + "\n".join(output_lines[-10:])
+        
+        # Foreground execution with interrupt support
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout
+            stderr=asyncio.subprocess.STDOUT,
             cwd=self.workspace_path,
         )
         
         output_lines = []
+        interrupted = False
+        
         try:
-            # Stream output in real-time
+            # Stream output in real-time with interrupt checking
             while True:
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(),
-                    timeout=120
-                )
+                # Check for interrupt
+                if is_interrupted():
+                    interrupted = True
+                    proc.terminate()
+                    self.console.print(f"\n[yellow]⏹️  Command interrupted[/yellow]")
+                    break
+                
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                    
                 if not line:
                     break
                     
                 decoded = line.decode("utf-8", errors="replace").rstrip()
                 output_lines.append(decoded)
-                
-                # Print with dim styling and indentation
                 self.console.print(f"[dim]  {decoded}[/dim]")
             
-            await proc.wait()
+            if not interrupted:
+                await proc.wait()
+                exit_code = proc.returncode
+                
+                if exit_code == 0:
+                    self.console.print(f"[green]✓ Exit code: {exit_code}[/green]")
+                else:
+                    self.console.print(f"[red]✗ Exit code: {exit_code}[/red]")
             
-            exit_code = proc.returncode
-            full_output = "\n".join(output_lines)
+            return "\n".join(output_lines)[:15000] or "(no output)"
             
-            # Show exit status
-            if exit_code == 0:
-                self.console.print(f"[green]✓ Exit code: {exit_code}[/green]")
-            else:
-                self.console.print(f"[red]✗ Exit code: {exit_code}[/red]")
-            
-            return full_output[:15000] or "(no output)"
-            
-        except asyncio.TimeoutError:
+        except Exception as e:
             proc.kill()
-            self.console.print("[red]✗ Command timed out after 120s[/red]")
-            return "Error: Command timed out after 120s"
+            return f"Error: {str(e)}"
     
     async def _list_files(self, params: Dict[str, str]) -> str:
         path = self._resolve_path(params.get("path", "."))

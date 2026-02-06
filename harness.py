@@ -138,6 +138,7 @@ def main():
             print("No input provided.", file=sys.stderr)
             sys.exit(1)
         asyncio.run(run_single(agent, user_input, console))
+        agent.cleanup_background_procs()
         agent.save_session(str(session_path))
     else:
         # Interactive mode
@@ -158,6 +159,7 @@ def main():
                     cmd_arg = parts[1] if len(parts) > 1 else ""
                     
                     if cmd in ('/exit', '/quit', '/q'):
+                        agent.cleanup_background_procs()
                         agent.save_session(str(session_path))
                         console.print("[dim]Session saved.[/dim]")
                         break
@@ -231,10 +233,12 @@ def main():
                 print()  # Blank line between requests
                 
             except KeyboardInterrupt:
+                agent.cleanup_background_procs()
                 agent.save_session(str(session_path))
                 console.print("\n[dim]Session saved. Exiting...[/dim]")
                 break
             except EOFError:
+                agent.cleanup_background_procs()
                 agent.save_session(str(session_path))
                 break
 
