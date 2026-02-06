@@ -1086,8 +1086,11 @@ class ClineAgent:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         
         # Foreground execution with interrupt/background/timeout support
+        # IMPORTANT: stdin=DEVNULL prevents interactive commands from stealing
+        # keyboard input, which would make Esc/Ctrl+C not work for interrupting.
         proc = await asyncio.create_subprocess_shell(
             command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.workspace_path,
@@ -1201,6 +1204,7 @@ class ClineAgent:
         
         proc = await asyncio.create_subprocess_shell(
             command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.workspace_path,
