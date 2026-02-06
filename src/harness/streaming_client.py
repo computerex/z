@@ -34,6 +34,7 @@ class StreamingChatResponse:
     usage: Dict[str, int] = field(default_factory=dict)
     raw_json: str = ""
     finish_reason: str = "stop"
+    interrupted: bool = False
     
     @property
     def is_truncated(self) -> bool:
@@ -260,6 +261,7 @@ class StreamingJSONClient:
         messages: List[StreamingMessage],
         on_content: Optional[Callable[[str], None]] = None,
         max_retries: int = 5,
+        check_interrupt: Optional[Callable[[], bool]] = None,
     ) -> StreamingChatResponse:
         """Stream raw text response (no JSON parsing) - for XML tool format."""
         
@@ -280,6 +282,7 @@ class StreamingJSONClient:
                 full_content = ""
                 usage = {}
                 finish_reason = "stop"
+                interrupted = False
                 
                 async with self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
@@ -288,6 +291,12 @@ class StreamingJSONClient:
                     
                     line_buffer = ""
                     async for chunk in response.aiter_bytes():
+                        # Check for interrupt
+                        if check_interrupt and check_interrupt():
+                            interrupted = True
+                            finish_reason = "interrupted"
+                            break
+                        
                         line_buffer += chunk.decode('utf-8', errors='ignore')
                         
                         while '\n' in line_buffer:
@@ -326,6 +335,7 @@ class StreamingJSONClient:
                     raw_json=full_content,
                     usage=usage,
                     finish_reason=finish_reason,
+                    interrupted=interrupted,
                 )
                 
             except httpx.HTTPStatusError as e:

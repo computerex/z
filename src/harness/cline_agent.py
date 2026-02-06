@@ -14,6 +14,7 @@ from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
 from .prompts import get_system_prompt
 from .cost_tracker import get_global_tracker
+from .interrupt import is_interrupted, reset_interrupt, start_monitoring, stop_monitoring
 
 
 @dataclass
@@ -110,7 +111,7 @@ class ClineAgent:
         self.messages = []
         self._initialized = False
     
-    async def run(self, user_input: str) -> str:
+    async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
         """Run the agent with streaming output."""
         
         # Initialize system prompt if first run
@@ -123,6 +124,18 @@ class ClineAgent:
         # Add user message
         self.messages.append(StreamingMessage(role="user", content=user_input))
         
+        # Start keyboard monitoring for escape key
+        if enable_interrupt and sys.stdin.isatty():
+            start_monitoring()
+        
+        try:
+            return await self._run_loop()
+        finally:
+            if enable_interrupt:
+                stop_monitoring()
+    
+    async def _run_loop(self) -> str:
+        """Main agent loop."""
         async with StreamingJSONClient(
             api_key=self.config.api_key,
             base_url=self.config.api_url,
@@ -132,6 +145,9 @@ class ClineAgent:
         ) as client:
             
             for iteration in range(self.max_iterations):
+                # Reset interrupt state for this iteration
+                reset_interrupt()
+                
                 print("", end="", flush=True)
                 
                 full_content = ""
@@ -146,9 +162,21 @@ class ClineAgent:
                 response = await client.chat_stream_raw(
                     messages=self.messages,
                     on_content=on_chunk,
+                    check_interrupt=is_interrupted,
                 )
                 
                 print()  # Newline after stream
+                
+                # Handle interrupt
+                if response.interrupted:
+                    print("\n⏹️  Interrupted")
+                    # Save partial response to history
+                    if full_content.strip():
+                        self.messages.append(StreamingMessage(
+                            role="assistant", 
+                            content=full_content + "\n[interrupted by user]"
+                        ))
+                    return "[Interrupted - press Enter to continue or type new request]"
                 
                 full_content = response.content or full_content
                 

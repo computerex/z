@@ -141,7 +141,7 @@ def main():
         agent.save_session(str(session_path))
     else:
         # Interactive mode
-        console.print("[bold blue]Harness[/bold blue] - Commands: /sessions, /session <name>, /clear, /exit")
+        console.print("[bold blue]Harness[/bold blue] - Press [bold]Esc[/bold] to interrupt | Commands: /sessions, /session, /clear, /exit")
         console.print(f"[dim]Workspace: {workspace}[/dim]\n")
         
         while True:
