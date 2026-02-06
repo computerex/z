@@ -5,9 +5,10 @@ import sys
 import platform
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from rich.console import Console
 
 from .streaming_client import StreamingJSONClient, StreamingMessage
@@ -15,6 +16,100 @@ from .config import Config
 from .prompts import get_system_prompt
 from .cost_tracker import get_global_tracker
 from .interrupt import is_interrupted, is_background_requested, reset_interrupt, start_monitoring, stop_monitoring
+from .context_management import (
+    estimate_tokens, estimate_messages_tokens, get_model_limits,
+    truncate_conversation, truncate_output, truncate_file_content,
+    DuplicateDetector
+)
+
+
+@dataclass
+class ContextItem:
+    """An item in the agent's context container."""
+    id: int
+    type: str  # 'file', 'fragment', 'command_output', 'search_result'
+    source: str  # path or command
+    content: str
+    added_at: float = field(default_factory=time.time)
+    line_range: Optional[Tuple[int, int]] = None  # for file fragments
+    
+    def summary(self) -> str:
+        """Return a short summary of this item."""
+        lines = len(self.content.splitlines())
+        size = len(self.content)
+        age = int(time.time() - self.added_at)
+        age_str = f"{age}s" if age < 60 else f"{age//60}m"
+        
+        if self.type == 'file':
+            if self.line_range:
+                return f"[{self.id}] file: {self.source} (L{self.line_range[0]}-{self.line_range[1]}, {lines}L, {size}B, {age_str} ago)"
+            return f"[{self.id}] file: {self.source} ({lines}L, {size}B, {age_str} ago)"
+        elif self.type == 'command_output':
+            cmd_short = self.source[:40] + '...' if len(self.source) > 40 else self.source
+            return f"[{self.id}] cmd: {cmd_short} ({lines}L, {size}B, {age_str} ago)"
+        elif self.type == 'search_result':
+            return f"[{self.id}] search: {self.source} ({lines} matches, {age_str} ago)"
+        else:
+            return f"[{self.id}] {self.type}: {self.source} ({lines}L, {age_str} ago)"
+
+
+class ContextContainer:
+    """Manages the agent's working context."""
+    
+    def __init__(self):
+        self._items: Dict[int, ContextItem] = {}
+        self._next_id = 1
+    
+    def add(self, type: str, source: str, content: str, line_range: Optional[Tuple[int, int]] = None) -> int:
+        """Add an item to context. Returns the item ID."""
+        item_id = self._next_id
+        self._next_id += 1
+        self._items[item_id] = ContextItem(
+            id=item_id,
+            type=type,
+            source=source,
+            content=content,
+            line_range=line_range
+        )
+        return item_id
+    
+    def remove(self, item_id: int) -> bool:
+        """Remove an item from context."""
+        if item_id in self._items:
+            del self._items[item_id]
+            return True
+        return False
+    
+    def remove_by_source(self, source: str) -> int:
+        """Remove all items with matching source. Returns count removed."""
+        to_remove = [id for id, item in self._items.items() if source in item.source]
+        for id in to_remove:
+            del self._items[id]
+        return len(to_remove)
+    
+    def get(self, item_id: int) -> Optional[ContextItem]:
+        return self._items.get(item_id)
+    
+    def list_items(self) -> List[ContextItem]:
+        return list(self._items.values())
+    
+    def total_size(self) -> int:
+        """Total character count of all context items."""
+        return sum(len(item.content) for item in self._items.values())
+    
+    def summary(self) -> str:
+        """Return a summary of all context items."""
+        if not self._items:
+            return "Context is empty."
+        
+        lines = [f"Context ({len(self._items)} items, {self.total_size():,} chars):"]
+        for item in sorted(self._items.values(), key=lambda x: x.added_at):
+            lines.append(f"  {item.summary()}")
+        return "\n".join(lines)
+    
+    def clear(self):
+        self._items.clear()
+        self._next_id = 1
 
 
 @dataclass
@@ -29,6 +124,8 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     tool_names = [
         'read_file', 'write_to_file', 'replace_in_file',
         'execute_command', 'list_files', 'search_files',
+        'check_background_process', 'stop_background_process', 'list_background_processes',
+        'list_context', 'remove_from_context',
         'attempt_completion'
     ]
     
@@ -40,13 +137,17 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
             inner = match.group(1)
             params = {}
             
-            # Parse each parameter tag
+            # Parse each parameter tag - collect multiple values for same param
             param_pattern = r'<(\w+)>(.*?)</\1>'
             for m in re.finditer(param_pattern, inner, re.DOTALL):
                 name, value = m.groups()
                 # Clean up value - strip outer newlines but preserve internal structure
                 value = value.strip('\n')
-                params[name] = value
+                # If param already exists, append as comma-separated
+                if name in params:
+                    params[name] = params[name] + "," + value
+                else:
+                    params[name] = value
             
             return ParsedToolCall(name=tool_name, parameters=params)
     
@@ -86,43 +187,167 @@ class ClineAgent:
         self.messages: List[StreamingMessage] = []
         self._initialized = False
         
-        # Background processes
-        self._background_procs: Dict[int, asyncio.subprocess.Process] = {}
+        # Context container for managing loaded content
+        self.context = ContextContainer()
+        
+        # Duplicate file detection
+        self._duplicate_detector = DuplicateDetector()
+        
+        # Token tracking
+        self._last_token_count = 0
+        
+        # Background processes: {id: {"proc": Process, "command": str, "started": float, "logs": list, "task": Task}}
+        self._background_procs: Dict[int, dict] = {}
+        self._next_bg_id = 1
+    
+    async def _background_log_reader(self, bg_id: int, proc: asyncio.subprocess.Process):
+        """Continuously read output from a background process."""
+        info = self._background_procs.get(bg_id)
+        if not info:
+            return
+        
+        try:
+            while True:
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        break
+                    continue
+                
+                if not line:
+                    break
+                
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                # Keep last 500 lines
+                info["logs"].append(decoded)
+                if len(info["logs"]) > 500:
+                    info["logs"] = info["logs"][-500:]
+        except Exception:
+            pass
     
     def cleanup_background_procs(self) -> None:
-        """Terminate all background processes."""
-        for pid, proc in list(self._background_procs.items()):
+        """Terminate all background processes safely."""
+        for pid, info in list(self._background_procs.items()):
             try:
+                proc = info["proc"]
                 if proc.returncode is None:
-                    proc.terminate()
-            except:
+                    # On Windows, use taskkill to kill the entire process tree
+                    # This prevents zombie multiprocessing children
+                    if platform.system() == "Windows":
+                        try:
+                            os.system(f'taskkill /F /T /PID {proc.pid} >nul 2>&1')
+                        except:
+                            try:
+                                proc.terminate()
+                            except:
+                                pass
+                    else:
+                        try:
+                            proc.terminate()
+                        except:
+                            pass
+                # Cancel the log reader task
+                if "task" in info and info["task"]:
+                    try:
+                        info["task"].cancel()
+                    except:
+                        pass
+            except Exception:
                 pass
         self._background_procs.clear()
     
+    def list_background_procs(self) -> List[dict]:
+        """List all background processes with their status."""
+        import time
+        result = []
+        for bg_id, info in self._background_procs.items():
+            proc = info["proc"]
+            elapsed = time.time() - info["started"]
+            status = "running" if proc.returncode is None else f"exited ({proc.returncode})"
+            result.append({
+                "id": bg_id,
+                "pid": proc.pid,
+                "command": info["command"][:50],
+                "elapsed": elapsed,
+                "status": status
+            })
+        return result
+    
     def save_session(self, path: str) -> None:
-        """Save conversation history."""
+        """Save conversation history and context."""
         import json
+        # Serialize context items
+        context_items = []
+        for item in self.context.list_items():
+            context_items.append({
+                "id": item.id,
+                "type": item.type,
+                "source": item.source,
+                "content": item.content,
+                "added_at": item.added_at,
+                "line_range": item.line_range
+            })
+        
         data = {
             "workspace": self.workspace_path,
-            "messages": [{"role": m.role, "content": m.content} for m in self.messages]
+            "messages": [{"role": m.role, "content": m.content} for m in self.messages],
+            "context": context_items,
+            "context_next_id": self.context._next_id
         }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
     
     def load_session(self, path: str) -> bool:
-        """Load conversation history."""
+        """Load conversation history and context."""
         import json
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             self.messages = [StreamingMessage(role=m["role"], content=m["content"]) for m in data["messages"]]
+            
+            # Load context if present
+            if "context" in data:
+                self.context.clear()
+                for item_data in data["context"]:
+                    item = ContextItem(
+                        id=item_data["id"],
+                        type=item_data["type"],
+                        source=item_data["source"],
+                        content=item_data["content"],
+                        added_at=item_data.get("added_at", time.time()),
+                        line_range=tuple(item_data["line_range"]) if item_data.get("line_range") else None
+                    )
+                    self.context._items[item.id] = item
+                self.context._next_id = data.get("context_next_id", max(self.context._items.keys(), default=0) + 1)
+            
             self._initialized = True
             return True
         except:
             return False
     
     def clear_history(self) -> None:
-        """Clear conversation history."""
+        """Clear conversation history and context."""
         self.messages = []
+        self.context.clear()
+        self._duplicate_detector.clear()
+        self._last_token_count = 0
         self._initialized = False
+    
+    def get_token_count(self) -> int:
+        """Get estimated token count of current conversation."""
+        return estimate_messages_tokens(self.messages)
+    
+    def get_context_stats(self) -> dict:
+        """Get context statistics for display."""
+        _, max_allowed = get_model_limits(self.config.model)
+        tokens = self.get_token_count()
+        return {
+            "tokens": tokens,
+            "max_allowed": max_allowed,
+            "percent": (tokens / max_allowed * 100) if max_allowed > 0 else 0,
+            "messages": len(self.messages),
+            "context_items": len(self.context.list_items()),
+            "context_chars": self.context.total_size(),
+        }
     
     async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
         """Run the agent with streaming output."""
@@ -157,9 +382,32 @@ class ClineAgent:
             max_tokens=self.config.max_tokens,
         ) as client:
             
+            # Get model limits for auto-truncation
+            _, max_allowed = get_model_limits(self.config.model)
+            
             for iteration in range(self.max_iterations):
-                # Reset interrupt state for this iteration
-                reset_interrupt()
+                # Check for interrupt BEFORE starting new iteration
+                # This ensures user can stop between iterations
+                if is_interrupted():
+                    self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
+                    return "[Interrupted - session preserved. Type to continue or start new request]"
+                
+                # Reset only background flag (not interrupt) for this iteration
+                # User needs to explicitly continue after interrupt
+                
+                # Check if we need to truncate conversation
+                self._last_token_count = estimate_messages_tokens(self.messages)
+                if self._last_token_count > max_allowed:
+                    # Determine aggressiveness based on how far over we are
+                    if self._last_token_count > max_allowed * 1.5:
+                        strategy = "quarter"  # 75% removal
+                    else:
+                        strategy = "half"  # 50% removal
+                    
+                    result = truncate_conversation(self.messages, strategy)
+                    self.messages = result.messages
+                    self._last_token_count = estimate_messages_tokens(self.messages)
+                    self.console.print(f"[dim][!] Context truncated: removed {result.removed_count} messages ({strategy})[/dim]")
                 
                 print("", end="", flush=True)
                 
@@ -182,7 +430,7 @@ class ClineAgent:
                 
                 # Handle interrupt
                 if response.interrupted:
-                    print("\n⏹️  Interrupted")
+                    print("\n[STOP] Interrupted")
                     # Save partial response to history
                     if full_content.strip():
                         self.messages.append(StreamingMessage(
@@ -193,16 +441,27 @@ class ClineAgent:
                 
                 full_content = response.content or full_content
                 
-                # Track usage
+                # Track usage - estimate if API didn't return it
                 if response.usage:
-                    self.cost_tracker.record_call(
-                        model=self.config.model,
-                        input_tokens=response.usage.get("prompt_tokens", 0),
-                        output_tokens=response.usage.get("completion_tokens", 0),
-                        duration_ms=0,
-                        tool_calls=0,
-                        finish_reason="stop",
-                    )
+                    input_tokens = response.usage.get("prompt_tokens", 0)
+                    output_tokens = response.usage.get("completion_tokens", 0)
+                    # DEBUG: Check if API returns zeros
+                    if input_tokens == 0 and output_tokens == 0:
+                        input_tokens = estimate_messages_tokens(self.messages)
+                        output_tokens = estimate_tokens(full_content)
+                else:
+                    # Estimate tokens
+                    input_tokens = estimate_messages_tokens(self.messages)
+                    output_tokens = estimate_tokens(full_content)
+                
+                self.cost_tracker.record_call(
+                    model=self.config.model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    duration_ms=0,
+                    tool_calls=0,
+                    finish_reason="stop",
+                )
                 
                 # Parse XML tool call from content
                 tool_call = parse_xml_tool(full_content)
@@ -223,6 +482,18 @@ class ClineAgent:
                 # Execute the tool
                 tool_result = await self._execute_tool(tool_call)
                 
+                # Check for interrupt after tool execution
+                if is_interrupted():
+                    self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
+                    # Still save the partial conversation
+                    self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                    if tool_result:
+                        self.messages.append(StreamingMessage(
+                            role="user",
+                            content=f"[{tool_call.name} result - interrupted]\n{tool_result[:500]}..."
+                        ))
+                    return "[Interrupted - session preserved. Type to continue or start new request]"
+                
                 # Add to history
                 self.messages.append(StreamingMessage(role="assistant", content=full_content))
                 self.messages.append(StreamingMessage(
@@ -238,14 +509,14 @@ class ClineAgent:
         try:
             if tool.name == "read_file":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[cyan]📄 Reading:[/cyan] {path}")
+                self.console.print(f"[cyan]> Reading:[/cyan] {path}")
                 result = await self._read_file(tool.parameters)
                 lines = result.count('\n') + 1
                 self.console.print(f"[dim]   ({lines} lines)[/dim]")
                 
             elif tool.name == "write_to_file":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[green]📝 Writing:[/green] {path}")
+                self.console.print(f"[green]> Writing:[/green] {path}")
                 result = await self._write_file(tool.parameters)
                 
             elif tool.name == "replace_in_file":
@@ -259,20 +530,45 @@ class ClineAgent:
                 
             elif tool.name == "list_files":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[blue]📁 Listing:[/blue] {path}")
+                self.console.print(f"[blue]> Listing:[/blue] {path}")
                 result = await self._list_files(tool.parameters)
                 count = len(result.splitlines())
                 self.console.print(f"[dim]   ({count} items)[/dim]")
                 
             elif tool.name == "search_files":
                 regex = tool.parameters.get("regex", "")
-                self.console.print(f"[magenta]🔍 Searching:[/magenta] {regex}")
+                self.console.print(f"[magenta]> Searching:[/magenta] {regex}")
                 result = await self._search_files(tool.parameters)
                 matches = len(result.splitlines()) if result != "(no matches)" else 0
                 self.console.print(f"[dim]   ({matches} matches)[/dim]")
                 
+            elif tool.name == "check_background_process":
+                bg_id = tool.parameters.get("id", "")
+                self.console.print(f"[cyan]> Checking background process:[/cyan] {bg_id or 'all'}")
+                result = await self._check_background_process(tool.parameters)
+                
+            elif tool.name == "stop_background_process":
+                bg_id = tool.parameters.get("id", "")
+                self.console.print(f"[red]> Stopping background process:[/red] {bg_id}")
+                result = await self._stop_background_process(tool.parameters)
+                
+            elif tool.name == "list_background_processes":
+                self.console.print(f"[cyan]> Listing background processes[/cyan]")
+                result = await self._list_background_processes(tool.parameters)
+                
+            elif tool.name == "list_context":
+                self.console.print(f"[blue]> Listing context[/blue]")
+                result = self.context.summary()
+                self.console.print(f"[dim]   ({len(self.context.list_items())} items, {self.context.total_size():,} chars)[/dim]")
+                
+            elif tool.name == "remove_from_context":
+                item_id = tool.parameters.get("id", "")
+                source = tool.parameters.get("source", "")
+                self.console.print(f"[yellow]> Removing from context:[/yellow] {item_id or source}")
+                result = self._remove_from_context(tool.parameters)
+                
             elif tool.name == "attempt_completion":
-                self.console.print("[green]✅ Task complete[/green]")
+                self.console.print("[green]> Task complete[/green]")
                 result = "Task completed."
                 
             else:
@@ -281,7 +577,7 @@ class ClineAgent:
             return result
             
         except Exception as e:
-            self.console.print(f"[red]✗ {tool.name}: {e}[/red]")
+            self.console.print(f"[red][X] {tool.name}: {e}[/red]")
             return f"Error: {str(e)}"
     
     def _resolve_path(self, path: str) -> Path:
@@ -297,12 +593,68 @@ class ClineAgent:
         if not path.exists():
             return f"Error: File not found: {path}"
         
+        rel_path = str(path.relative_to(self.workspace_path)) if str(path).startswith(self.workspace_path) else str(path)
+        
+        # Check for duplicate reads - replace older ones with notice
+        prev_index = self._duplicate_detector.was_read_before(rel_path)
+        if prev_index is not None:
+            replaced = DuplicateDetector.replace_old_reads(self.messages, rel_path, len(self.messages))
+            if replaced > 0:
+                self.console.print(f"[dim]   (replaced {replaced} older read(s) with notice)[/dim]")
+        
+        # Record this read
+        self._duplicate_detector.record_read(rel_path, len(self.messages))
+        
         content = path.read_text(encoding="utf-8", errors="replace")
+        
+        # Truncate if file is too large
+        content = truncate_file_content(content)
         
         # Add line numbers
         lines = content.splitlines()
         numbered = [f"{i+1:4d} | {line}" for i, line in enumerate(lines)]
-        return "\n".join(numbered)
+        result = "\n".join(numbered)
+        
+        # Add to context container
+        ctx_id = self.context.add("file", rel_path, result)
+        
+        return f"[Context ID: {ctx_id}]\n{result}"
+    
+    def _remove_from_context(self, params: Dict[str, str]) -> str:
+        """Remove items from context by ID(s) or source pattern."""
+        item_id = params.get("id", "")
+        source = params.get("source", "")
+        
+        if item_id:
+            # Handle multiple IDs (comma-separated or from multiple <id> tags)
+            id_strs = [s.strip() for s in item_id.replace('\n', ',').split(',') if s.strip()]
+            removed = []
+            errors = []
+            
+            for id_str in id_strs:
+                try:
+                    id_int = int(id_str)
+                    if self.context.remove(id_int):
+                        removed.append(id_int)
+                    else:
+                        errors.append(f"{id_int} (not found)")
+                except ValueError:
+                    errors.append(f"{id_str} (invalid)")
+            
+            result = []
+            if removed:
+                result.append(f"Removed context items: {', '.join(map(str, removed))}")
+            if errors:
+                result.append(f"Errors: {', '.join(errors)}")
+            return "\n".join(result) if result else "No items removed."
+        elif source:
+            count = self.context.remove_by_source(source)
+            if count > 0:
+                return f"Removed {count} context item(s) matching '{source}'."
+            else:
+                return f"No context items matching '{source}'."
+        else:
+            return "Error: Provide either 'id' or 'source' parameter."
     
     async def _write_file(self, params: Dict[str, str]) -> str:
         path = self._resolve_path(params.get("path", ""))
@@ -340,8 +692,10 @@ class ClineAgent:
     async def _execute_command(self, params: Dict[str, str]) -> str:
         """Execute a shell command with live output display and interrupt support."""
         import time
+        import subprocess
         command = params.get("command", "")
         background = params.get("background", "").lower() == "true"
+        timeout_secs = 120  # Auto-background after this many seconds
         
         # Show command being executed
         print()
@@ -351,42 +705,76 @@ class ClineAgent:
         if background:
             return await self._run_background_command(command)
         
-        # Foreground execution with interrupt/background support
+        # Windows: create new process group to isolate from child process chaos
+        # This prevents multiprocessing fork bombs from taking down the harness
+        creationflags = 0
+        if platform.system() == "Windows":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        
+        # Foreground execution with interrupt/background/timeout support
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.workspace_path,
+            creationflags=creationflags,
         )
         
         output_lines = []
-        interrupted = False
         start_time = time.time()
         hint_shown = False
         
         try:
             while True:
+                elapsed = time.time() - start_time
+                
                 # Check for interrupt (Esc)
                 if is_interrupted():
-                    interrupted = True
                     proc.terminate()
-                    self.console.print(f"\n[yellow]⏹️  Command interrupted[/yellow]")
-                    break
+                    self.console.print(f"\n[yellow][STOP] Command interrupted[/yellow]")
+                    output = "\n".join(output_lines)[:15000]
+                    return f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}" if output else "Command interrupted (no output)"
                 
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
-                    self.console.print(f"\n[cyan]↳ Sending to background...[/cyan]")
-                    # Store process and return
-                    proc_id = len(self._background_procs) + 1
-                    self._background_procs[proc_id] = proc
-                    self.console.print(f"[green]↳ Running in background (PID: {proc.pid})[/green]")
-                    return f"Command sent to background (PID: {proc.pid}).\nOutput so far:\n" + "\n".join(output_lines[-20:])
+                    self.console.print(f"\n[cyan]-> Sending to background...[/cyan]")
+                    proc_id = self._next_bg_id
+                    self._next_bg_id += 1
+                    self._background_procs[proc_id] = {
+                        "proc": proc, 
+                        "command": command, 
+                        "started": start_time,
+                        "logs": output_lines.copy(),
+                        "task": None
+                    }
+                    task = asyncio.create_task(self._background_log_reader(proc_id, proc))
+                    self._background_procs[proc_id]["task"] = task
+                    self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+                    output = "\n".join(output_lines[-30:])
+                    return f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\nUse check_background_process to see logs.\nOutput so far:\n{output}"
                 
-                # Show hint after 5 seconds of running
-                elapsed = time.time() - start_time
+                # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
                     self.console.print(f"[dim]  (Ctrl+B to background, Esc to stop)[/dim]")
                     hint_shown = True
+                
+                # Auto-background after timeout
+                if elapsed > timeout_secs:
+                    self.console.print(f"\n[yellow][TIME] Command running for {timeout_secs}s - auto-backgrounding[/yellow]")
+                    proc_id = self._next_bg_id
+                    self._next_bg_id += 1
+                    self._background_procs[proc_id] = {
+                        "proc": proc, 
+                        "command": command, 
+                        "started": start_time,
+                        "logs": output_lines.copy(),
+                        "task": None
+                    }
+                    task = asyncio.create_task(self._background_log_reader(proc_id, proc))
+                    self._background_procs[proc_id]["task"] = task
+                    self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+                    output = "\n".join(output_lines)[:15000]
+                    return f"Command auto-backgrounded after {timeout_secs}s (ID: {proc_id}, PID: {proc.pid}).\nUse check_background_process to see logs.\nOutput captured:\n{output}" if output else f"Command auto-backgrounded (ID: {proc_id}, PID: {proc.pid}, no output yet)"
                 
                 try:
                     line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
@@ -400,33 +788,50 @@ class ClineAgent:
                 output_lines.append(decoded)
                 self.console.print(f"[dim]  {decoded}[/dim]")
             
-            if not interrupted:
-                await proc.wait()
-                exit_code = proc.returncode
-                
-                if exit_code == 0:
-                    self.console.print(f"[green]✓ Exit code: {exit_code}[/green]")
-                else:
-                    self.console.print(f"[red]✗ Exit code: {exit_code}[/red]")
+            await proc.wait()
+            exit_code = proc.returncode
             
-            return "\n".join(output_lines)[:15000] or "(no output)"
+            if exit_code == 0:
+                self.console.print(f"[green][OK] Exit code: {exit_code}[/green]")
+            else:
+                self.console.print(f"[red][X] Exit code: {exit_code}[/red]")
+            
+            # Truncate long output (keep start and end)
+            raw_output = "\n".join(output_lines) or "(no output)"
+            output = truncate_output(raw_output, max_lines=200, keep_start=50, keep_end=50)
+            
+            # Add to context if significant output
+            if len(output_lines) > 3:
+                ctx_id = self.context.add("command_output", command, output)
+                return f"[Context ID: {ctx_id}]\n{output}"
+            return output
             
         except Exception as e:
             proc.kill()
-            return f"Error: {str(e)}"
+            output = truncate_output("\n".join(output_lines), max_lines=150)
+            return f"Error: {str(e)}\nOutput captured:\n{output}" if output else f"Error: {str(e)}"
     
     async def _run_background_command(self, command: str) -> str:
         """Run a command in background."""
+        import time
+        import subprocess
+        
+        # Windows: create new process group to isolate from child process chaos
+        creationflags = 0
+        if platform.system() == "Windows":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=self.workspace_path,
+            creationflags=creationflags,
         )
         
-        # Store background process
-        proc_id = len(self._background_procs) + 1
-        self._background_procs[proc_id] = proc
+        # Store background process with log buffer
+        proc_id = self._next_bg_id
+        self._next_bg_id += 1
         
         # Wait briefly to capture initial output
         output_lines = []
@@ -441,8 +846,20 @@ class ClineAgent:
         except asyncio.TimeoutError:
             pass
         
-        self.console.print(f"[green]↳ Running in background (PID: {proc.pid})[/green]")
-        return f"Command started in background (PID: {proc.pid}).\nInitial output:\n" + "\n".join(output_lines[-10:])
+        # Store process and start log reader
+        self._background_procs[proc_id] = {
+            "proc": proc, 
+            "command": command, 
+            "started": time.time(),
+            "logs": output_lines.copy(),
+            "task": None
+        }
+        # Start background log reader
+        task = asyncio.create_task(self._background_log_reader(proc_id, proc))
+        self._background_procs[proc_id]["task"] = task
+        
+        self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        return f"Command started in background (ID: {proc_id}, PID: {proc.pid}).\nUse check_background_process to see logs.\nInitial output:\n" + "\n".join(output_lines[-10:])
     
     async def _list_files(self, params: Dict[str, str]) -> str:
         path = self._resolve_path(params.get("path", "."))
@@ -452,20 +869,36 @@ class ClineAgent:
             return f"Error: Directory not found: {path}"
         
         items = []
+        truncated = False
+        max_items = 100 if recursive else 50  # Smaller limits
+        
         try:
             if recursive:
-                for p in sorted(path.rglob("*"))[:500]:
+                for p in sorted(path.rglob("*")):
+                    if len(items) >= max_items:
+                        truncated = True
+                        break
+                    # Skip common junk directories
+                    parts = p.parts
+                    if any(skip in parts for skip in ['node_modules', '.git', '__pycache__', '.venv', 'venv', 'dist', 'build']):
+                        continue
                     rel = p.relative_to(path)
                     suffix = "/" if p.is_dir() else ""
                     items.append(f"{rel}{suffix}")
             else:
-                for p in sorted(path.iterdir())[:200]:
+                for p in sorted(path.iterdir())[:max_items]:
                     suffix = "/" if p.is_dir() else ""
                     items.append(f"{p.name}{suffix}")
+                if len(list(path.iterdir())) > max_items:
+                    truncated = True
         except PermissionError:
             return "Error: Permission denied"
         
-        return "\n".join(items) or "(empty directory)"
+        result = "\n".join(items) or "(empty directory)"
+        if truncated:
+            result += f"\n\n... (truncated at {max_items} items, use more specific path)"
+        
+        return result
     
     async def _search_files(self, params: Dict[str, str]) -> str:
         path = self._resolve_path(params.get("path", "."))
@@ -496,8 +929,108 @@ class ClineAgent:
             if len(results) >= 100:
                 break
         
-        return "\n".join(results) or "(no matches)"
-
+        if not results:
+            return "(no matches)"
+        
+        result = "\n".join(results)
+        # Add to context if significant results
+        if len(results) > 5:
+            ctx_id = self.context.add("search_result", regex, result)
+            return f"[Context ID: {ctx_id}]\n{result}"
+        return result
+    
+    async def _check_background_process(self, params: Dict[str, str]) -> str:
+        """Check status and logs of a background process."""
+        import time
+        bg_id_str = params.get("id", "")
+        lines = int(params.get("lines", "50"))
+        
+        try:
+            bg_id = int(bg_id_str)
+        except ValueError:
+            # List all if no ID given
+            procs = self.list_background_procs()
+            if not procs:
+                return "No background processes running."
+            result = "Background processes:\n"
+            for p in procs:
+                elapsed_min = p['elapsed'] / 60
+                result += f"  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}\n"
+            result += "\nUse check_background_process with id parameter to see logs."
+            return result
+        
+        if bg_id not in self._background_procs:
+            return f"Error: No background process with ID {bg_id}"
+        
+        info = self._background_procs[bg_id]
+        proc = info["proc"]
+        elapsed = time.time() - info["started"]
+        status = "running" if proc.returncode is None else f"exited (code {proc.returncode})"
+        logs = info.get("logs", [])
+        
+        # Get last N lines
+        recent_logs = logs[-lines:] if logs else []
+        
+        result = f"Background Process [{bg_id}]\n"
+        result += f"Command: {info['command']}\n"
+        result += f"PID: {proc.pid}\n"
+        result += f"Status: {status}\n"
+        result += f"Running time: {elapsed:.0f}s\n"
+        result += f"Total log lines: {len(logs)}\n"
+        result += f"\n--- Last {len(recent_logs)} lines ---\n"
+        result += "\n".join(recent_logs) if recent_logs else "(no output yet)"
+        
+        # Add guidance to prevent spam checking
+        if proc.returncode is None:
+            if not recent_logs or len(logs) == info.get('_last_check_lines', 0):
+                result += "\n\n[!] Process still running with no new output. Continue with other tasks instead of re-checking immediately."
+            info['_last_check_lines'] = len(logs)
+        
+        return result
+    
+    async def _stop_background_process(self, params: Dict[str, str]) -> str:
+        """Stop a background process by ID."""
+        bg_id_str = params.get("id", "")
+        
+        try:
+            bg_id = int(bg_id_str)
+        except ValueError:
+            return "Error: ID must be a number"
+        
+        if bg_id not in self._background_procs:
+            return f"Error: No background process with ID {bg_id}"
+        
+        info = self._background_procs[bg_id]
+        proc = info["proc"]
+        
+        if proc.returncode is not None:
+            return f"Process [{bg_id}] already exited with code {proc.returncode}"
+        
+        try:
+            proc.terminate()
+            # Wait briefly for graceful termination
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+        
+        # Cancel log reader
+        if "task" in info and info["task"]:
+            info["task"].cancel()
+        
+        return f"Stopped background process [{bg_id}] (PID: {proc.pid})"
+    
+    async def _list_background_processes(self, params: Dict[str, str]) -> str:
+        """List all background processes."""
+        procs = self.list_background_procs()
+        if not procs:
+            return "No background processes."
+        
+        result = "Background processes:\n"
+        for p in procs:
+            elapsed_min = p['elapsed'] / 60
+            result += f"  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}\n"
+        return result
+    
 
 # Alias for backward compatibility
 StreamingAgent = ClineAgent

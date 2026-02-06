@@ -22,6 +22,17 @@ from harness.cost_tracker import get_global_tracker, reset_global_tracker
 from rich.console import Console
 from rich.panel import Panel
 
+# Multiline input support
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    HAS_PROMPT_TOOLKIT = False
+
 
 def get_sessions_dir(workspace: str) -> Path:
     """Get sessions directory for a workspace."""
@@ -59,22 +70,69 @@ def list_sessions(workspace: str) -> list[tuple[str, datetime, int]]:
     return sessions
 
 
+def create_prompt_session(history_file: Path) -> "PromptSession":
+    """Create a prompt session with multiline support.
+    
+    Keybindings:
+    - Enter: Submit input
+    - Ctrl+Enter: Insert newline (for multiline input)
+    - Paste: Multiline paste works automatically
+    """
+    if not HAS_PROMPT_TOOLKIT:
+        return None
+    
+    bindings = KeyBindings()
+    
+    # Ctrl+Enter inserts newline (Escape+Enter as fallback for terminals that don't support Ctrl+Enter)
+    @bindings.add(Keys.Escape, Keys.Enter)
+    def _(event):
+        """Escape+Enter: insert newline (fallback)."""
+        event.current_buffer.insert_text('\n')
+    
+    @bindings.add('c-j')  # Ctrl+J = Ctrl+Enter in most terminals
+    def _(event):
+        """Ctrl+Enter: insert newline."""
+        event.current_buffer.insert_text('\n')
+    
+    # Create session with history
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    return PromptSession(
+        history=FileHistory(str(history_file)),
+        auto_suggest=AutoSuggestFromHistory(),
+        key_bindings=bindings,
+        multiline=False,  # Enter submits, Ctrl+Enter for newline
+    )
+
+
 async def run_single(agent: ClineAgent, user_input: str, console: Console):
     """Run a single user request."""
-    result = await agent.run(user_input)
+    try:
+        result = await agent.run(user_input)
+    except asyncio.CancelledError:
+        console.print("\n[yellow][STOP] Cancelled[/yellow]")
+        result = "[Interrupted]"
+    except KeyboardInterrupt:
+        console.print("\n[yellow][STOP] Interrupted[/yellow]")
+        result = "[Interrupted]"
     
     # Show final response
     if result:
         console.print()
         console.print(Panel(result, title="Response", border_style="green"))
     
-    # Show cost
+    # Show cost and context stats
     cost = get_global_tracker().get_summary()
+    stats = agent.get_context_stats()
+    
     console.print(Panel(
         f"API Calls: {cost.total_calls}\n"
         f"Tokens: {cost.total_input_tokens:,} in / {cost.total_output_tokens:,} out\n"
-        f"Cost: ${cost.total_cost:.4f}",
-        title="Cost",
+        f"Cost: ${cost.total_cost:.4f}\n"
+        f"───────────────\n"
+        f"Context: {stats['tokens']:,} tokens ({stats['percent']:.0f}% of {stats['max_allowed']:,} limit)\n"
+        f"Messages: {stats['messages']} | Items: {stats['context_items']} ({stats['context_chars']:,} chars)",
+        title="Stats",
         border_style="blue"
     ))
 
@@ -113,6 +171,11 @@ def main():
     config = Config.from_env(harness_dir / ".env")
     config.validate()
     
+    # Create a single persistent event loop for the entire session
+    # This prevents "Event loop is closed" errors when subprocesses are cleaned up
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     console = Console()
     
     # Create agent
@@ -137,18 +200,40 @@ def main():
         if not user_input:
             print("No input provided.", file=sys.stderr)
             sys.exit(1)
-        asyncio.run(run_single(agent, user_input, console))
-        agent.cleanup_background_procs()
-        agent.save_session(str(session_path))
+        try:
+            loop.run_until_complete(run_single(agent, user_input, console))
+        finally:
+            agent.cleanup_background_procs()
+            agent.save_session(str(session_path))
+            loop.close()
     else:
         # Interactive mode
         console.print("[bold blue]Harness[/bold blue] - [bold]Esc[/bold] interrupt | [bold]Ctrl+B[/bold] background | /help for commands")
-        console.print(f"[dim]Workspace: {workspace}[/dim]\n")
+        if HAS_PROMPT_TOOLKIT:
+            console.print("[dim]Ctrl+Enter for newline | Workspace: " + workspace + "[/dim]\n")
+        else:
+            console.print(f"[dim]Workspace: {workspace}[/dim]\n")
+        
+        # Create prompt session for multiline input
+        history_file = get_sessions_dir(workspace) / ".history"
+        prompt_session = create_prompt_session(history_file) if HAS_PROMPT_TOOLKIT else None
         
         while True:
             try:
-                prompt = f"[{current_session}]> "
-                user_input = input(prompt).strip()
+                # Show token count in prompt if significant
+                stats = agent.get_context_stats()
+                token_info = f" [{stats['tokens']//1000}k]" if stats['tokens'] > 1000 else ""
+                prompt_text = f"[{current_session}]{token_info}> "
+                
+                # Get input (multiline with prompt_toolkit, or simple input)
+                if prompt_session:
+                    try:
+                        user_input = prompt_session.prompt(prompt_text).strip()
+                    except KeyboardInterrupt:
+                        continue  # Ctrl+C cancels current input
+                else:
+                    user_input = input(prompt_text).strip()
+                
                 if not user_input:
                     continue
                 
@@ -225,26 +310,61 @@ def main():
                         console.print(f"[dim]Messages: {len(agent.messages)}[/dim]")
                         continue
                     
+                    elif cmd == '/bg':
+                        procs = agent.list_background_procs()
+                        if not procs:
+                            console.print("[dim]No background processes.[/dim]")
+                        else:
+                            console.print("[dim]Background processes:[/dim]")
+                            for p in procs:
+                                elapsed_min = p['elapsed'] / 60
+                                console.print(f"[dim]  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}[/dim]")
+                        continue
+                    
+                    elif cmd == '/ctx':
+                        stats = agent.get_context_stats()
+                        console.print(f"[dim]Context: {stats['tokens']:,} tokens ({stats['percent']:.0f}% of {stats['max_allowed']:,} limit)[/dim]")
+                        console.print(f"[dim]Messages: {stats['messages']} | Context items: {stats['context_items']}[/dim]")
+                        console.print(f"[dim]{agent.context.summary()}[/dim]")
+                        continue
+                    
                     elif cmd in ('/help', '/?'):
-                        console.print("""[dim]Commands:
+                        help_text = """[dim]Commands:
   /sessions          - List all sessions
   /session <name>    - Switch to session (creates if new)
   /delete <name>     - Delete a session
   /clear             - Clear conversation history
   /save              - Save current session
   /history           - Show message count
+  /bg                - List background processes
+  /ctx               - Show context container
   /exit              - Save and exit
 
 Keys during commands:
   Esc                - Stop/interrupt
-  Ctrl+B             - Send to background[/dim]""")
+  Ctrl+B             - Send to background"""
+                        if HAS_PROMPT_TOOLKIT:
+                            help_text += """
+
+Input:
+  Ctrl+Enter         - Insert newline (multiline input)
+  Enter              - Submit input
+  Up/Down            - Browse history
+  Paste              - Multiline paste supported"""
+                        help_text += "[/dim]"
+                        console.print(help_text)
                         continue
                     
                     else:
                         console.print("[dim]Type /help for commands[/dim]")
                         continue
                 
-                asyncio.run(run_single(agent, user_input, console))
+                try:
+                    loop.run_until_complete(run_single(agent, user_input, console))
+                except KeyboardInterrupt:
+                    console.print("\n[yellow][STOP] Interrupted - Ctrl+C again to exit[/yellow]")
+                except Exception as e:
+                    console.print(f"[red]Error: {e}[/red]")
                 print()  # Blank line between requests
                 
             except KeyboardInterrupt:
@@ -256,6 +376,12 @@ Keys during commands:
                 agent.cleanup_background_procs()
                 agent.save_session(str(session_path))
                 break
+        
+        # Clean up the event loop
+        try:
+            loop.close()
+        except:
+            pass
 
 
 if __name__ == "__main__":
