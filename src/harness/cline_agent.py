@@ -221,31 +221,54 @@ class ClineAgent:
     
     async def _execute_tool(self, tool: ParsedToolCall) -> str:
         """Execute a tool call and return the result."""
-        print(f"🔧 {tool.name}", end="", flush=True)
         
         try:
             if tool.name == "read_file":
+                path = tool.parameters.get("path", "")
+                self.console.print(f"[cyan]📄 Reading:[/cyan] {path}")
                 result = await self._read_file(tool.parameters)
+                lines = result.count('\n') + 1
+                self.console.print(f"[dim]   ({lines} lines)[/dim]")
+                
             elif tool.name == "write_to_file":
+                path = tool.parameters.get("path", "")
+                self.console.print(f"[green]📝 Writing:[/green] {path}")
                 result = await self._write_file(tool.parameters)
+                
             elif tool.name == "replace_in_file":
+                path = tool.parameters.get("path", "")
+                self.console.print(f"[yellow]✏️  Editing:[/yellow] {path}")
                 result = await self._replace_in_file(tool.parameters)
+                
             elif tool.name == "execute_command":
+                # execute_command handles its own display
                 result = await self._execute_command(tool.parameters)
+                
             elif tool.name == "list_files":
+                path = tool.parameters.get("path", "")
+                self.console.print(f"[blue]📁 Listing:[/blue] {path}")
                 result = await self._list_files(tool.parameters)
+                count = len(result.splitlines())
+                self.console.print(f"[dim]   ({count} items)[/dim]")
+                
             elif tool.name == "search_files":
+                regex = tool.parameters.get("regex", "")
+                self.console.print(f"[magenta]🔍 Searching:[/magenta] {regex}")
                 result = await self._search_files(tool.parameters)
+                matches = len(result.splitlines()) if result != "(no matches)" else 0
+                self.console.print(f"[dim]   ({matches} matches)[/dim]")
+                
             elif tool.name == "attempt_completion":
+                self.console.print("[green]✅ Task complete[/green]")
                 result = "Task completed."
+                
             else:
                 result = f"Unknown tool: {tool.name}"
             
-            print(" ✓")
             return result
             
         except Exception as e:
-            print(f" ✗ {e}")
+            self.console.print(f"[red]✗ {tool.name}: {e}[/red]")
             return f"Error: {str(e)}"
     
     def _resolve_path(self, path: str) -> Path:
@@ -302,23 +325,53 @@ class ClineAgent:
         return f"Successfully made {changes} replacement(s) in {path}"
     
     async def _execute_command(self, params: Dict[str, str]) -> str:
+        """Execute a shell command with live output display."""
         command = params.get("command", "")
+        
+        # Show command being executed
+        print()
+        self.console.print(f"[dim]$ {command}[/dim]")
         
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout
             cwd=self.workspace_path,
         )
         
+        output_lines = []
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-            output = stdout.decode("utf-8", errors="replace")
-            if stderr:
-                output += "\n" + stderr.decode("utf-8", errors="replace")
-            return output[:15000] or "(no output)"
+            # Stream output in real-time
+            while True:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(),
+                    timeout=120
+                )
+                if not line:
+                    break
+                    
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                output_lines.append(decoded)
+                
+                # Print with dim styling and indentation
+                self.console.print(f"[dim]  {decoded}[/dim]")
+            
+            await proc.wait()
+            
+            exit_code = proc.returncode
+            full_output = "\n".join(output_lines)
+            
+            # Show exit status
+            if exit_code == 0:
+                self.console.print(f"[green]✓ Exit code: {exit_code}[/green]")
+            else:
+                self.console.print(f"[red]✗ Exit code: {exit_code}[/red]")
+            
+            return full_output[:15000] or "(no output)"
+            
         except asyncio.TimeoutError:
             proc.kill()
+            self.console.print("[red]✗ Command timed out after 120s[/red]")
             return "Error: Command timed out after 120s"
     
     async def _list_files(self, params: Dict[str, str]) -> str:
