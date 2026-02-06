@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import os
 import httpx
 from typing import Any, Callable, Dict, List, Optional, Union
 from dataclasses import dataclass, field
@@ -319,6 +320,7 @@ class StreamingJSONClient:
             }]
         
         last_error = None
+        debug_log = os.environ.get("HARNESS_DEBUG_API")
         
         for attempt in range(max_retries + 1):
             try:
@@ -327,6 +329,7 @@ class StreamingJSONClient:
                 finish_reason = "stop"
                 interrupted = False
                 web_search_data = []  # Collect web search results
+                raw_chunks = []  # For debug logging
                 
                 async with self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
@@ -335,6 +338,8 @@ class StreamingJSONClient:
                     
                     line_buffer = ""
                     async for chunk in response.aiter_bytes():
+                        if debug_log:
+                            raw_chunks.append(chunk)
                         # Check for interrupt
                         if check_interrupt and check_interrupt():
                             interrupted = True
@@ -393,6 +398,16 @@ class StreamingJSONClient:
                         refer=item.get("refer", ""),
                         publish_date=item.get("publish_date", ""),
                     ))
+                
+                # Write debug log if enabled
+                if debug_log and raw_chunks:
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    debug_path = f"harness_api_debug_{timestamp}.log"
+                    with open(debug_path, "wb") as f:
+                        for chunk in raw_chunks:
+                            f.write(chunk)
+                    print(f"\n[DEBUG] Raw API response saved to: {debug_path}")
                 
                 return StreamingChatResponse(
                     content=full_content,

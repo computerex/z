@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from rich.console import Console
+from rich.markup import escape as rich_escape
 
 from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
@@ -119,8 +120,21 @@ class ParsedToolCall:
     parameters: Dict[str, str]
 
 
+def strip_thinking_blocks(content: str) -> str:
+    """Remove <think>...</think> blocks from content (MiniMax reasoning)."""
+    return re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
+
+
 def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
-    """Parse Cline-style XML tool call from content."""
+    """Parse Cline-style XML tool call from content.
+    
+    Uses smart matching to handle XML examples embedded in content.
+    For tools with complex content (write_to_file, replace_in_file), uses
+    greedy matching to get the full content including any nested examples.
+    """
+    # Strip thinking blocks first (MiniMax outputs these)
+    content = strip_thinking_blocks(content)
+    
     tool_names = [
         'read_file', 'write_to_file', 'replace_in_file',
         'execute_command', 'list_files', 'search_files',
@@ -129,37 +143,124 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         'attempt_completion'
     ]
     
-    for tool_name in tool_names:
-        pattern = rf'<{tool_name}>(.*?)</{tool_name}>'
-        match = re.search(pattern, content, re.DOTALL)
-        
-        if match:
-            inner = match.group(1)
-            params = {}
-            
-            # Parse each parameter tag - collect multiple values for same param
-            param_pattern = r'<(\w+)>(.*?)</\1>'
-            for m in re.finditer(param_pattern, inner, re.DOTALL):
-                name, value = m.groups()
-                # Clean up value - strip outer newlines but preserve internal structure
-                value = value.strip('\n')
-                # If param already exists, append as comma-separated
-                if name in params:
-                    params[name] = params[name] + "," + value
-                else:
-                    params[name] = value
-            
-            return ParsedToolCall(name=tool_name, parameters=params)
+    # Tools that may have nested XML examples in their content
+    complex_content_tools = {'write_to_file', 'replace_in_file'}
     
-    return None
+    # Find ALL tool matches across ALL tool types, track by end position
+    all_matches = []  # (end_pos, tool_name, match)
+    
+    for tool_name in tool_names:
+        if tool_name in complex_content_tools:
+            # For complex tools with nested XML examples in content:
+            # Find FIRST opening tag and LAST closing tag to get the outermost block
+            open_tag = f'<{tool_name}>'
+            close_tag = f'</{tool_name}>'
+            
+            # Find the FIRST opening tag (the real tool call, not an inner example)
+            first_open = content.find(open_tag)
+            if first_open == -1:
+                continue
+            
+            # Find the LAST closing tag (the real closing, not an inner example)
+            last_close = content.rfind(close_tag)
+            if last_close == -1 or last_close < first_open:
+                continue
+            
+            # Create a match-like object
+            inner_start = first_open + len(open_tag)
+            inner_content = content[inner_start:last_close]
+            
+            class FakeMatch:
+                def __init__(self, start_pos, end_pos, inner):
+                    self._start = start_pos
+                    self._end = end_pos
+                    self._inner = inner
+                def end(self):
+                    return self._end
+                def group(self, n):
+                    return self._inner if n == 1 else content[self._start:self._end]
+            
+            fake_match = FakeMatch(first_open, last_close + len(close_tag), inner_content)
+            all_matches.append((fake_match.end(), tool_name, fake_match))
+        else:
+            # For simple tools, use non-greedy matching
+            pattern = rf'<{tool_name}>(.*?)</{tool_name}>'
+            for match in re.finditer(pattern, content, re.DOTALL):
+                all_matches.append((match.end(), tool_name, match))
+    
+    if not all_matches:
+        return None
+    
+    # Use the match with the highest end position (last in content)
+    all_matches.sort(key=lambda x: x[0], reverse=True)
+    _, tool_name, match = all_matches[0]
+    
+    inner = match.group(1)
+    params = {}
+    
+    # Parse parameters - order matters because content/diff may contain nested XML
+    # Simple params (path, command, etc.) use FIRST closing tag
+    # Complex params (content, diff) use LAST closing tag
+    simple_params = ['path', 'command', 'background', 'regex', 'file_pattern', 
+                    'result', 'query', 'image_path', 'process_id', 'item', 
+                    'search_term', 'count', 'recursive', 'id', 'lines', 'question']
+    complex_params = ['content', 'diff']
+    
+    # For tools with complex content (write_to_file, replace_in_file),
+    # extract the content/diff FIRST, then only search for other params
+    # in the portion BEFORE <content> or <diff> starts
+    search_area = inner  # default: search entire inner block
+    
+    # Find where complex params start (to avoid extracting example XML from content)
+    for cp in complex_params:
+        open_tag = f'<{cp}>'
+        start = inner.find(open_tag)
+        if start != -1:
+            # Only search for simple params BEFORE the complex param starts
+            search_area = inner[:start]
+            break
+    
+    for param_name in simple_params:
+        open_tag = f'<{param_name}>'
+        close_tag = f'</{param_name}>'
+        start = search_area.find(open_tag)
+        if start == -1:
+            continue
+        # Use FIRST closing tag for simple params
+        end = search_area.find(close_tag, start)
+        if end == -1:
+            continue
+        value = search_area[start + len(open_tag):end]
+        value = value.strip('\n')
+        params[param_name] = value
+    
+    for param_name in complex_params:
+        open_tag = f'<{param_name}>'
+        close_tag = f'</{param_name}>'
+        start = inner.find(open_tag)
+        if start == -1:
+            continue
+        # Use LAST closing tag for complex params (content may have nested examples)
+        end = inner.rfind(close_tag)
+        if end == -1 or end < start:
+            continue
+        value = inner[start + len(open_tag):end]
+        value = value.strip('\n')
+        params[param_name] = value
+    
+    return ParsedToolCall(name=tool_name, parameters=params)
 
 
 def parse_search_replace_blocks(diff: str) -> List[Tuple[str, str]]:
     """Parse SEARCH/REPLACE blocks from diff string."""
     blocks = []
     
+    # Normalize line endings first
+    diff = diff.replace('\r\n', '\n').replace('\r', '\n')
+    
     # Pattern: <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE
-    pattern = r'<{7}\s*SEARCH\n(.*?)\n={7}\n(.*?)\n>{7}\s*REPLACE'
+    # Allow optional whitespace and be flexible with newlines
+    pattern = r'<{7}\s*SEARCH\s*\n(.*?)\n={7}\s*\n(.*?)\n>{7}\s*REPLACE'
     
     for m in re.finditer(pattern, diff, re.DOTALL):
         search, replace = m.groups()
@@ -226,25 +327,29 @@ class ClineAgent:
         except Exception:
             pass
     
-    def cleanup_background_procs(self) -> None:
-        """Terminate all background processes safely."""
+    async def cleanup_background_procs_async(self) -> None:
+        """Async version - properly waits for processes to terminate."""
         for pid, info in list(self._background_procs.items()):
             try:
                 proc = info["proc"]
                 if proc.returncode is None:
                     # On Windows, use taskkill to kill the entire process tree
-                    # This prevents zombie multiprocessing children
                     if platform.system() == "Windows":
                         try:
                             os.system(f'taskkill /F /T /PID {proc.pid} >nul 2>&1')
                         except:
-                            try:
-                                proc.terminate()
-                            except:
-                                pass
-                    else:
+                            pass
+                    try:
+                        proc.terminate()
+                    except:
+                        pass
+                    # Wait for process to finish (properly closes transports)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
                         try:
-                            proc.terminate()
+                            proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=1.0)
                         except:
                             pass
                 # Cancel the log reader task
@@ -256,6 +361,38 @@ class ClineAgent:
             except Exception:
                 pass
         self._background_procs.clear()
+    
+    def cleanup_background_procs(self) -> None:
+        """Terminate all background processes safely (sync wrapper)."""
+        # Try to use async cleanup if event loop is available
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule async cleanup
+                asyncio.create_task(self.cleanup_background_procs_async())
+            else:
+                # Run async cleanup
+                loop.run_until_complete(self.cleanup_background_procs_async())
+        except RuntimeError:
+            # No event loop - do basic sync cleanup
+            for pid, info in list(self._background_procs.items()):
+                try:
+                    proc = info["proc"]
+                    if proc.returncode is None:
+                        if platform.system() == "Windows":
+                            os.system(f'taskkill /F /T /PID {proc.pid} >nul 2>&1')
+                        try:
+                            proc.terminate()
+                        except:
+                            pass
+                    if "task" in info and info["task"]:
+                        try:
+                            info["task"].cancel()
+                        except:
+                            pass
+                except Exception:
+                    pass
+            self._background_procs.clear()
     
     def list_background_procs(self) -> List[dict]:
         """List all background processes with their status."""
@@ -277,21 +414,45 @@ class ClineAgent:
     def save_session(self, path: str) -> None:
         """Save conversation history and context."""
         import json
+        
+        def sanitize_string(s) -> str:
+            """Remove unicode surrogates that can't be encoded."""
+            if isinstance(s, str):
+                return s.encode('utf-8', errors='replace').decode('utf-8')
+            return s
+        
+        def sanitize_content(content):
+            """Sanitize message content (can be string or list for vision)."""
+            if isinstance(content, str):
+                return sanitize_string(content)
+            elif isinstance(content, list):
+                result = []
+                for item in content:
+                    if isinstance(item, dict):
+                        sanitized = {}
+                        for k, v in item.items():
+                            sanitized[k] = sanitize_string(v) if isinstance(v, str) else v
+                        result.append(sanitized)
+                    else:
+                        result.append(sanitize_string(item) if isinstance(item, str) else item)
+                return result
+            return content
+        
         # Serialize context items
         context_items = []
         for item in self.context.list_items():
             context_items.append({
                 "id": item.id,
                 "type": item.type,
-                "source": item.source,
-                "content": item.content,
+                "source": sanitize_string(item.source),
+                "content": sanitize_string(item.content),
                 "added_at": item.added_at,
                 "line_range": item.line_range
             })
         
         data = {
             "workspace": self.workspace_path,
-            "messages": [{"role": m.role, "content": m.content} for m in self.messages],
+            "messages": [{"role": m.role, "content": sanitize_content(m.content)} for m in self.messages],
             "context": context_items,
             "context_next_id": self.context._next_id
         }
@@ -587,6 +748,21 @@ class ClineAgent:
                 # Parse XML tool call from content
                 tool_call = parse_xml_tool(full_content)
                 
+                # Debug output - save full content for analysis
+                if os.environ.get("HARNESS_DEBUG"):
+                    debug_file = os.path.join(self.workspace_path, ".harness_debug.txt")
+                    with open(debug_file, "w", encoding="utf-8") as f:
+                        f.write(f"=== Full Model Output ({len(full_content)} chars) ===\n")
+                        f.write(full_content)
+                        f.write(f"\n\n=== Parsed Tool Call ===\n")
+                        f.write(f"{tool_call}\n")
+                        if tool_call:
+                            f.write(f"tool={tool_call.name}, params={tool_call.parameters}\n")
+                    print(f"[DEBUG] Saved model output to {debug_file}")
+                    print(f"[DEBUG] parse_xml_tool returned: {tool_call}")
+                    if tool_call:
+                        print(f"[DEBUG] tool={tool_call.name}, params keys={list(tool_call.parameters.keys())}")
+                
                 if not tool_call:
                     # Check for attempt_completion
                     if "<attempt_completion>" in full_content:
@@ -637,12 +813,13 @@ class ClineAgent:
                 
             elif tool.name == "write_to_file":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[green]> Writing:[/green] {path}")
+                content = tool.parameters.get("content", "")
+                self.console.print(f"[green]> Writing:[/green] {path} ({len(content)} bytes)")
                 result = await self._write_file(tool.parameters)
                 
             elif tool.name == "replace_in_file":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[yellow]✏️  Editing:[/yellow] {path}")
+                self.console.print(f"[yellow]> Editing:[/yellow] {path}")
                 result = await self._replace_in_file(tool.parameters)
                 
             elif tool.name == "execute_command":
@@ -710,7 +887,7 @@ class ClineAgent:
             return result
             
         except Exception as e:
-            self.console.print(f"[red][X] {tool.name}: {e}[/red]")
+            self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
             return f"Error: {str(e)}"
     
     def _resolve_path(self, path: str) -> Path:
@@ -793,9 +970,38 @@ class ClineAgent:
         path = self._resolve_path(params.get("path", ""))
         content = params.get("content", "")
         
+        # DEBUG: Log write operation
+        if os.environ.get("HARNESS_DEBUG"):
+            print(f"[DEBUG _write_file] path={path}, content_len={len(content)}", flush=True)
+        
+        # Clean up invalid backtick escapes in Go files
+        # Models sometimes generate \` or \`\`\` which are invalid in Go raw strings
+        if path.suffix == '.go':
+            original_len = len(content)
+            # Remove escaped backticks like \` (invalid in Go)
+            content = re.sub(r'\\`', '`', content)
+            # Remove triple-backtick markdown fences that might be in raw strings
+            # These often appear as ```go or ``` which break Go compilation
+            content = re.sub(r'```\w*\n?', '', content)
+            if len(content) != original_len:
+                self.console.print(f"[dim]   (cleaned {original_len - len(content)} invalid backtick chars)[/dim]")
+        
+        # Warn if overwriting existing file (should use replace_in_file instead)
+        was_overwrite = path.exists()
+        if was_overwrite:
+            old_size = path.stat().st_size
+            self.console.print(f"[yellow]Warning: Overwriting existing file ({old_size} bytes). Consider replace_in_file for edits.[/yellow]")
+        
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         
+        # DEBUG: Verify write
+        if os.environ.get("HARNESS_DEBUG"):
+            actual_size = path.stat().st_size
+            print(f"[DEBUG _write_file] written! actual_size={actual_size}", flush=True)
+        
+        if was_overwrite:
+            return f"Successfully wrote to {path}\nNote: This file already existed. For future edits to existing files, please use replace_in_file instead of write_to_file."
         return f"Successfully wrote to {path}"
     
     async def _replace_in_file(self, params: Dict[str, str]) -> str:
@@ -811,13 +1017,48 @@ class ClineAgent:
         if not blocks:
             return "Error: No valid SEARCH/REPLACE blocks found"
         
+        def normalize_whitespace(s: str) -> str:
+            """Normalize line endings and trailing whitespace for matching."""
+            lines = s.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            return '\n'.join(line.rstrip() for line in lines)
+        
         changes = 0
         for search, replace in blocks:
+            # Try exact match first
             if search in content:
                 content = content.replace(search, replace, 1)
                 changes += 1
             else:
-                return f"Error: SEARCH block not found in file:\n{search[:200]}..."
+                # Try with normalized whitespace
+                norm_content = normalize_whitespace(content)
+                norm_search = normalize_whitespace(search)
+                
+                if norm_search in norm_content:
+                    # Find position in normalized content, apply to original
+                    # Replace line by line with whitespace tolerance
+                    search_lines = norm_search.split('\n')
+                    content_lines = content.replace('\r\n', '\n').split('\n')
+                    
+                    # Find starting line
+                    for i in range(len(content_lines) - len(search_lines) + 1):
+                        match = True
+                        for j, search_line in enumerate(search_lines):
+                            if content_lines[i + j].rstrip() != search_line:
+                                match = False
+                                break
+                        if match:
+                            # Found it - replace those lines
+                            replace_lines = replace.replace('\r\n', '\n').split('\n')
+                            content_lines = content_lines[:i] + replace_lines + content_lines[i + len(search_lines):]
+                            content = '\n'.join(content_lines)
+                            changes += 1
+                            break
+                    else:
+                        return f"Error: SEARCH block not found in file (even with whitespace normalization):\n{search[:200]}..."
+                else:
+                    # Show helpful diff for debugging
+                    lines = search.split('\n')[:3]
+                    return f"Error: SEARCH block not found in file:\n{chr(10).join(lines)}...\n\nTip: Check for whitespace/indentation differences."
         
         path.write_text(content, encoding="utf-8")
         return f"Successfully made {changes} replacement(s) in {path}"
@@ -864,6 +1105,10 @@ class ClineAgent:
                 # Check for interrupt (Esc)
                 if is_interrupted():
                     proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
                     self.console.print(f"\n[yellow][STOP] Command interrupted[/yellow]")
                     output = "\n".join(output_lines)[:15000]
                     return f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}" if output else "Command interrupted (no output)"

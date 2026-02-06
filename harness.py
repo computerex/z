@@ -4,9 +4,14 @@
 import sys
 import os
 
-# Force unbuffered output BEFORE any imports
+# Force unbuffered output and UTF-8 encoding BEFORE any imports
 os.environ['PYTHONUNBUFFERED'] = '1'
-sys.stdout.reconfigure(write_through=True)
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+try:
+    sys.stdout.reconfigure(encoding='utf-8', write_through=True)
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass  # May fail on some systems
 
 import asyncio
 import hashlib
@@ -22,6 +27,7 @@ from harness.cline_agent import ClineAgent
 from harness.cost_tracker import get_global_tracker, reset_global_tracker
 from rich.console import Console
 from rich.panel import Panel
+from rich.markup import escape as rich_escape
 
 # Multiline input support
 try:
@@ -31,8 +37,16 @@ try:
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     HAS_PROMPT_TOOLKIT = True
+    
+    class SafeFileHistory(FileHistory):
+        """FileHistory that handles unicode surrogates gracefully."""
+        def store_string(self, string: str) -> None:
+            # Remove unicode surrogates that can't be encoded
+            safe_string = string.encode('utf-8', errors='replace').decode('utf-8')
+            super().store_string(safe_string)
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
+    SafeFileHistory = None
 
 # Clipboard image support
 try:
@@ -279,7 +293,7 @@ def create_prompt_session(history_file: Path) -> "PromptSession":
     history_file.parent.mkdir(parents=True, exist_ok=True)
     
     return PromptSession(
-        history=FileHistory(str(history_file)),
+        history=SafeFileHistory(str(history_file)),
         auto_suggest=AutoSuggestFromHistory(),
         key_bindings=bindings,
         multiline=False,  # Enter submits, Ctrl+Enter for newline
@@ -310,7 +324,7 @@ async def run_single(agent: ClineAgent, user_input: str, console: Console):
         f"API Calls: {cost.total_calls}\n"
         f"Tokens: {cost.total_input_tokens:,} in / {cost.total_output_tokens:,} out\n"
         f"Cost: ${cost.total_cost:.4f}\n"
-        f"───────────────\n"
+        f"---------------\n"
         f"Context: {stats['tokens']:,} tokens ({stats['percent']:.0f}% of {stats['max_allowed']:,} limit)\n"
         f"Messages: {stats['messages']} | Items: {stats['context_items']} ({stats['context_chars']:,} chars)",
         title="Stats",
@@ -399,7 +413,7 @@ def main():
         try:
             loop.run_until_complete(run_single(agent, user_input, console))
         finally:
-            agent.cleanup_background_procs()
+            loop.run_until_complete(agent.cleanup_background_procs_async())
             agent.save_session(str(session_path))
             loop.close()
     else:
@@ -456,7 +470,7 @@ def main():
                     cmd_arg = parts[1] if len(parts) > 1 else ""
                     
                     if cmd in ('/exit', '/quit', '/q'):
-                        agent.cleanup_background_procs()
+                        loop.run_until_complete(agent.cleanup_background_procs_async())
                         agent.save_session(str(session_path))
                         console.print("[dim]Session saved.[/dim]")
                         break
@@ -628,16 +642,16 @@ Input:
                     console.print("\n[yellow][STOP] Interrupted - Ctrl+C again to exit[/yellow]")
                     last_interrupt_time = time.time()  # Start the 2-second window
                 except Exception as e:
-                    console.print(f"[red]Error: {e}[/red]")
+                    console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
                 print()  # Blank line between requests
                 
             except KeyboardInterrupt:
-                agent.cleanup_background_procs()
+                loop.run_until_complete(agent.cleanup_background_procs_async())
                 agent.save_session(str(session_path))
                 console.print("\n[dim]Session saved. Exiting...[/dim]")
                 break
             except EOFError:
-                agent.cleanup_background_procs()
+                loop.run_until_complete(agent.cleanup_background_procs_async())
                 agent.save_session(str(session_path))
                 break
         
