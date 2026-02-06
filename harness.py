@@ -34,6 +34,53 @@ try:
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
 
+# Clipboard image support
+try:
+    from PIL import ImageGrab
+    HAS_CLIPBOARD_IMAGE = True
+except ImportError:
+    HAS_CLIPBOARD_IMAGE = False
+
+
+def get_clipboard_image() -> tuple[Path | None, str]:
+    """Get image from clipboard if available.
+    
+    Returns:
+        (temp_file_path, error_message) - path is None on error
+    """
+    if not HAS_CLIPBOARD_IMAGE:
+        return None, "PIL not installed. Run: pip install Pillow"
+    
+    try:
+        img = ImageGrab.grabclipboard()
+        if img is None:
+            return None, "No image in clipboard"
+        
+        # Check if it's a list of file paths (copied files)
+        if isinstance(img, list):
+            # Filter for image files
+            image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+            for path_str in img:
+                p = Path(path_str)
+                if p.suffix.lower() in image_exts:
+                    return p, ""
+            return None, "Clipboard contains files but no images"
+        
+        # It's a PIL Image - save to temp file
+        import tempfile
+        temp_dir = Path(tempfile.gettempdir()) / "harness_clipboard"
+        temp_dir.mkdir(exist_ok=True)
+        
+        # Use timestamp for unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_path = temp_dir / f"clipboard_{timestamp}.png"
+        
+        img.save(temp_path, "PNG")
+        return temp_path, ""
+        
+    except Exception as e:
+        return None, f"Error getting clipboard: {e}"
+
 
 def get_sessions_dir(workspace: str) -> Path:
     """Get sessions directory for a workspace."""
@@ -368,6 +415,22 @@ def main():
                         console.print(f"[dim]Compacted: {before:,} -> {after:,} tokens (-{removed:,})[/dim]")
                         continue
                     
+                    elif cmd == '/clip':
+                        # Get image from clipboard and analyze it
+                        img_path, error = get_clipboard_image()
+                        if error:
+                            console.print(f"[red]{error}[/red]")
+                            continue
+                        
+                        console.print(f"[dim]Clipboard image: {img_path}[/dim]")
+                        
+                        # If user provided a question, use it
+                        question = cmd_arg.strip() if cmd_arg else "Describe this image in detail."
+                        
+                        # Create the analyze request
+                        user_input = f"Analyze this image: {img_path}\n\nQuestion: {question}"
+                        # Fall through to process this request
+                    
                     elif cmd in ('/help', '/?'):
                         help_text = """[dim]Commands:
   /sessions          - List all sessions
@@ -376,6 +439,7 @@ def main():
   /clear             - Clear conversation history
   /compact [strat]   - Remove older messages (half/quarter/last2)
   /tokens            - Show token breakdown  
+  /clip [question]   - Analyze image from clipboard
   /save              - Save current session
   /history           - Show message count
   /bg                - List background processes
