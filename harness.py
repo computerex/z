@@ -42,6 +42,139 @@ except ImportError:
     HAS_CLIPBOARD_IMAGE = False
 
 
+def run_install(api_url: str = None, api_key: str = None, model: str = None, global_config: bool = True):
+    """Setup wizard for API configuration. Supports headless mode with CLI args.
+    
+    Args:
+        api_url: API base URL (headless mode)
+        api_key: API key (headless mode)
+        model: Model name (headless mode)
+        global_config: If True, save to ~/.z.json, else workspace/.z/.z.json
+    """
+    from pathlib import Path
+    import json
+    
+    # Headless mode - all params provided
+    if api_url and api_key:
+        config_data = {
+            "api_url": api_url.rstrip('/') + '/',
+            "api_key": api_key,
+            "model": model or "glm-4.7",
+        }
+        
+        if global_config:
+            config_path = Path.home() / ".z.json"
+        else:
+            config_dir = Path.cwd() / ".z"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_path = config_dir / ".z.json"
+        
+        config_path.write_text(json.dumps(config_data, indent=2))
+        print(f"Configuration saved to: {config_path}")
+        print(f"  URL:   {api_url}")
+        print(f"  Model: {config_data['model']}")
+        print(f"  Key:   {api_key[:10]}...")
+        return
+    
+    # Interactive mode
+    print("\n" + "="*60)
+    print("  LLM Harness Setup")
+    print("="*60 + "\n")
+    
+    # Choose provider
+    print("Select your LLM provider:\n")
+    print("  [1] Z.AI Coding Plan (recommended)")
+    print("      - https://api.z.ai/api/coding/paas/v4/\n")
+    print("  [2] Z.AI Standard API")
+    print("      - https://api.z.ai/api/paas/v4/\n")
+    print("  [3] MiniMax")
+    print("      - https://api.minimax.io/v1/\n")
+    print("  [4] Custom OpenAI-compatible API")
+    print("      - Enter your own URL\n")
+    
+    while True:
+        choice = input("Enter choice [1/2/3/4]: ").strip()
+        if choice == "1":
+            base_url = "https://api.z.ai/api/coding/paas/v4/"
+            provider = "Z.AI Coding"
+            default_model = "glm-4.7"
+            break
+        elif choice == "2":
+            base_url = "https://api.z.ai/api/paas/v4/"
+            provider = "Z.AI Standard"
+            default_model = "glm-4.7"
+            break
+        elif choice == "3":
+            base_url = "https://api.minimax.io/v1/"
+            provider = "MiniMax"
+            default_model = "MiniMax-M2.1"
+            break
+        elif choice == "4":
+            base_url = input("Enter API base URL: ").strip()
+            if not base_url:
+                print("URL is required.")
+                continue
+            provider = "Custom"
+            default_model = input("Enter default model name: ").strip() or "gpt-4"
+            break
+        else:
+            print("Please enter 1, 2, 3, or 4.")
+    
+    print(f"\nUsing {provider}: {base_url}")
+    
+    # Get API key
+    print("\nEnter your API key:\n")
+    
+    api_key = ""
+    while not api_key:
+        api_key = input("API Key: ").strip()
+        if not api_key:
+            print("API key is required.")
+    
+    # Model
+    model_input = input(f"\nModel name (default: {default_model}): ").strip()
+    model = model_input or default_model
+    
+    # Build config
+    config_data = {
+        "api_url": base_url,
+        "api_key": api_key,
+        "model": model,
+    }
+    
+    # Choose where to save
+    print("\nWhere to save configuration?\n")
+    print("  [1] Global (~/.z.json) - applies to all projects")
+    print("  [2] Workspace (.z/.z.json) - this project only\n")
+    
+    save_choice = input("Enter choice [1/2] (default: 1): ").strip() or "1"
+    
+    if save_choice == "2":
+        config_dir = Path.cwd() / ".z"
+        config_path = config_dir / ".z.json"
+        location = "workspace"
+    else:
+        config_dir = Path.home()
+        config_path = config_dir / ".z.json"
+        location = "global"
+    
+    # Create directory if needed
+    config_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Write config
+    config_path.write_text(json.dumps(config_data, indent=2))
+    
+    print(f"\n" + "="*60)
+    print("  Setup Complete!")
+    print("="*60)
+    print(f"\nConfiguration saved to: {config_path}")
+    print(f"  Location: {location}")
+    print(f"  Provider: {provider}")
+    print(f"  Model:    {model}")
+    print(f"  Key:      {api_key[:10]}...")
+    print(f"\nRun 'python harness.py' to start.\n")
+
+
 def get_clipboard_image() -> tuple[Path | None, str]:
     """Get image from clipboard if available.
     
@@ -193,7 +326,22 @@ def main():
     parser.add_argument("--new", action="store_true", help="Start fresh session")
     parser.add_argument("--session", "-s", default="default", help="Session name (default: 'default')")
     parser.add_argument("--list", "-l", action="store_true", help="List all sessions")
+    parser.add_argument("--install", action="store_true", help="Run setup wizard (interactive or headless)")
+    parser.add_argument("--api-url", help="API base URL (headless install)")
+    parser.add_argument("--api-key", help="API key (headless install)")
+    parser.add_argument("--model", help="Model name (headless install)")
+    parser.add_argument("--workspace-config", action="store_true", help="Save config to workspace instead of global")
     args = parser.parse_args()
+    
+    # Install mode - run setup wizard
+    if args.install or args.api_url or args.api_key:
+        run_install(
+            api_url=args.api_url,
+            api_key=args.api_key,
+            model=args.model,
+            global_config=not args.workspace_config
+        )
+        return
     
     # Resolve workspace
     if args.workspace == ".":
@@ -415,6 +563,14 @@ def main():
                         console.print(f"[dim]Compacted: {before:,} -> {after:,} tokens (-{removed:,})[/dim]")
                         continue
                     
+                    elif cmd == '/config':
+                        key_preview = config.api_key[:8] + "..." if config.api_key else "(not set)"
+                        console.print(f"[dim]API URL: {config.api_url}[/dim]")
+                        console.print(f"[dim]Model:   {config.model}[/dim]")
+                        console.print(f"[dim]API Key: {key_preview}[/dim]")
+                        console.print(f"[dim]Max tokens: {config.max_tokens:,}[/dim]")
+                        continue
+                    
                     elif cmd == '/clip':
                         # Get image from clipboard and analyze it
                         img_path, error = get_clipboard_image()
@@ -439,6 +595,7 @@ def main():
   /clear             - Clear conversation history
   /compact [strat]   - Remove older messages (half/quarter/last2)
   /tokens            - Show token breakdown  
+  /config            - Show current API configuration
   /clip [question]   - Analyze image from clipboard
   /save              - Save current session
   /history           - Show message count

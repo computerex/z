@@ -31,6 +31,18 @@ class StreamingToolCall:
 
 
 @dataclass
+class WebSearchResult:
+    """A single web search result."""
+    title: str
+    content: str
+    link: str
+    media: str = ""
+    icon: str = ""
+    refer: str = ""
+    publish_date: str = ""
+
+
+@dataclass
 class StreamingChatResponse:
     """Response from the streaming JSON approach."""
     content: Optional[str] = None
@@ -41,6 +53,7 @@ class StreamingChatResponse:
     raw_json: str = ""
     finish_reason: str = "stop"
     interrupted: bool = False
+    web_search_results: List[WebSearchResult] = field(default_factory=list)
     
     @property
     def is_truncated(self) -> bool:
@@ -50,6 +63,10 @@ class StreamingChatResponse:
     @property
     def has_tool_call(self) -> bool:
         return self.tool_call is not None
+    
+    @property
+    def has_web_search(self) -> bool:
+        return len(self.web_search_results) > 0
 
 
 class ContentExtractor:
@@ -268,8 +285,16 @@ class StreamingJSONClient:
         on_content: Optional[Callable[[str], None]] = None,
         max_retries: int = 5,
         check_interrupt: Optional[Callable[[], bool]] = None,
+        enable_web_search: bool = False,
+        web_search_count: int = 5,
     ) -> StreamingChatResponse:
-        """Stream raw text response (no JSON parsing) - for XML tool format."""
+        """Stream raw text response (no JSON parsing) - for XML tool format.
+        
+        Args:
+            enable_web_search: If True, adds built-in web search tool to the request.
+                The model will automatically decide when to search and incorporate results.
+            web_search_count: Number of web search results to return (1-50, default 5).
+        """
         
         url = f"{self.base_url}/chat/completions"
         payload = {
@@ -281,6 +306,18 @@ class StreamingJSONClient:
             "stream_options": {"include_usage": True},
         }
         
+        # Add built-in web search tool if enabled
+        if enable_web_search:
+            payload["tools"] = [{
+                "type": "web_search",
+                "web_search": {
+                    "enable": True,
+                    "search_engine": "search-prime",
+                    "search_result": True,
+                    "count": str(web_search_count),
+                }
+            }]
+        
         last_error = None
         
         for attempt in range(max_retries + 1):
@@ -289,6 +326,7 @@ class StreamingJSONClient:
                 usage = {}
                 finish_reason = "stop"
                 interrupted = False
+                web_search_data = []  # Collect web search results
                 
                 async with self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
@@ -324,7 +362,14 @@ class StreamingJSONClient:
                             if "usage" in data:
                                 usage = data["usage"]
                             
-                            choice = data.get("choices", [{}])[0]
+                            # Capture web_search results from response
+                            if "web_search" in data:
+                                web_search_data = data["web_search"]
+                            
+                            choices = data.get("choices", [])
+                            if not choices:
+                                continue
+                            choice = choices[0]
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
                             
@@ -336,12 +381,26 @@ class StreamingJSONClient:
                                 if on_content:
                                     on_content(content)
                 
+                # Parse web search results
+                web_search_results = []
+                for item in web_search_data:
+                    web_search_results.append(WebSearchResult(
+                        title=item.get("title", ""),
+                        content=item.get("content", ""),
+                        link=item.get("link", ""),
+                        media=item.get("media", ""),
+                        icon=item.get("icon", ""),
+                        refer=item.get("refer", ""),
+                        publish_date=item.get("publish_date", ""),
+                    ))
+                
                 return StreamingChatResponse(
                     content=full_content,
                     raw_json=full_content,
                     usage=usage,
                     finish_reason=finish_reason,
                     interrupted=interrupted,
+                    web_search_results=web_search_results,
                 )
                 
             except httpx.HTTPStatusError as e:

@@ -7,11 +7,18 @@ from datetime import datetime
 import json
 
 
-# GLM-4.7 pricing (per 1M tokens) - adjust as needed
+# LLM pricing (per 1M tokens) - adjust as needed
 DEFAULT_PRICING = {
+    # Z.AI GLM models
     "glm-4.7": {"input": 0.50, "output": 1.50},
     "glm-4": {"input": 0.50, "output": 1.50},
     "glm-4-plus": {"input": 1.00, "output": 3.00},
+    "glm-4.6v": {"input": 0.50, "output": 1.50},  # Vision model
+    # MiniMax models
+    "MiniMax-M2.1": {"input": 0.14, "output": 0.56},
+    "MiniMax-Text-01": {"input": 0.10, "output": 0.40},
+    "abab6.5s-chat": {"input": 0.01, "output": 0.01},
+    # Default fallback
     "default": {"input": 0.50, "output": 1.50},
 }
 
@@ -108,8 +115,23 @@ class CostTracker:
         self._last_report_call_count = 0
     
     def get_pricing(self, model: str) -> Dict[str, float]:
-        """Get pricing for a model."""
-        return self.pricing.get(model, self.pricing.get("default", {"input": 0.50, "output": 1.50}))
+        """Get pricing for a model. Supports exact, case-insensitive, and partial matching."""
+        # Exact match
+        if model in self.pricing:
+            return self.pricing[model]
+        
+        # Case-insensitive match
+        model_lower = model.lower()
+        for key in self.pricing:
+            if key.lower() == model_lower:
+                return self.pricing[key]
+        
+        # Partial match (model name contains pricing key or vice versa)
+        for key in self.pricing:
+            if key.lower() in model_lower or model_lower in key.lower():
+                return self.pricing[key]
+        
+        return self.pricing.get("default", {"input": 0.50, "output": 1.50})
     
     def record_call(
         self,

@@ -125,7 +125,7 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         'read_file', 'write_to_file', 'replace_in_file',
         'execute_command', 'list_files', 'search_files',
         'check_background_process', 'stop_background_process', 'list_background_processes',
-        'list_context', 'remove_from_context', 'analyze_image',
+        'list_context', 'remove_from_context', 'analyze_image', 'web_search',
         'attempt_completion'
     ]
     
@@ -532,13 +532,22 @@ class ClineAgent:
                     sys.stdout.flush()
                 
                 # Stream the response - using raw mode (no JSON parsing)
+                # Web search disabled by default to avoid unnecessary searches
+                # Use /search command for explicit web searches
                 response = await client.chat_stream_raw(
                     messages=self.messages,
                     on_content=on_chunk,
                     check_interrupt=is_interrupted,
+                    enable_web_search=False,
                 )
                 
                 print()  # Newline after stream
+                
+                # Display web search results if any
+                if response.has_web_search:
+                    self.console.print(f"\n[dim][Web Search: {len(response.web_search_results)} results][/dim]")
+                    for result in response.web_search_results[:3]:  # Show top 3
+                        self.console.print(f"[dim]  - {result.title[:60]}... ({result.media})[/dim]")
                 
                 # Handle interrupt
                 if response.interrupted:
@@ -557,7 +566,7 @@ class ClineAgent:
                 if response.usage:
                     input_tokens = response.usage.get("prompt_tokens", 0)
                     output_tokens = response.usage.get("completion_tokens", 0)
-                    # DEBUG: Check if API returns zeros
+                    # Fallback to estimation if API returns zeros
                     if input_tokens == 0 and output_tokens == 0:
                         input_tokens = estimate_messages_tokens(self.messages)
                         output_tokens = estimate_tokens(full_content)
@@ -684,6 +693,12 @@ class ClineAgent:
                 question = tool.parameters.get("question", "Describe this image in detail.")
                 self.console.print(f"[magenta]> Analyzing image:[/magenta] {path}")
                 result = await self._analyze_image(tool.parameters)
+                
+            elif tool.name == "web_search":
+                query = tool.parameters.get("query", "")
+                self.console.print(f"[cyan]> Web Search:[/cyan] {query}")
+                self.console.print("[dim]  (searching... this may take up to 2 minutes)[/dim]")
+                result = await self._web_search(tool.parameters)
                 
             elif tool.name == "attempt_completion":
                 self.console.print("[green]> Task complete[/green]")
@@ -1233,6 +1248,99 @@ class ClineAgent:
             return f"Error calling vision API: {e.response.status_code} - {e.response.text[:200]}"
         except Exception as e:
             return f"Error analyzing image: {e}"
+
+    async def _web_search(self, params: Dict[str, str]) -> str:
+        """Search the web using Z.AI's built-in web search via chat completions."""
+        import httpx
+        from urllib.parse import urlparse
+        
+        query = params.get("query", "")
+        if not query:
+            return "Error: search query is required"
+        
+        count = int(params.get("count", "5"))
+        count = max(1, min(10, count))  # Clamp to 1-10
+        
+        # Use chat completion with web_search tool enabled
+        parsed = urlparse(self.config.api_url)
+        search_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
+        
+        payload = {
+            "model": "glm-4.7",
+            "messages": [{"role": "user", "content": f"Search the web for: {query}"}],
+            "temperature": 0.7,
+            "max_tokens": 2048,
+            "stream": False,
+            "tools": [{
+                "type": "web_search",
+                "web_search": {
+                    "enable": True,
+                    "search_engine": "search-prime",
+                    "search_result": True,
+                    "count": str(count),
+                }
+            }]
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Accept-Language": "en-US,en"
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as http_client:
+                response = await http_client.post(search_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                
+                results = data.get("web_search", [])
+                content = ""
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+                
+                if not results and not content:
+                    return f"No results found for: {query}"
+                
+                # Format results
+                output = [f"Web Search Results for: {query}\n"]
+                
+                if results:
+                    output.append(f"Found {len(results)} sources:\n")
+                    for i, r in enumerate(results, 1):
+                        title = r.get("title", "No title")
+                        link = r.get("link", "")
+                        media = r.get("media", "")
+                        date = r.get("publish_date", "")
+                        snippet = r.get("content", "")[:200]
+                        
+                        output.append(f"[{i}] {title}")
+                        if media:
+                            output.append(f"    Source: {media}")
+                        if date:
+                            output.append(f"    Date: {date}")
+                        if snippet:
+                            output.append(f"    {snippet}...")
+                        if link:
+                            output.append(f"    URL: {link}")
+                        output.append("")
+                
+                if content:
+                    output.append(f"\nSummary:\n{content}")
+                
+                result_text = "\n".join(output)
+                
+                # Add to context
+                ctx_id = self.context.add("web_search", query, result_text)
+                return f"[Context ID: {ctx_id}]\n\n{result_text}"
+                
+        except httpx.HTTPStatusError as e:
+            return f"Error calling search API: {e.response.status_code} - {e.response.text[:200]}"
+        except httpx.TimeoutException:
+            return f"Error: Search request timed out after 120 seconds"
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            return f"Error searching web: {type(e).__name__}: {e}\n{tb}"
 
 
 # Alias for backward compatibility

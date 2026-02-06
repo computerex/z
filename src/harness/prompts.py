@@ -227,6 +227,22 @@ Usage:
 <question>What error message is shown?</question>
 </analyze_image>
 
+## web_search
+Description: Search the web for current information. Use this when you need up-to-date information that may not be in your training data, such as recent events, current prices, news, weather, or any time-sensitive information. Results include sources and summaries.
+Parameters:
+- query: (required) The search query. Be specific and include relevant keywords.
+- count: (optional) Number of results to return (1-10, default 5).
+Usage:
+<web_search>
+<query>Python 3.12 new features</query>
+</web_search>
+
+With count:
+<web_search>
+<query>latest tech news today</query>
+<count>5</count>
+</web_search>
+
 ## list_context
 Description: View all items currently in your context container. This shows files, command outputs, and search results you've loaded. Each item has an ID, type, source, size, and age. Use this to understand what information you have available and identify items that are no longer needed.
 Parameters: None
