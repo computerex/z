@@ -49,3 +49,6 @@ Thumbs.db
 
 # Debug files
 debug_*.py
+
+# Sessions
+.sessions/

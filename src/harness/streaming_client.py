@@ -27,6 +27,7 @@ class StreamingToolCall:
 @dataclass
 class StreamingChatResponse:
     """Response from the streaming JSON approach."""
+    content: Optional[str] = None
     thinking: Optional[str] = None
     tool_call: Optional[StreamingToolCall] = None
     message: Optional[str] = None
@@ -232,6 +233,100 @@ class StreamingJSONClient:
                         )
                 
                 return result
+                
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                if e.response.status_code in (429, 500, 502, 503):
+                    if attempt < max_retries:
+                        wait = min(2 ** (attempt + 1), 60)
+                        print(f"\n⚠️  HTTP {e.response.status_code}. Retry in {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                raise RuntimeError(f"API error: {e}")
+                
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait = min(2 ** (attempt + 1), 60)
+                    print(f"\n⚠️  Connection error. Retry in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                raise RuntimeError(f"Request failed: {e}")
+        
+        raise RuntimeError(f"Failed after {max_retries} retries: {last_error}")
+
+    async def chat_stream_raw(
+        self,
+        messages: List[StreamingMessage],
+        on_content: Optional[Callable[[str], None]] = None,
+        max_retries: int = 5,
+    ) -> StreamingChatResponse:
+        """Stream raw text response (no JSON parsing) - for XML tool format."""
+        
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [m.to_dict() for m in messages],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                full_content = ""
+                usage = {}
+                finish_reason = "stop"
+                
+                async with self._client.stream(
+                    "POST", url, headers=self._get_headers(), json=payload
+                ) as response:
+                    response.raise_for_status()
+                    
+                    line_buffer = ""
+                    async for chunk in response.aiter_bytes():
+                        line_buffer += chunk.decode('utf-8', errors='ignore')
+                        
+                        while '\n' in line_buffer:
+                            line, line_buffer = line_buffer.split('\n', 1)
+                            line = line.strip()
+                            
+                            if not line or not line.startswith("data: "):
+                                continue
+                            
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            
+                            if "usage" in data:
+                                usage = data["usage"]
+                            
+                            choice = data.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "")
+                            
+                            if choice.get("finish_reason"):
+                                finish_reason = choice["finish_reason"]
+                            
+                            if content:
+                                full_content += content
+                                if on_content:
+                                    on_content(content)
+                
+                return StreamingChatResponse(
+                    content=full_content,
+                    raw_json=full_content,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                )
                 
             except httpx.HTTPStatusError as e:
                 last_error = e

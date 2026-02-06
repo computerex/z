@@ -94,6 +94,10 @@ class StreamingAgent:
         self.workspace_path = str(Path.cwd().resolve())
         self.cost_tracker = get_global_tracker()
         
+        # Conversation history for session persistence
+        self.messages: List[StreamingMessage] = []
+        self._initialized = False
+        
         # Tool implementations
         self.tools = {
             "write_file": self._tool_write_file,
@@ -105,12 +109,42 @@ class StreamingAgent:
             "run_command": self._tool_run_command,
         }
     
+    def save_session(self, path: str) -> None:
+        """Save conversation history to a file."""
+        import json
+        data = {
+            "workspace": self.workspace_path,
+            "messages": [{"role": m.role, "content": m.content} for m in self.messages]
+        }
+        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    
+    def load_session(self, path: str) -> bool:
+        """Load conversation history from a file."""
+        import json
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.messages = [StreamingMessage(role=m["role"], content=m["content"]) for m in data["messages"]]
+            self._initialized = True
+            return True
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            return False
+    
+    def clear_history(self) -> None:
+        """Clear conversation history."""
+        self.messages = []
+        self._initialized = False
+    
     async def run(self, user_input: str) -> str:
-        """Run the agent with streaming output."""
-        messages = [
-            StreamingMessage(role="system", content=get_tools_prompt(self.workspace_path)),
-            StreamingMessage(role="user", content=user_input),
-        ]
+        """Run the agent with streaming output. Maintains conversation history."""
+        # Initialize system prompt if first run
+        if not self._initialized:
+            self.messages = [
+                StreamingMessage(role="system", content=get_tools_prompt(self.workspace_path)),
+            ]
+            self._initialized = True
+        
+        # Add user's new message
+        self.messages.append(StreamingMessage(role="user", content=user_input))
         
         async with StreamingJSONClient(
             api_key=self.config.api_key,
@@ -128,7 +162,7 @@ class StreamingAgent:
                     sys.stdout.flush()
                 
                 response = await client.chat_stream(
-                    messages=messages,
+                    messages=self.messages,
                     on_content=print_char,
                 )
                 
@@ -140,7 +174,7 @@ class StreamingAgent:
                     print("⏳ (continuing...)", end="", flush=True)
                     
                     # Ask to continue
-                    continuation_messages = messages + [
+                    continuation_messages = self.messages + [
                         StreamingMessage(role="assistant", content=accumulated_json),
                         StreamingMessage(role="user", content="Continue from where you stopped. Output ONLY the remaining JSON, nothing else.")
                     ]
@@ -183,6 +217,11 @@ class StreamingAgent:
                 
                 # No tool call - final response
                 if not response.has_tool_call:
+                    # Add assistant's final response to history
+                    self.messages.append(StreamingMessage(
+                        role="assistant",
+                        content=response.raw_json
+                    ))
                     return response.message or ""
                 
                 # Execute tool
@@ -200,12 +239,12 @@ class StreamingAgent:
                         result = f"Error: {str(e)}"
                         print(f"❌ {tool_name}: {e}")
                 
-                # Add assistant response and tool result to messages
-                messages.append(StreamingMessage(
+                # Add assistant response and tool result to history
+                self.messages.append(StreamingMessage(
                     role="assistant",
                     content=response.raw_json
                 ))
-                messages.append(StreamingMessage(
+                self.messages.append(StreamingMessage(
                     role="user",
                     content=f"Tool result for {tool_name}:\n{result}"
                 ))
