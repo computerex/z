@@ -1,0 +1,5 @@
+=== Full Model Output (272 chars) ===
+The file has been successfully created with all the specified content. The prompts_test.go file now contains the complete implementation for system prompt generation with OS detection, custom prompt support, and a comprehensive default system prompt with tool definitions.
+
+=== Parsed Tool Call ===
+None

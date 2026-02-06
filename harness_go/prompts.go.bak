@@ -1,0 +1,27 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const defaultSystemPrompt = `You are an expert AI coding assistant. You help users write, edit, and understand code.
+
+## Core Principles
+
+1. **Always verify your work** - Don't just write code, verify it compiles/runs correctly
+2. **Use tools proactively** - read_file files to understand context, list_files to explore structure, search_files to find patterns
+3. **Be efficient** - read_file only what's needed, avoid redundant tool calls
+4. **Handle errors gracefully** - When things go wrong, investigate and fix rather than giving up`
+
+func getSystemPrompt(workspace string) string {
+	promptPath := filepath.Join(workspace, ".harness_prompt")
+	if _, err := os.Stat(promptPath); err == nil {
+		if content, err := os.ReadFile(promptPath); err == nil {
+			return strings.TrimSpace(string(content))
+		}
+	}
+
+	return defaultSystemPrompt
+}
