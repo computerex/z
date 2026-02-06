@@ -14,7 +14,7 @@ from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
 from .prompts import get_system_prompt
 from .cost_tracker import get_global_tracker
-from .interrupt import is_interrupted, reset_interrupt, start_monitoring, stop_monitoring
+from .interrupt import is_interrupted, is_background_requested, reset_interrupt, start_monitoring, stop_monitoring
 
 
 @dataclass
@@ -339,23 +339,9 @@ class ClineAgent:
     
     async def _execute_command(self, params: Dict[str, str]) -> str:
         """Execute a shell command with live output display and interrupt support."""
+        import time
         command = params.get("command", "")
         background = params.get("background", "").lower() == "true"
-        
-        # Detect server-like commands that should run in background
-        server_patterns = [
-            'flask run', 'python.*app.py', 'npm start', 'npm run dev',
-            'node server', 'uvicorn', 'gunicorn', 'python -m http.server',
-            'ng serve', 'yarn start', 'yarn dev', 'vite', 'next dev',
-            'python manage.py runserver', 'rails server', 'rails s',
-        ]
-        
-        import re as regex_module
-        is_server_command = any(regex_module.search(p, command, regex_module.IGNORECASE) for p in server_patterns)
-        
-        if is_server_command and not background:
-            background = True
-            self.console.print(f"[yellow]⚠️  Detected server command - running in background[/yellow]")
         
         # Show command being executed
         print()
@@ -363,35 +349,9 @@ class ClineAgent:
         self.console.print(f"[dim]$ {mode_indicator}{command}[/dim]")
         
         if background:
-            # Run in background - don't wait for completion
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.workspace_path,
-            )
-            
-            # Store background process
-            proc_id = len(self._background_procs) + 1
-            self._background_procs[proc_id] = proc
-            
-            # Wait briefly to capture initial output
-            output_lines = []
-            try:
-                for _ in range(20):  # Read up to 20 lines or 2 seconds
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
-                    if not line:
-                        break
-                    decoded = line.decode("utf-8", errors="replace").rstrip()
-                    output_lines.append(decoded)
-                    self.console.print(f"[dim]  {decoded}[/dim]")
-            except asyncio.TimeoutError:
-                pass
-            
-            self.console.print(f"[green]↳ Running in background (PID: {proc.pid})[/green]")
-            return f"Command started in background (PID: {proc.pid}).\nInitial output:\n" + "\n".join(output_lines[-10:])
+            return await self._run_background_command(command)
         
-        # Foreground execution with interrupt support
+        # Foreground execution with interrupt/background support
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
@@ -401,16 +361,32 @@ class ClineAgent:
         
         output_lines = []
         interrupted = False
+        start_time = time.time()
+        hint_shown = False
         
         try:
-            # Stream output in real-time with interrupt checking
             while True:
-                # Check for interrupt
+                # Check for interrupt (Esc)
                 if is_interrupted():
                     interrupted = True
                     proc.terminate()
                     self.console.print(f"\n[yellow]⏹️  Command interrupted[/yellow]")
                     break
+                
+                # Check for background request (Ctrl+B)
+                if is_background_requested():
+                    self.console.print(f"\n[cyan]↳ Sending to background...[/cyan]")
+                    # Store process and return
+                    proc_id = len(self._background_procs) + 1
+                    self._background_procs[proc_id] = proc
+                    self.console.print(f"[green]↳ Running in background (PID: {proc.pid})[/green]")
+                    return f"Command sent to background (PID: {proc.pid}).\nOutput so far:\n" + "\n".join(output_lines[-20:])
+                
+                # Show hint after 5 seconds of running
+                elapsed = time.time() - start_time
+                if elapsed > 5 and not hint_shown:
+                    self.console.print(f"[dim]  (Ctrl+B to background, Esc to stop)[/dim]")
+                    hint_shown = True
                 
                 try:
                     line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
@@ -438,6 +414,35 @@ class ClineAgent:
         except Exception as e:
             proc.kill()
             return f"Error: {str(e)}"
+    
+    async def _run_background_command(self, command: str) -> str:
+        """Run a command in background."""
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=self.workspace_path,
+        )
+        
+        # Store background process
+        proc_id = len(self._background_procs) + 1
+        self._background_procs[proc_id] = proc
+        
+        # Wait briefly to capture initial output
+        output_lines = []
+        try:
+            for _ in range(20):
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                output_lines.append(decoded)
+                self.console.print(f"[dim]  {decoded}[/dim]")
+        except asyncio.TimeoutError:
+            pass
+        
+        self.console.print(f"[green]↳ Running in background (PID: {proc.pid})[/green]")
+        return f"Command started in background (PID: {proc.pid}).\nInitial output:\n" + "\n".join(output_lines[-10:])
     
     async def _list_files(self, params: Dict[str, str]) -> str:
         path = self._resolve_path(params.get("path", "."))

@@ -11,15 +11,21 @@ from dataclasses import dataclass
 class InterruptState:
     """Shared state for interrupt handling."""
     interrupted: bool = False
+    background: bool = False
     reason: str = ""
     
     def reset(self):
         self.interrupted = False
+        self.background = False
         self.reason = ""
     
     def trigger(self, reason: str = "user"):
         self.interrupted = True
         self.reason = reason
+    
+    def trigger_background(self):
+        self.background = True
+        self.reason = "background"
 
 
 # Global interrupt state
@@ -41,8 +47,13 @@ def is_interrupted() -> bool:
     return _interrupt_state.interrupted
 
 
+def is_background_requested() -> bool:
+    """Check if background was requested."""
+    return _interrupt_state.background
+
+
 class KeyboardMonitor:
-    """Monitor for escape key press during streaming."""
+    """Monitor for escape key and Ctrl+B during streaming."""
     
     def __init__(self):
         self._running = False
@@ -50,7 +61,7 @@ class KeyboardMonitor:
         self._stop_event = threading.Event()
     
     def start(self):
-        """Start monitoring for escape key."""
+        """Start monitoring for keys."""
         if self._running:
             return
         
@@ -70,7 +81,7 @@ class KeyboardMonitor:
             self._thread = None
     
     def _monitor_loop(self):
-        """Monitor for escape key in background thread."""
+        """Monitor for keys in background thread."""
         if sys.platform == 'win32':
             self._monitor_windows()
         else:
@@ -87,7 +98,10 @@ class KeyboardMonitor:
                 if key == b'\x1b':
                     _interrupt_state.trigger("escape")
                     break
-                # Ctrl+C handled separately by signal
+                # Ctrl+B = 0x02
+                elif key == b'\x02':
+                    _interrupt_state.trigger_background()
+                    break
             self._stop_event.wait(0.05)  # 50ms polling
     
     def _monitor_unix(self):
@@ -106,6 +120,9 @@ class KeyboardMonitor:
                     key = sys.stdin.read(1)
                     if key == '\x1b':  # Escape
                         _interrupt_state.trigger("escape")
+                        break
+                    elif key == '\x02':  # Ctrl+B
+                        _interrupt_state.trigger_background()
                         break
         except:
             pass

@@ -142,7 +142,7 @@ def main():
         agent.save_session(str(session_path))
     else:
         # Interactive mode
-        console.print("[bold blue]Harness[/bold blue] - Press [bold]Esc[/bold] to interrupt | Commands: /sessions, /session, /clear, /exit")
+        console.print("[bold blue]Harness[/bold blue] - [bold]Esc[/bold] interrupt | [bold]Ctrl+B[/bold] background | /help for commands")
         console.print(f"[dim]Workspace: {workspace}[/dim]\n")
         
         while True:
@@ -225,8 +225,23 @@ def main():
                         console.print(f"[dim]Messages: {len(agent.messages)}[/dim]")
                         continue
                     
+                    elif cmd in ('/help', '/?'):
+                        console.print("""[dim]Commands:
+  /sessions          - List all sessions
+  /session <name>    - Switch to session (creates if new)
+  /delete <name>     - Delete a session
+  /clear             - Clear conversation history
+  /save              - Save current session
+  /history           - Show message count
+  /exit              - Save and exit
+
+Keys during commands:
+  Esc                - Stop/interrupt
+  Ctrl+B             - Send to background[/dim]""")
+                        continue
+                    
                     else:
-                        console.print("[dim]Commands: /sessions, /session <name>, /delete <name>, /clear, /save, /exit[/dim]")
+                        console.print("[dim]Type /help for commands[/dim]")
                         continue
                 
                 asyncio.run(run_single(agent, user_input, console))
