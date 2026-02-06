@@ -125,7 +125,7 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         'read_file', 'write_to_file', 'replace_in_file',
         'execute_command', 'list_files', 'search_files',
         'check_background_process', 'stop_background_process', 'list_background_processes',
-        'list_context', 'remove_from_context',
+        'list_context', 'remove_from_context', 'analyze_image',
         'attempt_completion'
     ]
     
@@ -297,8 +297,13 @@ class ClineAgent:
         }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
     
-    def load_session(self, path: str) -> bool:
-        """Load conversation history and context."""
+    def load_session(self, path: str, inject_resume: bool = True) -> bool:
+        """Load conversation history and context.
+        
+        Args:
+            path: Path to session file
+            inject_resume: If True, adds a resume context message to help the model
+        """
         import json
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -319,10 +324,57 @@ class ClineAgent:
                     self.context._items[item.id] = item
                 self.context._next_id = data.get("context_next_id", max(self.context._items.keys(), default=0) + 1)
             
+            # Inject a resume context message to orient the model
+            if inject_resume and len(self.messages) > 1:
+                resume_msg = self._build_resume_context()
+                if resume_msg:
+                    self.messages.append(StreamingMessage(role="user", content=resume_msg))
+            
             self._initialized = True
             return True
         except:
             return False
+    
+    def _build_resume_context(self) -> str:
+        """Build a resume context message from conversation history."""
+        # Find the last few exchanges to summarize
+        summary_parts = []
+        
+        # Get last user request (not tool results)
+        last_user_request = None
+        for msg in reversed(self.messages):
+            if msg.role == "user" and not msg.content.startswith("[") and not msg.content.startswith("<"):
+                last_user_request = msg.content[:200]
+                break
+        
+        # Get last assistant action
+        last_action = None
+        for msg in reversed(self.messages):
+            if msg.role == "assistant":
+                # Extract tool name if any
+                if "<read_file>" in msg.content:
+                    last_action = "reading files"
+                elif "<write_to_file>" in msg.content:
+                    last_action = "writing files"
+                elif "<execute_command>" in msg.content:
+                    last_action = "executing commands"
+                elif "<search_files>" in msg.content:
+                    last_action = "searching code"
+                elif "<attempt_completion>" in msg.content:
+                    last_action = "completing the task"
+                else:
+                    last_action = "responding"
+                break
+        
+        if last_user_request:
+            summary_parts.append(f"Last request: {last_user_request}...")
+        if last_action:
+            summary_parts.append(f"Last action: {last_action}")
+        
+        if not summary_parts:
+            return ""
+        
+        return f"[Session resumed. {' '.join(summary_parts)}. Continue where you left off or ask what you need to know.]"
     
     def clear_history(self) -> None:
         """Clear conversation history and context."""
@@ -348,6 +400,66 @@ class ClineAgent:
             "context_items": len(self.context.list_items()),
             "context_chars": self.context.total_size(),
         }
+    
+    def get_token_breakdown(self) -> dict:
+        """Get detailed breakdown of where tokens are going."""
+        system_tokens = 0
+        conv_tokens = 0
+        message_sizes = []
+        
+        for i, msg in enumerate(self.messages):
+            tokens = estimate_tokens(msg.content)
+            if msg.role == "system":
+                system_tokens += tokens
+            else:
+                conv_tokens += tokens
+                # Track largest messages for diagnosis
+                preview = msg.content[:100].replace('\n', ' ')
+                message_sizes.append({
+                    "index": i,
+                    "role": msg.role,
+                    "tokens": tokens,
+                    "preview": preview
+                })
+        
+        # Sort by size, get top 5
+        message_sizes.sort(key=lambda x: x["tokens"], reverse=True)
+        largest = message_sizes[:5]
+        
+        return {
+            "system": system_tokens,
+            "conversation": conv_tokens,
+            "total": system_tokens + conv_tokens,
+            "message_count": len(self.messages) - 1,  # minus system
+            "largest_messages": largest
+        }
+    
+    def compact_history(self, strategy: str = "half") -> int:
+        """Compact conversation history by removing older messages.
+        
+        Strategies:
+        - 'half': Remove first half of messages
+        - 'quarter': Remove first quarter of messages
+        - 'last2': Keep only last 2 exchanges
+        
+        Returns: number of tokens removed
+        """
+        before = estimate_messages_tokens(self.messages)
+        
+        # Find messages (skip system prompt at index 0)
+        if len(self.messages) <= 1:
+            return 0
+        
+        # Map strategy names
+        strat_map = {'last2': 'lastTwo'}
+        strat = strat_map.get(strategy, strategy)
+        
+        # Apply truncation to messages (preserves system prompt)
+        result = truncate_conversation(self.messages, strat)
+        self.messages = result.messages
+        
+        after = estimate_messages_tokens(self.messages)
+        return before - after
     
     async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
         """Run the agent with streaming output."""
@@ -566,6 +678,12 @@ class ClineAgent:
                 source = tool.parameters.get("source", "")
                 self.console.print(f"[yellow]> Removing from context:[/yellow] {item_id or source}")
                 result = self._remove_from_context(tool.parameters)
+                
+            elif tool.name == "analyze_image":
+                path = tool.parameters.get("path", "")
+                question = tool.parameters.get("question", "Describe this image in detail.")
+                self.console.print(f"[magenta]> Analyzing image:[/magenta] {path}")
+                result = await self._analyze_image(tool.parameters)
                 
             elif tool.name == "attempt_completion":
                 self.console.print("[green]> Task complete[/green]")
@@ -1031,6 +1149,91 @@ class ClineAgent:
             result += f"  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}\n"
         return result
     
+    async def _analyze_image(self, params: Dict[str, str]) -> str:
+        """Analyze an image using GLM-4.6V vision model via coding endpoint."""
+        import base64
+        import httpx
+        from urllib.parse import urlparse
+        
+        path_str = params.get("path", "")
+        question = params.get("question", "Describe this image in detail. Note any text, UI elements, errors, or important visual details.")
+        
+        path = self._resolve_path(path_str)
+        if not path.exists():
+            return f"Error: Image not found: {path}"
+        
+        # Check file extension
+        ext = path.suffix.lower()
+        if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+            return f"Error: Unsupported image format: {ext}. Use jpg, png, gif, or webp."
+        
+        # Read and encode image as base64
+        try:
+            img_data = path.read_bytes()
+            img_base64 = base64.b64encode(img_data).decode('utf-8')
+        except Exception as e:
+            return f"Error reading image: {e}"
+        
+        # Determine mime type
+        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', 
+                    '.gif': 'image/gif', '.webp': 'image/webp'}
+        mime_type = mime_map.get(ext, 'image/png')
+        
+        # Use the Coding endpoint which properly supports vision with base64
+        # https://api.z.ai/api/coding/paas/v4/chat/completions
+        parsed = urlparse(self.config.api_url)
+        vision_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
+        
+        # OpenAI format with data URI base64
+        vision_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{img_base64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": question
+                    }
+                ]
+            }
+        ]
+        
+        payload = {
+            "model": "glm-4.6v",  # Vision model
+            "messages": vision_messages,
+            "max_tokens": 2048,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as http_client:
+                response = await http_client.post(vision_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Extract OpenAI response format
+                if "choices" in data and len(data["choices"]) > 0:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+                    if content:
+                        # Add to context
+                        ctx_id = self.context.add("image_analysis", str(path), content)
+                        return f"[Context ID: {ctx_id}]\n\nImage: {path_str}\n\n{content}"
+                    return "Vision model returned empty response."
+                return f"Unexpected response format: {data}"
+                
+        except httpx.HTTPStatusError as e:
+            return f"Error calling vision API: {e.response.status_code} - {e.response.text[:200]}"
+        except Exception as e:
+            return f"Error analyzing image: {e}"
+
 
 # Alias for backward compatibility
 StreamingAgent = ClineAgent

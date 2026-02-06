@@ -10,6 +10,7 @@ sys.stdout.reconfigure(write_through=True)
 
 import asyncio
 import hashlib
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -218,6 +219,8 @@ def main():
         history_file = get_sessions_dir(workspace) / ".history"
         prompt_session = create_prompt_session(history_file) if HAS_PROMPT_TOOLKIT else None
         
+        last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
+        
         while True:
             try:
                 # Show token count in prompt if significant
@@ -230,9 +233,23 @@ def main():
                     try:
                         user_input = prompt_session.prompt(prompt_text).strip()
                     except KeyboardInterrupt:
-                        continue  # Ctrl+C cancels current input
+                        now = time.time()
+                        if now - last_interrupt_time < 2.0:
+                            # Double Ctrl+C within 2 seconds - exit
+                            raise
+                        last_interrupt_time = now
+                        console.print("\n[dim]Ctrl+C again to exit[/dim]")
+                        continue
                 else:
-                    user_input = input(prompt_text).strip()
+                    try:
+                        user_input = input(prompt_text).strip()
+                    except KeyboardInterrupt:
+                        now = time.time()
+                        if now - last_interrupt_time < 2.0:
+                            raise
+                        last_interrupt_time = now
+                        console.print("\n[dim]Ctrl+C again to exit[/dim]")
+                        continue
                 
                 if not user_input:
                     continue
@@ -328,12 +345,37 @@ def main():
                         console.print(f"[dim]{agent.context.summary()}[/dim]")
                         continue
                     
+                    elif cmd == '/tokens':
+                        breakdown = agent.get_token_breakdown()
+                        console.print(f"[dim]Token breakdown:[/dim]")
+                        console.print(f"[dim]  System prompt: {breakdown['system']:,} tokens[/dim]")
+                        console.print(f"[dim]  Conversation:  {breakdown['conversation']:,} tokens ({breakdown['message_count']} messages)[/dim]")
+                        console.print(f"[dim]  Total:         {breakdown['total']:,} tokens[/dim]")
+                        if breakdown['largest_messages']:
+                            console.print(f"[dim]  Largest messages:[/dim]")
+                            for msg in breakdown['largest_messages']:
+                                role = msg['role']
+                                tokens = msg['tokens']
+                                preview = msg['preview'][:60] + '...' if len(msg['preview']) > 60 else msg['preview']
+                                console.print(f"[dim]    [{role}] {tokens:,}t: {preview}[/dim]")
+                        continue
+                    
+                    elif cmd == '/compact':
+                        strategy = cmd_arg.strip() if cmd_arg else 'half'
+                        before = agent.get_token_count()
+                        removed = agent.compact_history(strategy)
+                        after = agent.get_token_count()
+                        console.print(f"[dim]Compacted: {before:,} -> {after:,} tokens (-{removed:,})[/dim]")
+                        continue
+                    
                     elif cmd in ('/help', '/?'):
                         help_text = """[dim]Commands:
   /sessions          - List all sessions
   /session <name>    - Switch to session (creates if new)
   /delete <name>     - Delete a session
   /clear             - Clear conversation history
+  /compact [strat]   - Remove older messages (half/quarter/last2)
+  /tokens            - Show token breakdown  
   /save              - Save current session
   /history           - Show message count
   /bg                - List background processes
@@ -363,6 +405,7 @@ Input:
                     loop.run_until_complete(run_single(agent, user_input, console))
                 except KeyboardInterrupt:
                     console.print("\n[yellow][STOP] Interrupted - Ctrl+C again to exit[/yellow]")
+                    last_interrupt_time = time.time()  # Start the 2-second window
                 except Exception as e:
                     console.print(f"[red]Error: {e}[/red]")
                 print()  # Blank line between requests

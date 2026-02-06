@@ -3,17 +3,23 @@
 import json
 import asyncio
 import httpx
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 from dataclasses import dataclass, field
 
 
 @dataclass 
 class StreamingMessage:
-    """A message for the streaming client."""
-    role: str
-    content: str
+    """A message for the streaming client.
     
-    def to_dict(self) -> Dict[str, str]:
+    Content can be:
+    - str: Simple text message
+    - list: Multi-part content for vision (OpenAI-compatible format)
+      e.g., [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]
+    """
+    role: str
+    content: Union[str, List[Dict[str, Any]]]
+    
+    def to_dict(self) -> Dict[str, Any]:
         return {"role": self.role, "content": self.content}
 
 

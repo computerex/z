@@ -1,12 +1,32 @@
 """Context management utilities - Cline-style truncation and optimization."""
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union, Any
 from dataclasses import dataclass
 
 
-def estimate_tokens(text: str) -> int:
-    """Estimate token count. Rough approximation: ~4 chars per token."""
-    return len(text) // 4
+def estimate_tokens(text: Union[str, List, Any]) -> int:
+    """Estimate token count. Rough approximation: ~4 chars per token.
+    
+    Handles both string content and list content (for vision messages).
+    """
+    if isinstance(text, str):
+        return len(text) // 4
+    elif isinstance(text, list):
+        # Vision format: list of content blocks
+        total = 0
+        for block in text:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    total += len(block.get("text", "")) // 4
+                elif block.get("type") == "image_url":
+                    total += 1000  # Rough estimate for image tokens
+                else:
+                    total += 50  # Unknown block type
+            else:
+                total += 50
+        return total
+    else:
+        return 50  # Fallback for unknown types
 
 
 def estimate_messages_tokens(messages: List[dict]) -> int:

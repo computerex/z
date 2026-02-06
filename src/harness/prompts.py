@@ -216,6 +216,17 @@ Usage:
 <file_pattern>*.py</file_pattern>
 </search_files>
 
+## analyze_image
+Description: Analyze an image file and answer questions about it. Use this to understand screenshots, diagrams, UI mockups, error messages, or any visual content. The image will be processed by a vision model.
+Parameters:
+- path: (required) The path to the image file (relative to the current working directory {workspace_path}). Supports jpg, png, gif, webp formats.
+- question: (optional) A specific question about the image. If not provided, will give a detailed description.
+Usage:
+<analyze_image>
+<path>screenshot.png</path>
+<question>What error message is shown?</question>
+</analyze_image>
+
 ## list_context
 Description: View all items currently in your context container. This shows files, command outputs, and search results you've loaded. Each item has an ID, type, source, size, and age. Use this to understand what information you have available and identify items that are no longer needed.
 Parameters: None
