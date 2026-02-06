@@ -288,6 +288,10 @@ class ClineAgent:
             duplicate_detector=self._duplicate_detector
         )
     
+    async def cleanup_background_procs_async(self) -> None:
+        """Terminate all background processes safely (async)."""
+        return await self.tool_handlers.cleanup_background_procs_async()
+    
     def cleanup_background_procs(self) -> None:
         """Terminate all background processes safely (sync wrapper)."""
         return self.tool_handlers.cleanup_background_procs()
