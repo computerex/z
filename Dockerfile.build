@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt pyinstaller
+
+# Copy source code
+COPY . .
+
+# Build the executable
+CMD ["python", "build.py"]
