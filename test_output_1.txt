@@ -1,0 +1,212 @@
+New session 'default'
+I'll create a complete prompts.go file for harness_go/ with the system prompt functionality, tool documentation, and runtime detection.
+
+<write_to_file>
+<path>prompts.go</path>
+<content>package main
+
+import (
+	"os"
+	"runtime"
+	"strings"
+)
+
+const defaultSystemPrompt = `You are an AI assistant with access to tools. Here are the tools available:
+
+## read_file
+Read the contents of a file at the specified path.
+Parameters:
+- path (required): The path of the file to read
+
+Example:
+<read_file>
+<path>src/main.go</path>
+</read_file>
+
+## write_to_file
+Write content to a NEW file at the specified path. This will create any necessary directories.
+Parameters:
+- path (required): The path of the file to write
+- content (required): The content to write
+
+Example:
+<write_to_file>
+<path>newfile.txt</path>
+<content>Hello, world!</content>
+</write_to_file>
+
+## replace_in_file
+Replace sections of content in an existing file using SEARCH/REPLACE blocks.
+Parameters:
+- path (required): The path of the file to modify
+- diff (required): One or more SEARCH/REPLACE blocks in this format:
+  <<<<<<< SEARCH
+  [exact content to find]
+  =======
+  [new content to replace with]
+  >>>>>>> REPLACE
+
+Example:
+<replace_in_file>
+<path>config.yaml</path>
+<diff>
+<<<<<<< SEARCH
+old value
+=======
+new value
+>>>>>>> REPLACE
+</diff>
+</replace_in_file>
+
+## execute_command
+Execute a CLI command on the system.
+Parameters:
+- command (required): The CLI command to execute
+- background (optional): Set to "true" to run in background (for servers, watch modes, etc.)
+
+Example:
+<execute_command>
+<command>go build</command>
+</execute_command>
+
+## list_files
+List files and directories within the specified directory.
+Parameters:
+- path (required): The directory path to list
+- recursive (optional): Whether to list recursively (true/false)
+
+Example:
+<list_files>
+<path>src</path>
+<recursive>true</recursive>
+</list_files>
+
+## search_files
+Perform a regex search across files in a specified directory.
+Parameters:
+- path (required): The directory path to search in
+- regex (required): The regex pattern to search for
+- file_pattern (optional): Glob pattern to filter files (e.g., *.go)
+
+Example:
+<search_files>
+<path>src</path>
+<regex>func.*main</regex>
+<file_pattern>*.go</file_pattern>
+</search_files>
+
+Environment:
+- OS: %%OS%%
+- Shell: %%SHELL%%
+- Workspace: %%WORKSPACE%%
+`
+
+var (
+	detectedOS    string
+	detectedShell string
+)
+
+func init() {
+	detectedOS = runtime.GOOS
+
+	// Detect shell based on OS
+	switch runtime.GOOS {
+	case "windows":
+		detectedShell = "PowerShell"
+	case "darwin":
+		detectedShell = "zsh"
+	default: // linux and others
+		detectedShell = "bash"
+	}
+}
+
+func getSystemPrompt(workspace string) string {
+	// Check for .harness_prompt override
+	if content, err := os.ReadFile(".harness_prompt"); err == nil {
+		return string(content)
+	}
+
+	// Use default with replacements
+	prompt := defaultSystemPrompt
+	prompt = strings.ReplaceAll(prompt, "%%OS%%", detectedOS)
+	prompt = strings.ReplaceAll(prompt, "%%SHELL%%", detectedShell)
+	prompt = strings.ReplaceAll(prompt, "%%WORKSPACE%%", workspace)
+
+	return prompt
+}
+</content>
+</write_to_file>
+[DEBUG] Saved model output to C:\projects\harness\harness_go\.harness_debug.txt
+[DEBUG] parse_xml_tool returned: ParsedToolCall(name='write_to_file', parameters={'path': 'prompts.go', 'command': 'go build', 'regex': 'func.*main', 'file_pattern': '*.go', 'recursive': 'true', 'content': 'package main\n\nimport (\n\t"os"\n\t"runtime"\n\t"strings"\n)\n\nconst defaultSystemPrompt = `You are an AI assistant with access to tools. Here are the tools available:\n\n## read_file\nRead the contents of a file at the specified path.\nParameters:\n- path (required): The path of the file to read\n\nExample:\n<read_file>\n<path>src/main.go</path>\n</read_file>\n\n## write_to_file\nWrite content to a NEW file at the specified path. This will create any necessary directories.\nParameters:\n- path (required): The path of the file to write\n- content (required): The content to write\n\nExample:\n<write_to_file>\n<path>newfile.txt</path>\n<content>Hello, world!</content>\n</write_to_file>\n\n## replace_in_file\nReplace sections of content in an existing file using SEARCH/REPLACE blocks.\nParameters:\n- path (required): The path of the file to modify\n- diff (required): One or more SEARCH/REPLACE blocks in this format:\n  <<<<<<< SEARCH\n  [exact content to find]\n  =======\n  [new content to replace with]\n  >>>>>>> REPLACE\n\nExample:\n<replace_in_file>\n<path>config.yaml</path>\n<diff>\n<<<<<<< SEARCH\nold value\n=======\nnew value\n>>>>>>> REPLACE\n</diff>\n</replace_in_file>\n\n## execute_command\nExecute a CLI command on the system.\nParameters:\n- command (required): The CLI command to execute\n- background (optional): Set to "true" to run in background (for servers, watch modes, etc.)\n\nExample:\n<execute_command>\n<command>go build</command>\n</execute_command>\n\n## list_files\nList files and directories within the specified directory.\nParameters:\n- path (required): The directory path to list\n- recursive (optional): Whether to list recursively (true/false)\n\nExample:\n<list_files>\n<path>src</path>\n<recursive>true</recursive>\n</list_files>\n\n## search_files\nPerform a regex search across files in a specified directory.\nParameters:\n- path (required): The directory path to search in\n- regex (required): The regex pattern to search for\n- file_pattern (optional): Glob pattern to filter files (e.g., *.go)\n\nExample:\n<search_files>\n<path>src</path>\n<regex>func.*main</regex>\n<file_pattern>*.go</file_pattern>\n</search_files>\n\nEnvironment:\n- OS: %%OS%%\n- Shell: %%SHELL%%\n- Workspace: %%WORKSPACE%%\n`\n\nvar (\n\tdetectedOS    string\n\tdetectedShell string\n)\n\nfunc init() {\n\tdetectedOS = runtime.GOOS\n\n\t// Detect shell based on OS\n\tswitch runtime.GOOS {\n\tcase "windows":\n\t\tdetectedShell = "PowerShell"\n\tcase "darwin":\n\t\tdetectedShell = "zsh"\n\tdefault: // linux and others\n\t\tdetectedShell = "bash"\n\t}\n}\n\nfunc getSystemPrompt(workspace string) string {\n\t// Check for .harness_prompt override\n\tif content, err := os.ReadFile(".harness_prompt"); err == nil {\n\t\treturn string(content)\n\t}\n\n\t// Use default with replacements\n\tprompt := defaultSystemPrompt\n\tprompt = strings.ReplaceAll(prompt, "%%OS%%", detectedOS)\n\tprompt = strings.ReplaceAll(prompt, "%%SHELL%%", detectedShell)\n\tprompt = strings.ReplaceAll(prompt, "%%WORKSPACE%%", workspace)\n\n\treturn prompt\n}', 'diff': '<<<<<<< SEARCH\nold value\n=======\nnew value\n>>>>>>> REPLACE'})
+[DEBUG] tool=write_to_file, params keys=['path', 'command', 'regex', 'file_pattern', 'recursive', 'content', 'diff']
+> Writing: prompts.go (2909 bytes)
+Traceback (most recent call last):
+  File "C:\projects\harness\src\harness\cline_agent.py", line 804, in _execute_tool
+    result = await self._write_file(tool.parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\projects\harness\src\harness\cline_agent.py", line 963, in _write_file
+    self.console.print(f"[yellow]\u26a0\ufe0f  Warning: Overwriting existing file ({old_size} bytes). Consider using replace_in_file for edits.[/yellow]")
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 1692, in print
+    with self:
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 866, in __exit__
+    self._exit_buffer()
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 824, in _exit_buffer
+    self._check_buffer()
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 2033, in _check_buffer
+    self._write_buffer()
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 2069, in _write_buffer
+    legacy_windows_render(buffer, LegacyWindowsTerm(self.file))
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\_windows_renderer.py", line 17, in legacy_windows_render
+    term.write_styled(text, style)
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\_win32_console.py", line 441, in write_styled
+    self.write_text(text)
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\_win32_console.py", line 402, in write_text
+    self.write(text)
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-1: character maps to <undefined>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\projects\harness\harness.py", line 661, in <module>
+    main()
+  File "C:\projects\harness\harness.py", line 409, in main
+    loop.run_until_complete(run_single(agent, user_input, console))
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py", line 687, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\projects\harness\harness.py", line 301, in run_single
+    result = await agent.run(user_input)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\projects\harness\src\harness\cline_agent.py", line 629, in run
+    return await self._run_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\projects\harness\src\harness\cline_agent.py", line 766, in _run_loop
+    tool_result = await self._execute_tool(tool_call)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\projects\harness\src\harness\cline_agent.py", line 876, in _execute_tool
+    self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 1692, in print
+    with self:
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 866, in __exit__
+    self._exit_buffer()
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 824, in _exit_buffer
+    self._check_buffer()
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 2033, in _check_buffer
+    self._write_buffer()
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\console.py", line 2069, in _write_buffer
+    legacy_windows_render(buffer, LegacyWindowsTerm(self.file))
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\_windows_renderer.py", line 17, in legacy_windows_render
+    term.write_styled(text, style)
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\_win32_console.py", line 441, in write_styled
+    self.write_text(text)
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\site-packages\rich\_win32_console.py", line 402, in write_text
+    self.write(text)
+  File "C:\Users\mohd\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-1: character maps to <undefined>

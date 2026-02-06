@@ -324,14 +324,24 @@ func (tr *ToolRegistry) listFiles(params map[string]string) *ToolResult {
 		maxItems = 100
 	}
 
+	// User explicitly requested a hidden directory if path starts with . (but not just ".")
+	userRequestedHidden := strings.HasPrefix(pathStr, ".") && pathStr != "."
+
 	skipDirs := map[string]bool{
-		"node_modules": true,
-		".git":         true,
-		"__pycache__":  true,
-		".venv":        true,
-		"venv":         true,
-		"dist":         true,
-		"build":        true,
+		"node_modules": true, "__pycache__": true, "venv": true,
+		"dist": true, "build": true, "target": true, "vendor": true, "obj": true, "bin": true,
+	}
+
+	// shouldSkip returns true if we should skip this directory name
+	shouldSkip := func(name string) bool {
+		if userRequestedHidden {
+			return false
+		}
+		// Skip dotfiles/dotdirs
+		if strings.HasPrefix(name, ".") {
+			return true
+		}
+		return skipDirs[name]
 	}
 
 	truncated := false
@@ -363,7 +373,7 @@ func (tr *ToolRegistry) listFiles(params map[string]string) *ToolResult {
 			parts := strings.Split(filepath.ToSlash(relPath), "/")
 			skip := false
 			for _, part := range parts {
-				if skipDirs[part] {
+				if shouldSkip(part) {
 					skip = true
 					break
 				}
@@ -398,7 +408,7 @@ func (tr *ToolRegistry) listFiles(params map[string]string) *ToolResult {
 
 			relPath := entry.Name()
 
-			if skipDirs[relPath] {
+			if shouldSkip(relPath) {
 				continue
 			}
 
@@ -425,6 +435,9 @@ func (tr *ToolRegistry) listFiles(params map[string]string) *ToolResult {
 	}
 }
 
+// errMaxResults is returned to stop filepath.Walk when we have enough results
+var errMaxResults = fmt.Errorf("max results reached")
+
 func (tr *ToolRegistry) searchFiles(params map[string]string) *ToolResult {
 	pathStr := params["path"]
 	if pathStr == "" {
@@ -447,16 +460,54 @@ func (tr *ToolRegistry) searchFiles(params map[string]string) *ToolResult {
 		return &ToolResult{Success: false, Message: fmt.Sprintf("Error: Invalid regex: %v", err)}
 	}
 
+	// User explicitly requested a hidden directory if path starts with . (but not just ".")
+	userRequestedHidden := strings.HasPrefix(pathStr, ".") && pathStr != "."
+
+	// Directories to skip (non-dotfile junk)
+	skipDirs := map[string]bool{
+		"node_modules": true, "__pycache__": true, "venv": true,
+		"dist": true, "build": true, "target": true, "vendor": true, "bin": true, "obj": true,
+	}
+
+	// shouldSkipDir returns true if we should skip this directory
+	shouldSkipDir := func(name string) bool {
+		if userRequestedHidden {
+			return false
+		}
+		// Skip any directory starting with .
+		if strings.HasPrefix(name, ".") {
+			return true
+		}
+		return skipDirs[name]
+	}
+
 	results := []string{}
 	maxResults := 100
+	filesScanned := 0
+	maxFilesToScan := 5000 // Safety limit
 
 	filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 
+		// Skip common large directories and dotdirs
 		if info.IsDir() {
+			if shouldSkipDir(info.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
+		}
+
+		// Stop if we have enough results
+		if len(results) >= maxResults {
+			return errMaxResults
+		}
+
+		// Safety limit on files scanned
+		filesScanned++
+		if filesScanned >= maxFilesToScan {
+			return errMaxResults
 		}
 
 		matched, _ := filepath.Match(filePattern, filepath.Base(filePath))
@@ -464,13 +515,25 @@ func (tr *ToolRegistry) searchFiles(params map[string]string) *ToolResult {
 			return nil
 		}
 
-		if len(results) >= maxResults {
+		// Skip large files (>1MB) and binary files
+		if info.Size() > 1024*1024 {
 			return nil
 		}
 
 		content, err := os.ReadFile(filePath)
 		if err != nil {
 			return nil
+		}
+
+		// Skip binary files (check for null bytes in first 512 bytes)
+		checkLen := 512
+		if len(content) < checkLen {
+			checkLen = len(content)
+		}
+		for i := 0; i < checkLen; i++ {
+			if content[i] == 0 {
+				return nil // Binary file
+			}
 		}
 
 		relPath, _ := filepath.Rel(path, filePath)
@@ -483,7 +546,7 @@ func (tr *ToolRegistry) searchFiles(params map[string]string) *ToolResult {
 				}
 				results = append(results, fmt.Sprintf("%s:%d: %s", relPath, i+1, linePreview))
 				if len(results) >= maxResults {
-					break
+					return errMaxResults
 				}
 			}
 		}

@@ -1246,9 +1246,25 @@ class ClineAgent:
         if not path.exists():
             return f"Error: Directory not found: {path}"
         
+        # Skip directories starting with . or common junk, unless user explicitly requested them
+        user_path = params.get("path", ".")
+        user_requested_hidden = user_path.startswith(".") and user_path != "."
+        skip_dirs = {'node_modules', '__pycache__', 'venv', 'dist', 'build', 'target', 'vendor', 'obj', 'bin'}
+        
+        def should_skip(p: Path) -> bool:
+            if user_requested_hidden:
+                return False
+            for part in p.relative_to(path).parts:
+                # Skip dotfiles/dotdirs (except current dir)
+                if part.startswith('.') and part != '.':
+                    return True
+                if part in skip_dirs:
+                    return True
+            return False
+        
         items = []
         truncated = False
-        max_items = 100 if recursive else 50  # Smaller limits
+        max_items = 100 if recursive else 50
         
         try:
             if recursive:
@@ -1256,9 +1272,7 @@ class ClineAgent:
                     if len(items) >= max_items:
                         truncated = True
                         break
-                    # Skip common junk directories
-                    parts = p.parts
-                    if any(skip in parts for skip in ['node_modules', '.git', '__pycache__', '.venv', 'venv', 'dist', 'build']):
+                    if should_skip(p):
                         continue
                     rel = p.relative_to(path)
                     suffix = "/" if p.is_dir() else ""
@@ -1291,10 +1305,36 @@ class ClineAgent:
         except re.error as e:
             return f"Error: Invalid regex: {e}"
         
+        # Skip directories starting with . or common junk, unless user explicitly requested
+        user_path = params.get("path", ".")
+        user_requested_hidden = user_path.startswith(".") and user_path != "."
+        skip_dirs = {'node_modules', '__pycache__', 'venv', 'dist', 'build', 'target', 'vendor', 'obj', 'bin'}
+        
+        def should_skip(p: Path) -> bool:
+            if user_requested_hidden:
+                return False
+            for part in p.relative_to(path).parts:
+                if part.startswith('.') and part != '.':
+                    return True
+                if part in skip_dirs:
+                    return True
+            return False
+        
         results = []
+        files_scanned = 0
+        max_files = 2000  # Safety limit
+        
         for file in path.rglob(file_pattern):
+            if should_skip(file):
+                continue
             if file.is_file():
+                files_scanned += 1
+                if files_scanned > max_files:
+                    break
+                # Skip large files (>1MB)
                 try:
+                    if file.stat().st_size > 1024 * 1024:
+                        continue
                     content = file.read_text(encoding="utf-8", errors="ignore")
                     for i, line in enumerate(content.splitlines(), 1):
                         if pattern.search(line):
