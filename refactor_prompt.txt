@@ -1,0 +1,11 @@
+Refactor src/harness/cline_agent.py to extract tool implementations into a separate module.
+
+Current state: cline_agent.py is 1637 lines with all 15 tool implementations inline (_read_file, _write_file, _replace_in_file, _execute_command, _list_files, _search_files, etc.)
+
+Goal:
+1. Create src/harness/tool_handlers.py with a ToolHandlers class containing all the tool implementation methods
+2. Move all _read_file, _write_file, _replace_in_file, _execute_command, _list_files, _search_files, _check_background_process, _stop_background_process, _list_background_processes, _analyze_image, _web_search methods to ToolHandlers
+3. Have ClineAgent inherit from or compose with ToolHandlers
+4. Keep _execute_tool in ClineAgent but have it delegate to the handler methods
+
+Start by reading the current cline_agent.py to understand the structure, then implement the refactor.
