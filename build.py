@@ -6,11 +6,14 @@ Usage:
     python build.py              # Build for current platform
     python build.py --clean      # Clean build artifacts first
     python build.py --onedir     # Build as directory (faster startup, larger size)
+    python build.py --linux      # Build Linux executable via Docker
 
 Requirements:
     pip install pyinstaller
+    Docker (for --linux cross-compilation)
 
-Note: Cross-compilation is not supported. Run this script on each target platform:
+Note: Native cross-compilation is not supported. Use --linux flag to build
+Linux binaries via Docker from any platform.
     - Windows: produces harness.exe
     - Linux: produces harness
     - macOS: produces harness
@@ -245,21 +248,105 @@ def check_pyinstaller():
         return False
 
 
+def build_linux_via_docker(root: Path) -> bool:
+    """Build Linux executable using Docker."""
+    print(f"\n{'='*60}")
+    print("Building Linux executable via Docker")
+    print(f"{'='*60}\n")
+    
+    # Check if Docker is available
+    try:
+        result = subprocess.run(
+            ["docker", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print("Docker is not available. Please install Docker.")
+            return False
+    except FileNotFoundError:
+        print("Docker command not found. Please install Docker.")
+        return False
+    
+    image_name = "harness-builder"
+    container_name = "harness-build-temp"
+    
+    # Build the Docker image
+    print("Building Docker image...")
+    result = subprocess.run(
+        ["docker", "build", "-f", "Dockerfile.build", "-t", image_name, "."],
+        cwd=root,
+    )
+    if result.returncode != 0:
+        print("Failed to build Docker image.")
+        return False
+    
+    # Create dist directory if it doesn't exist
+    dist_dir = root / "dist"
+    dist_dir.mkdir(exist_ok=True)
+    
+    # Run the container to build
+    print("\nBuilding executable in container...")
+    
+    # Remove any existing container with the same name
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        capture_output=True,
+    )
+    
+    # Run the build
+    result = subprocess.run(
+        [
+            "docker", "run",
+            "--name", container_name,
+            image_name,
+        ],
+        cwd=root,
+    )
+    
+    if result.returncode != 0:
+        print("Build failed in container.")
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        return False
+    
+    # Copy the built executable out
+    print("\nCopying executable from container...")
+    linux_exe = dist_dir / "harness-linux"
+    result = subprocess.run(
+        ["docker", "cp", f"{container_name}:/app/dist/harness", str(linux_exe)],
+        cwd=root,
+    )
+    
+    # Clean up container
+    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+    
+    if result.returncode != 0:
+        print("Failed to copy executable from container.")
+        return False
+    
+    if linux_exe.exists():
+        size_mb = linux_exe.stat().st_size / (1024 * 1024)
+        print(f"\n{'='*60}")
+        print(f"Build successful!")
+        print(f"Executable: {linux_exe}")
+        print(f"Size: {size_mb:.1f} MB")
+        print(f"{'='*60}\n")
+        return True
+    else:
+        print("Executable not found after build.")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build harness executable")
     parser.add_argument("--clean", action="store_true", help="Clean build artifacts before building")
     parser.add_argument("--clean-only", action="store_true", help="Only clean, don't build")
     parser.add_argument("--onedir", action="store_true", help="Build as directory instead of single file")
     parser.add_argument("--debug", action="store_true", help="Build with debug info")
+    parser.add_argument("--linux", action="store_true", help="Build Linux executable via Docker")
     args = parser.parse_args()
     
     root = Path(__file__).parent.absolute()
-    
-    # Check PyInstaller
-    if not check_pyinstaller():
-        print("PyInstaller not found. Install it with:")
-        print("  pip install pyinstaller")
-        return 1
     
     # Clean if requested
     if args.clean or args.clean_only:
@@ -267,6 +354,17 @@ def main():
         if args.clean_only:
             print("Clean complete.")
             return 0
+    
+    # Docker build for Linux
+    if args.linux:
+        success = build_linux_via_docker(root)
+        return 0 if success else 1
+    
+    # Native build - check PyInstaller
+    if not check_pyinstaller():
+        print("PyInstaller not found. Install it with:")
+        print("  pip install pyinstaller")
+        return 1
     
     # Build
     success = build_executable(

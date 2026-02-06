@@ -1,0 +1,36 @@
+# Ignore virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Ignore build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore IDE
+.vscode/
+.idea/
+
+# Ignore sessions and cache
+.sessions/
+.pytest_cache/
+
+# Ignore test artifacts
+*.log
+debug_output.txt
+test_output*.txt
+
+# Ignore large model files if any
+*.bin
+*.pt
+*.onnx
