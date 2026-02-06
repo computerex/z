@@ -48,8 +48,11 @@ class ContentExtractor:
     """Extract content/code fields from streaming JSON in real-time."""
     
     # Fields to stream (parameter values that contain code/content)
-    STREAM_FIELDS = ('"content": "', '"content":"', '"old_string": "', '"old_string":"', 
-                     '"new_string": "', '"new_string":"')
+    STREAM_FIELDS = ('"content": "', '"content":"', 
+                     '"old_string": "', '"old_string":"', 
+                     '"new_string": "', '"new_string":"',
+                     '"command": "', '"command":"',
+                     '"pattern": "', '"pattern":"')
     
     def __init__(self):
         self.buffer = ""
