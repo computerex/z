@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+# Install minimal dependencies for testing
+RUN apt-get update && apt-get install -y \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the Linux executable
+COPY dist/harness-linux /app/harness
+RUN chmod +x /app/harness
+
+# Copy test files and torture_test directory
+COPY tests/ /app/tests/
+COPY torture_test/ /app/torture_test/
+
+# Copy .env config (needed for API access)
+COPY .env /app/.env
+
+# Set PATH to include current directory
+ENV PATH="/app:${PATH}"
+
+# Default command runs the stress test
+CMD ["python", "tests/stress_test_linux.py"]

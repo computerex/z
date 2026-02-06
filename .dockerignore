@@ -4,9 +4,8 @@ venv/
 ENV/
 env/
 
-# Ignore build artifacts
+# Ignore build artifacts (but not dist/ - needed for testing)
 build/
-dist/
 *.egg-info/
 *.egg
 __pycache__/
