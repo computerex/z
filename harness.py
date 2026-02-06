@@ -11,6 +11,7 @@ sys.stdout.reconfigure(write_through=True)
 import asyncio
 import hashlib
 from pathlib import Path
+from datetime import datetime
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
@@ -22,13 +23,40 @@ from rich.console import Console
 from rich.panel import Panel
 
 
-def get_session_path(workspace: str) -> Path:
-    """Get session file path for a workspace."""
+def get_sessions_dir(workspace: str) -> Path:
+    """Get sessions directory for a workspace."""
     harness_dir = Path(__file__).parent
     sessions_dir = harness_dir / ".sessions"
-    sessions_dir.mkdir(exist_ok=True)
     workspace_hash = hashlib.md5(workspace.encode()).hexdigest()[:12]
-    return sessions_dir / f"{workspace_hash}.json"
+    workspace_sessions = sessions_dir / workspace_hash
+    workspace_sessions.mkdir(parents=True, exist_ok=True)
+    return workspace_sessions
+
+
+def get_session_path(workspace: str, session_name: str = "default") -> Path:
+    """Get session file path for a workspace and session name."""
+    return get_sessions_dir(workspace) / f"{session_name}.json"
+
+
+def list_sessions(workspace: str) -> list[tuple[str, datetime, int]]:
+    """List all sessions for a workspace. Returns [(name, modified_time, message_count), ...]"""
+    import json
+    sessions_dir = get_sessions_dir(workspace)
+    sessions = []
+    
+    for f in sessions_dir.glob("*.json"):
+        name = f.stem
+        mtime = datetime.fromtimestamp(f.stat().st_mtime)
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            msg_count = len(data.get("messages", [])) - 1  # minus system prompt
+        except:
+            msg_count = 0
+        sessions.append((name, mtime, max(0, msg_count)))
+    
+    # Sort by most recently modified
+    sessions.sort(key=lambda x: x[1], reverse=True)
+    return sessions
 
 
 async def run_single(agent: ClineAgent, user_input: str, console: Console):
@@ -56,7 +84,9 @@ def main():
     
     parser = argparse.ArgumentParser(description="Streaming Harness")
     parser.add_argument("workspace", nargs="?", default=".", help="Workspace directory")
-    parser.add_argument("--new", action="store_true", help="Start fresh session (ignore saved)")
+    parser.add_argument("--new", action="store_true", help="Start fresh session")
+    parser.add_argument("--session", "-s", default="default", help="Session name (default: 'default')")
+    parser.add_argument("--list", "-l", action="store_true", help="List all sessions")
     args = parser.parse_args()
     
     # Resolve workspace
@@ -64,6 +94,17 @@ def main():
         workspace = os.getcwd()
     else:
         workspace = os.path.abspath(args.workspace)
+    
+    # List sessions mode
+    if args.list:
+        sessions = list_sessions(workspace)
+        if not sessions:
+            print("No sessions found.")
+        else:
+            print(f"Sessions for {workspace}:\n")
+            for name, mtime, count in sessions:
+                print(f"  {name:20s}  {mtime:%Y-%m-%d %H:%M}  ({count} msgs)")
+        return
     
     os.chdir(workspace)
     
@@ -78,13 +119,16 @@ def main():
     agent = ClineAgent(config)
     
     # Session management
-    session_path = get_session_path(workspace)
+    current_session = args.session
+    session_path = get_session_path(workspace, current_session)
     
     # Try to resume session unless --new
     if not args.new and session_path.exists():
         if agent.load_session(str(session_path)):
             msg_count = len(agent.messages) - 1  # minus system prompt
-            console.print(f"[dim]Resumed session ({msg_count} messages)[/dim]")
+            console.print(f"[dim]Resumed session '{current_session}' ({msg_count} messages)[/dim]")
+    else:
+        console.print(f"[dim]New session '{current_session}'[/dim]")
     
     # Get input from stdin or interactive prompt
     if not sys.stdin.isatty():
@@ -97,36 +141,90 @@ def main():
         agent.save_session(str(session_path))
     else:
         # Interactive mode
-        console.print("[bold blue]Harness[/bold blue] - Type your request. Commands: /clear, /save, /exit")
+        console.print("[bold blue]Harness[/bold blue] - Commands: /sessions, /session <name>, /clear, /exit")
         console.print(f"[dim]Workspace: {workspace}[/dim]\n")
         
         while True:
             try:
-                user_input = input("> ").strip()
+                prompt = f"[{current_session}]> "
+                user_input = input(prompt).strip()
                 if not user_input:
                     continue
                 
                 # Handle commands
                 if user_input.startswith("/"):
-                    cmd = user_input.lower()
+                    parts = user_input.split(maxsplit=1)
+                    cmd = parts[0].lower()
+                    cmd_arg = parts[1] if len(parts) > 1 else ""
+                    
                     if cmd in ('/exit', '/quit', '/q'):
                         agent.save_session(str(session_path))
                         console.print("[dim]Session saved.[/dim]")
                         break
+                    
+                    elif cmd == '/sessions':
+                        sessions = list_sessions(workspace)
+                        if not sessions:
+                            console.print("[dim]No sessions.[/dim]")
+                        else:
+                            console.print("[dim]Sessions:[/dim]")
+                            for name, mtime, count in sessions:
+                                marker = "*" if name == current_session else " "
+                                console.print(f"[dim] {marker} {name:20s} ({count} msgs)[/dim]")
+                        continue
+                    
+                    elif cmd == '/session':
+                        if not cmd_arg:
+                            console.print(f"[dim]Current: {current_session}[/dim]")
+                            continue
+                        # Save current session first
+                        agent.save_session(str(session_path))
+                        # Switch to new session
+                        new_name = cmd_arg.strip()
+                        current_session = new_name
+                        session_path = get_session_path(workspace, current_session)
+                        if session_path.exists():
+                            agent.load_session(str(session_path))
+                            msg_count = len(agent.messages) - 1
+                            console.print(f"[dim]Switched to '{current_session}' ({msg_count} msgs)[/dim]")
+                        else:
+                            agent.clear_history()
+                            console.print(f"[dim]Created new session '{current_session}'[/dim]")
+                        continue
+                    
                     elif cmd == '/clear':
                         agent.clear_history()
                         reset_global_tracker()
                         console.print("[dim]History cleared.[/dim]")
                         continue
+                    
                     elif cmd == '/save':
                         agent.save_session(str(session_path))
-                        console.print(f"[dim]Session saved to {session_path}[/dim]")
+                        console.print(f"[dim]Saved '{current_session}'[/dim]")
                         continue
+                    
+                    elif cmd == '/delete':
+                        if not cmd_arg:
+                            console.print("[dim]Usage: /delete <session_name>[/dim]")
+                            continue
+                        target = cmd_arg.strip()
+                        if target == current_session:
+                            console.print("[dim]Cannot delete active session.[/dim]")
+                            continue
+                        target_path = get_session_path(workspace, target)
+                        if target_path.exists():
+                            target_path.unlink()
+                            console.print(f"[dim]Deleted '{target}'[/dim]")
+                        else:
+                            console.print(f"[dim]Session '{target}' not found.[/dim]")
+                        continue
+                    
                     elif cmd == '/history':
                         console.print(f"[dim]Messages: {len(agent.messages)}[/dim]")
                         continue
+                    
                     else:
-                        console.print("[dim]Unknown command. Use /clear, /save, /history, /exit[/dim]")
+                        console.print("[dim]Commands: /sessions, /session <name>, /delete <name>, /clear, /save, /exit[/dim]")
                         continue
                 
                 asyncio.run(run_single(agent, user_input, console))
