@@ -14,7 +14,7 @@ class Config:
     api_url: str = ""
     api_key: str = ""
     model: str = "glm-4.7"
-    max_tokens: int = 32768
+    max_tokens: int = 128000
     temperature: float = 0.7
     workspace_path: Path = field(default_factory=lambda: Path.cwd())
     max_context_tokens: int = 32000
@@ -32,7 +32,7 @@ class Config:
             api_url=os.getenv("LLM_API_URL", ""),
             api_key=os.getenv("LLM_API_KEY", ""),
             model=os.getenv("LLM_MODEL", "glm-4.7"),
-            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "32768")),
+            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "128000")),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
             workspace_path=Path(os.getenv("WORKSPACE_PATH", str(Path.cwd()))),
             max_context_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", "32000")),

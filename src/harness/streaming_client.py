@@ -130,7 +130,7 @@ class StreamingJSONClient:
         base_url: str = "https://api.z.ai/api/paas/v4",
         model: str = "glm-4.7",
         temperature: float = 0.7,
-        max_tokens: int = 16384,
+        max_tokens: int = 128000,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/')
