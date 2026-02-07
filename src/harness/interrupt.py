@@ -52,6 +52,11 @@ def is_background_requested() -> bool:
     return _interrupt_state.background
 
 
+def reset_background():
+    """Reset only the background flag (used after sending command to background)."""
+    _interrupt_state.background = False
+
+
 def trigger_interrupt(reason: str = "user"):
     """Trigger an interrupt externally."""
     _interrupt_state.trigger(reason)
