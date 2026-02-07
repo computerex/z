@@ -583,6 +583,22 @@ def main():
                         console.print(f"[dim]Model:   {config.model}[/dim]")
                         console.print(f"[dim]API Key: {key_preview}[/dim]")
                         console.print(f"[dim]Max tokens: {config.max_tokens:,}[/dim]")
+                        console.print(f"[dim]Max iterations: {agent.max_iterations}[/dim]")
+                        continue
+                    
+                    elif cmd == '/iter':
+                        if not cmd_arg:
+                            console.print(f"[dim]Max iterations: {agent.max_iterations}[/dim]")
+                            continue
+                        try:
+                            new_val = int(cmd_arg.strip())
+                            if new_val < 1:
+                                console.print("[dim]Must be at least 1[/dim]")
+                                continue
+                            agent.max_iterations = new_val
+                            console.print(f"[dim]Max iterations set to {new_val}[/dim]")
+                        except ValueError:
+                            console.print("[dim]Usage: /iter <number>[/dim]")
                         continue
                     
                     elif cmd == '/clip':
@@ -610,6 +626,7 @@ def main():
   /compact [strat]   - Remove older messages (half/quarter/last2)
   /tokens            - Show token breakdown  
   /config            - Show current API configuration
+  /iter [n]          - Show or set max iterations
   /clip [question]   - Analyze image from clipboard
   /save              - Save current session
   /history           - Show message count
