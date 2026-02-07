@@ -312,7 +312,7 @@ class ToolHandlers:
     
     async def execute_command(self, params: Dict[str, str]) -> str:
         """Execute a shell command with live output display and interrupt support."""
-        from .interrupt import is_interrupted, is_background_requested
+        from .interrupt import is_interrupted, is_background_requested, reset_background
         
         import subprocess
         command = params.get("command", "")
@@ -366,6 +366,7 @@ class ToolHandlers:
                 
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
+                    reset_background()  # Reset flag so next command doesn't also go to background
                     self.console.print(f"\n[cyan]-> Sending to background...[/cyan]")
                     proc_id = self._next_bg_id
                     self._next_bg_id += 1
