@@ -14,9 +14,6 @@ RUN chmod +x /app/harness
 COPY tests/ /app/tests/
 COPY torture_test/ /app/torture_test/
 
-# Copy .env config (needed for API access)
-COPY .env /app/.env
-
 # Set PATH to include current directory
 ENV PATH="/app:${PATH}"
 

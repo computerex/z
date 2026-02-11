@@ -1,11 +1,9 @@
 """Configuration management for the harness."""
 
-import os
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
-from dotenv import load_dotenv
 
 
 def get_global_config_path() -> Path:
@@ -72,30 +70,16 @@ class Config:
         )
     
     @classmethod
-    def from_env(cls, env_path: Optional[Path] = None) -> "Config":
-        """Load configuration from environment variables (legacy, falls back to JSON)."""
-        if env_path and env_path.exists():
-            load_dotenv(env_path)
-        else:
-            load_dotenv()
+    def from_env(cls, env_path: Optional[Path] = None, workspace: Optional[Path] = None) -> "Config":
+        """Load configuration from JSON config files.
         
-        # Check if env vars are set
-        api_url = os.getenv("LLM_API_URL", "")
-        api_key = os.getenv("LLM_API_KEY", "")
+        Priority (later overrides earlier):
+        1. ~/.z.json (global)
+        2. workspace/.z/.z.json (workspace-specific — WINS)
         
-        # If not set, try JSON config
-        if not api_url or not api_key:
-            return cls.from_json()
-        
-        return cls(
-            api_url=api_url,
-            api_key=api_key,
-            model=os.getenv("LLM_MODEL", "glm-4.7"),
-            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "128000")),
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
-            workspace_path=Path(os.getenv("WORKSPACE_PATH", str(Path.cwd()))),
-            max_context_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", "32000")),
-        )
+        The env_path parameter is accepted but ignored (legacy compat).
+        """
+        return cls.from_json(workspace)
     
     def validate(self) -> bool:
         """Validate the configuration."""

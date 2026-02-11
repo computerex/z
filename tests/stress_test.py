@@ -1,16 +1,60 @@
 #!/usr/bin/env python3
-"""Stress test the Python harness with challenging scenarios."""
+"""Stress test the Python harness with challenging scenarios.
+
+NOTE: These tests require a live LLM API connection. They validate:
+1. The harness doesn't crash (basic smoke test)
+2. The model actually generates tool calls (tool-use validation)
+3. Python tracebacks don't appear (no code bugs)
+"""
 
 import subprocess
 import sys
 import time
 import os
+import re
 
 HARNESS_PATH = os.path.join(os.path.dirname(__file__), "..", "harness.py")
 WORKSPACE = os.path.join(os.path.dirname(__file__), "..", "torture_test")
 
-def run_test(name: str, prompt: str, timeout: int = 120) -> tuple[bool, str]:
-    """Run a single test and return (passed, output)."""
+# Indicators that tool use actually happened (from ClineAgent._execute_tool console output)
+TOOL_USE_INDICATORS = [
+    "> Reading:",      # read_file
+    "> Writing:",      # write_to_file
+    "> Editing:",      # replace_in_file
+    "> Running:",      # execute_command
+    "> Listing:",      # list_files
+    "> Searching:",    # search_files
+    "> Todo:",         # manage_todos
+    "> Task complete", # attempt_completion
+    "> Web Search:",   # web_search
+    "> Analyzing",     # analyze_image
+    "[read_file result]",      # tool result in conversation
+    "[write_to_file result]",  # tool result in conversation
+    "[execute_command result]", # tool result in conversation
+    "[list_files result]",     # tool result in conversation
+    "[search_files result]",   # tool result in conversation
+]
+
+def check_tool_use(output: str) -> tuple[bool, list[str]]:
+    """Check if the model actually used any tools.
+    
+    Returns (used_tools: bool, tool_indicators_found: list[str])
+    """
+    found = []
+    for indicator in TOOL_USE_INDICATORS:
+        if indicator in output:
+            found.append(indicator)
+    return len(found) > 0, found
+
+
+def run_test(name: str, prompt: str, timeout: int = 120, 
+             expect_tool_use: bool = True) -> tuple[bool, str]:
+    """Run a single test and return (passed, output).
+    
+    Args:
+        expect_tool_use: If True, test FAILS when model doesn't use tools.
+                        This catches the "I can't run commands" failure mode.
+    """
     print(f"\n{'='*60}")
     print(f"TEST: {name}")
     print(f"{'='*60}")
@@ -30,12 +74,28 @@ def run_test(name: str, prompt: str, timeout: int = 120) -> tuple[bool, str]:
         print(f"Exit code: {result.returncode}")
         print(f"Output length: {len(output)} chars")
         
-        # Check for crashes/errors
-        if "Traceback" in output or "Error:" in output.lower():
-            if "Error:" in output and "successfully" in output.lower():
-                pass  # Tool returned an error but harness handled it
-            else:
-                print(f"POTENTIAL ISSUE in output")
+        # Check 1: Python tracebacks = code bug = FAIL
+        if "Traceback (most recent call last)" in output:
+            # Extract the actual traceback for diagnosis
+            tb_match = re.search(r'Traceback \(most recent call last\).*?(?=\n\S|\Z)', 
+                               output, re.DOTALL)
+            tb_text = tb_match.group(0)[:500] if tb_match else "unknown"
+            print(f"✗ CRASH: Python traceback detected!")
+            print(f"  {tb_text[:200]}")
+            return False, output
+        
+        # Check 2: Did the model use tools?
+        used_tools, indicators = check_tool_use(output)
+        if expect_tool_use and not used_tools:
+            print(f"✗ NO TOOL USE: Model responded without using any tools!")
+            print(f"  This means the LLM ignored its system prompt.")
+            # Show first 200 chars of model output for diagnosis
+            preview = output[:300].replace('\n', ' ')
+            print(f"  Output preview: {preview}")
+            return False, output
+        
+        if used_tools:
+            print(f"  Tools used: {', '.join(indicators[:5])}")
         
         return True, output
     except subprocess.TimeoutExpired:
@@ -107,6 +167,7 @@ def main():
     
     passed = 0
     failed = 0
+    no_tool_use = 0
     
     for name, prompt in tests:
         success, output = run_test(name, prompt, timeout=90)
@@ -115,10 +176,17 @@ def main():
             print(f"✓ PASSED")
         else:
             failed += 1
+            used_tools, _ = check_tool_use(output) if output != "TIMEOUT" else (False, [])
+            if not used_tools:
+                no_tool_use += 1
             print(f"✗ FAILED")
     
     print(f"\n{'='*60}")
     print(f"RESULTS: {passed} passed, {failed} failed out of {len(tests)} tests")
+    if no_tool_use > 0:
+        print(f"WARNING: {no_tool_use} test(s) failed because the model did NOT use tools!")
+        print(f"  This usually means the LLM is ignoring its system prompt.")
+        print(f"  Check: model config, API key, system prompt length.")
     print(f"{'='*60}")
     
     return 0 if failed == 0 else 1

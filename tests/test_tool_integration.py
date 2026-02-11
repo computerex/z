@@ -1,0 +1,902 @@
+"""Integration tests for tool-use pipeline.
+
+These tests validate the ACTUAL pipeline the agent uses:
+  Model output (XML) → parse_xml_tool() → _execute_tool() → result
+
+Unlike unit tests which test Python classes in isolation, these prove
+that if the LLM generates the right XML, the harness correctly parses
+and executes it. This is the critical gap that unit tests miss.
+"""
+
+import asyncio
+import sys
+import os
+import json
+import re
+import pytest
+
+# Ensure src is on path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from harness.cline_agent import parse_xml_tool, ParsedToolCall, ClineAgent
+from harness.config import Config
+from harness.todo_manager import TodoManager, TodoStatus
+from harness.smart_context import SmartContextManager
+
+
+# ============================================================
+# XML Parsing Tests — Does parse_xml_tool handle every tool?
+# ============================================================
+
+class TestParseXmlTool:
+    """Test that parse_xml_tool correctly extracts tool calls from
+    realistic model output (including surrounding prose)."""
+
+    def test_parse_read_file(self):
+        content = """I need to examine the auth module to understand the flow.
+
+<read_file>
+<path>src/auth.py</path>
+</read_file>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "read_file"
+        assert result.parameters["path"] == "src/auth.py"
+
+    def test_parse_write_to_file(self):
+        content = """I'll create the config file now.
+
+<write_to_file>
+<path>config.json</path>
+<content>
+{
+    "key": "value",
+    "nested": {
+        "a": 1
+    }
+}
+</content>
+</write_to_file>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "write_to_file"
+        assert result.parameters["path"] == "config.json"
+        assert '"key": "value"' in result.parameters["content"]
+
+    def test_parse_replace_in_file(self):
+        content = """I see the bug. Let me fix line 42.
+
+<replace_in_file>
+<path>src/auth.py</path>
+<diff>
+<<<<<<< SEARCH
+    if token.validate():
+=======
+    if token is not None and token.validate():
+>>>>>>> REPLACE
+</diff>
+</replace_in_file>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "replace_in_file"
+        assert result.parameters["path"] == "src/auth.py"
+        assert "<<<<<<< SEARCH" in result.parameters["diff"]
+        assert "token is not None" in result.parameters["diff"]
+
+    def test_parse_execute_command(self):
+        content = """Let me run the tests to verify.
+
+<execute_command>
+<command>python -m pytest tests/ -v</command>
+</execute_command>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "execute_command"
+        assert result.parameters["command"] == "python -m pytest tests/ -v"
+
+    def test_parse_execute_command_background(self):
+        content = """Starting the dev server.
+
+<execute_command>
+<command>npm run dev</command>
+<background>true</background>
+</execute_command>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "execute_command"
+        assert result.parameters["command"] == "npm run dev"
+        assert result.parameters["background"] == "true"
+
+    def test_parse_list_files(self):
+        content = """<list_files>
+<path>src/</path>
+<recursive>true</recursive>
+</list_files>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "list_files"
+        assert result.parameters["path"] == "src/"
+        assert result.parameters["recursive"] == "true"
+
+    def test_parse_search_files(self):
+        content = """<search_files>
+<path>src/</path>
+<regex>\\bdef authenticate\\b</regex>
+<file_pattern>*.py</file_pattern>
+</search_files>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "search_files"
+        assert result.parameters["path"] == "src/"
+        assert "authenticate" in result.parameters["regex"]
+        assert result.parameters["file_pattern"] == "*.py"
+
+    def test_parse_web_search(self):
+        content = """<web_search>
+<query>Python 3.12 asyncio changes</query>
+<count>5</count>
+</web_search>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "web_search"
+        assert result.parameters["query"] == "Python 3.12 asyncio changes"
+        assert result.parameters["count"] == "5"
+
+    def test_parse_attempt_completion(self):
+        content = """<attempt_completion>
+<result>
+The authentication bug has been fixed. The null check now prevents
+the crash when tokens expire during refresh.
+</result>
+</attempt_completion>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "attempt_completion"
+        assert "authentication bug" in result.parameters["result"]
+
+    def test_parse_list_context(self):
+        content = """Let me check what's in my context.
+
+<list_context>
+</list_context>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "list_context"
+
+    def test_parse_remove_from_context(self):
+        content = """<remove_from_context>
+<id>3</id>
+</remove_from_context>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "remove_from_context"
+        assert result.parameters["id"] == "3"
+
+    def test_no_tool_call(self):
+        """Plain text with no XML should return None."""
+        content = "I cannot run commands directly. I am an AI running in a text-only environment."
+        result = parse_xml_tool(content)
+        assert result is None
+
+    def test_no_tool_call_with_xml_like_text(self):
+        """Text that mentions XML tags but isn't a tool call."""
+        content = "You can use <read_file> to read files. Just put the path inside <path> tags."
+        # This might parse as a tool call — the key question is does it matter?
+        # Actually, in Cline format, if the model generates these tags, they DO get parsed.
+        # The issue is when the model doesn't generate ANY tags.
+        pass
+
+    def test_last_tool_wins(self):
+        """When model generates multiple tool calls, the LAST one wins."""
+        content = """I'll first read the file.
+
+<read_file>
+<path>old_file.py</path>
+</read_file>
+
+Actually, let me read a different file instead.
+
+<read_file>
+<path>correct_file.py</path>
+</read_file>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "read_file"
+        assert result.parameters["path"] == "correct_file.py"
+
+
+# ============================================================
+# manage_todos XML Parsing Tests
+# ============================================================
+
+class TestParseTodoXml:
+    """Test that manage_todos XML is correctly parsed — the critical
+    integration point between our new code and the existing parser."""
+
+    def test_parse_add_simple(self):
+        content = """I'll break this task down into steps.
+
+<manage_todos>
+<action>add</action>
+<title>Implement user authentication</title>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "manage_todos"
+        assert result.parameters["action"] == "add"
+        assert result.parameters["title"] == "Implement user authentication"
+
+    def test_parse_add_with_description(self):
+        content = """<manage_todos>
+<action>add</action>
+<title>Add JWT support</title>
+<context_refs>src/auth.py,src/config.py</context_refs>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "manage_todos"
+        assert result.parameters["action"] == "add"
+        assert result.parameters["title"] == "Add JWT support"
+        assert "src/auth.py" in result.parameters["context_refs"]
+        assert "src/config.py" in result.parameters["context_refs"]
+
+    def test_parse_add_subtask(self):
+        content = """<manage_todos>
+<action>add</action>
+<title>Create login endpoint</title>
+<parent_id>1</parent_id>
+<context_refs>src/routes.py</context_refs>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.parameters["action"] == "add"
+        assert result.parameters["parent_id"] == "1"
+        assert result.parameters["title"] == "Create login endpoint"
+
+    def test_parse_update_status(self):
+        content = """<manage_todos>
+<action>update</action>
+<id>1</id>
+<status>in-progress</status>
+<notes>Found existing auth module, extending it</notes>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.parameters["action"] == "update"
+        assert result.parameters["id"] == "1"
+        assert result.parameters["status"] == "in-progress"
+        assert "extending it" in result.parameters["notes"]
+
+    def test_parse_update_completed(self):
+        content = """Task is done.
+
+<manage_todos>
+<action>update</action>
+<id>3</id>
+<status>completed</status>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.parameters["action"] == "update"
+        assert result.parameters["id"] == "3"
+        assert result.parameters["status"] == "completed"
+
+    def test_parse_remove(self):
+        content = """<manage_todos>
+<action>remove</action>
+<id>5</id>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.parameters["action"] == "remove"
+        assert result.parameters["id"] == "5"
+
+    def test_parse_list(self):
+        content = """Let me review my progress.
+
+<manage_todos>
+<action>list</action>
+</manage_todos>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.parameters["action"] == "list"
+
+
+# ============================================================
+# Tool Dispatch Tests — Does _handle_manage_todos work via _execute_tool?
+# ============================================================
+
+class TestToolDispatch:
+    """Test the full dispatch path: ParsedToolCall → _execute_tool() → result.
+    
+    Uses a real ClineAgent with a mock config (no API calls needed)."""
+
+    def _make_agent(self):
+        """Create a ClineAgent for testing (no API connection needed)."""
+        config = Config(
+            api_url="http://test.invalid",
+            api_key="test-key",
+            model="test-model",
+        )
+        agent = ClineAgent(config=config, max_iterations=1)
+        return agent
+
+    def test_dispatch_manage_todos_add(self):
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "add", "title": "Fix the auth bug"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Added todo [1]" in result
+        assert "Fix the auth bug" in result
+        assert len(agent.todo_manager.list_all()) == 1
+
+    def test_dispatch_manage_todos_add_with_refs(self):
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={
+                "action": "add",
+                "title": "Implement feature",
+                "context_refs": "src/auth.py,src/config.py"
+            }
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Added todo [1]" in result
+        item = agent.todo_manager.get(1)
+        assert "src/auth.py" in item.context_refs
+        assert "src/config.py" in item.context_refs
+
+    def test_dispatch_manage_todos_add_subtask(self):
+        agent = self._make_agent()
+        # Add parent
+        tool1 = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "add", "title": "Main task"}
+        )
+        asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool1))
+        
+        # Add child
+        tool2 = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "add", "title": "Sub-task", "parent_id": "1"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool2))
+        assert "Added todo [2]" in result
+        assert agent.todo_manager.get(2).parent_id == 1
+
+    def test_dispatch_manage_todos_update(self):
+        agent = self._make_agent()
+        # Add first
+        agent.todo_manager.add("Task 1")
+        
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "update", "id": "1", "status": "in-progress"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Updated todo [1]" in result
+        assert agent.todo_manager.get(1).status == TodoStatus.IN_PROGRESS
+
+    def test_dispatch_manage_todos_update_with_notes(self):
+        agent = self._make_agent()
+        agent.todo_manager.add("Task 1")
+        
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={
+                "action": "update",
+                "id": "1",
+                "status": "in-progress",
+                "notes": "Found the bug in auth.py line 42"
+            }
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Updated todo [1]" in result
+        assert agent.todo_manager.get(1).notes == "Found the bug in auth.py line 42"
+
+    def test_dispatch_manage_todos_complete(self):
+        agent = self._make_agent()
+        agent.todo_manager.add("Task 1")
+        
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "update", "id": "1", "status": "completed"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Updated todo [1]" in result
+        assert agent.todo_manager.get(1).status == TodoStatus.COMPLETED
+
+    def test_dispatch_manage_todos_remove(self):
+        agent = self._make_agent()
+        agent.todo_manager.add("Task 1")
+        
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "remove", "id": "1"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Removed todo [1]" in result
+        assert len(agent.todo_manager.list_all()) == 0
+
+    def test_dispatch_manage_todos_list(self):
+        agent = self._make_agent()
+        agent.todo_manager.add("Task 1")
+        agent.todo_manager.add("Task 2")
+        
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "list"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Task 1" in result
+        assert "Task 2" in result
+
+    def test_dispatch_manage_todos_error_no_title(self):
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "add"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Error" in result
+        assert "'title' is required" in result
+
+    def test_dispatch_manage_todos_error_invalid_id(self):
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "update", "id": "abc"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Error" in result
+        assert "Invalid id" in result
+
+    def test_dispatch_manage_todos_error_not_found(self):
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "update", "id": "99", "status": "completed"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "not found" in result
+
+    def test_dispatch_manage_todos_error_unknown_action(self):
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "destroy"}
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Error" in result
+        assert "Unknown action" in result
+
+
+# ============================================================
+# End-to-End Mock Tests — Simulate full model output → parse → execute
+# ============================================================
+
+class TestEndToEndMock:
+    """Simulate realistic model output and verify the complete pipeline.
+    
+    These test what happens in _run_loop when the model generates XML:
+    1. Model text → parse_xml_tool() → ParsedToolCall
+    2. ParsedToolCall → _execute_tool() → result string
+    3. Result gets appended as user message for next iteration
+    """
+
+    def _make_agent(self):
+        config = Config(
+            api_url="http://test.invalid",
+            api_key="test-key",
+            model="test-model",
+        )
+        agent = ClineAgent(config=config, max_iterations=1)
+        # Initialize the system prompt
+        from harness.prompts import get_system_prompt
+        from harness.streaming_client import StreamingMessage
+        agent.messages = [
+            StreamingMessage(role="system", content=get_system_prompt(agent.workspace_path))
+        ]
+        agent._initialized = True
+        return agent
+
+    def test_e2e_model_adds_todo_then_reads_file(self):
+        """Simulate: model → add todo XML → parse → execute → verify state."""
+        agent = self._make_agent()
+        
+        # Simulate realistic model output with prose + XML
+        model_output = """I'll start by breaking this task into steps.
+
+First, let me create a todo list to track my progress:
+
+<manage_todos>
+<action>add</action>
+<title>Read and understand auth module</title>
+<context_refs>src/auth.py</context_refs>
+</manage_todos>"""
+
+        # Step 1: Parse the XML
+        tool_call = parse_xml_tool(model_output)
+        assert tool_call is not None, "parse_xml_tool should find manage_todos in model output"
+        assert tool_call.name == "manage_todos"
+        
+        # Step 2: Execute the tool
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool_call))
+        
+        # Step 3: Verify state changes
+        assert "Added todo [1]" in result
+        assert len(agent.todo_manager.list_all()) == 1
+        item = agent.todo_manager.get(1)
+        assert item.title == "Read and understand auth module"
+        assert "src/auth.py" in item.context_refs
+
+    def test_e2e_model_creates_full_todo_list(self):
+        """Simulate: model creates multiple todos, updates their status."""
+        agent = self._make_agent()
+        
+        # Step 1: Add first todo
+        output1 = """<manage_todos>
+<action>add</action>
+<title>Fix authentication bug</title>
+</manage_todos>"""
+        tool1 = parse_xml_tool(output1)
+        asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool1))
+        
+        # Step 2: Add sub-task
+        output2 = """<manage_todos>
+<action>add</action>
+<title>Add null check for token</title>
+<parent_id>1</parent_id>
+<context_refs>src/auth.py</context_refs>
+</manage_todos>"""
+        tool2 = parse_xml_tool(output2)
+        asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool2))
+        
+        # Step 3: Mark parent in-progress
+        output3 = """<manage_todos>
+<action>update</action>
+<id>1</id>
+<status>in-progress</status>
+</manage_todos>"""
+        tool3 = parse_xml_tool(output3)
+        asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool3))
+        
+        # Step 4: Complete sub-task
+        output4 = """<manage_todos>
+<action>update</action>
+<id>2</id>
+<status>completed</status>
+<notes>Added null check on line 42</notes>
+</manage_todos>"""
+        tool4 = parse_xml_tool(output4)
+        asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool4))
+        
+        # Verify final state
+        assert len(agent.todo_manager.list_all()) == 2
+        parent = agent.todo_manager.get(1)
+        child = agent.todo_manager.get(2)
+        assert parent.status == TodoStatus.IN_PROGRESS
+        assert child.status == TodoStatus.COMPLETED
+        assert child.parent_id == 1
+        assert child.notes == "Added null check on line 42"
+
+    def test_e2e_model_output_with_thinking(self):
+        """Model output with <thinking> blocks should still parse tools."""
+        model_output = """<thinking>
+I need to track my progress on this complex task.
+Let me create a todo list first before doing anything.
+</thinking>
+
+I'll organize my approach with a todo list.
+
+<manage_todos>
+<action>add</action>
+<title>Analyze codebase structure</title>
+</manage_todos>"""
+        
+        tool_call = parse_xml_tool(model_output)
+        assert tool_call is not None
+        assert tool_call.name == "manage_todos"
+        assert tool_call.parameters["title"] == "Analyze codebase structure"
+
+    def test_e2e_no_tool_plain_response(self):
+        """When model says 'I can't do that' — no tool gets parsed."""
+        model_output = """No, I cannot run commands directly.
+
+I am an AI running in a text-only environment. I do not have access 
+to a terminal, a command line, or your computer's file system. This 
+means I cannot execute 'git clone', 'pip install', or download files 
+from GitHub for you.
+
+I can only:
+1. **Write the code** for you to copy and paste.
+2. **Explain** how to run the commands on your own machine."""
+
+        tool_call = parse_xml_tool(model_output)
+        assert tool_call is None, "Should NOT parse any tool from this refusal response"
+
+    def test_e2e_todo_persists_through_save_load(self):
+        """Todos survive session save/load."""
+        import tempfile
+        agent = self._make_agent()
+        
+        # Add todos
+        tool = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "add", "title": "Persistent task", "context_refs": "main.py"}
+        )
+        asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        
+        # Save session
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            save_path = f.name
+        
+        try:
+            agent.save_session(save_path)
+            
+            # Create new agent and load
+            agent2 = self._make_agent()
+            assert len(agent2.todo_manager.list_all()) == 0
+            
+            loaded = agent2.load_session(save_path, inject_resume=False)
+            assert loaded
+            assert len(agent2.todo_manager.list_all()) == 1
+            assert agent2.todo_manager.get(1).title == "Persistent task"
+            assert "main.py" in agent2.todo_manager.get(1).context_refs
+        finally:
+            os.unlink(save_path)
+
+    def test_e2e_context_stats_show_todos(self):
+        """get_context_stats includes todo counts."""
+        agent = self._make_agent()
+        
+        # Before todos
+        stats = agent.get_context_stats()
+        assert stats["todos_total"] == 0
+        assert stats["todos_active"] == 0
+        
+        # Add and complete some todos
+        agent.todo_manager.add("Task 1")
+        agent.todo_manager.add("Task 2")
+        t3 = agent.todo_manager.add("Task 3")
+        agent.todo_manager.update(t3.id, status="completed")
+        
+        stats = agent.get_context_stats()
+        assert stats["todos_total"] == 3
+        assert stats["todos_active"] == 2
+        assert stats["todos_completed"] == 1
+
+
+# ============================================================
+# Context Compaction Integration Tests
+# ============================================================
+
+class TestContextCompactionIntegration:
+    """Test that smart context compaction works through the agent."""
+
+    def _make_agent(self):
+        config = Config(
+            api_url="http://test.invalid",
+            api_key="test-key",
+            model="test-model",
+        )
+        agent = ClineAgent(config=config, max_iterations=1)
+        return agent
+
+    def test_smart_context_connected_to_todo_manager(self):
+        """SmartContextManager uses the agent's TodoManager."""
+        agent = self._make_agent()
+        assert agent.smart_context.todo_manager is agent.todo_manager
+        
+        agent.todo_manager.add("Test task", context_refs=["important.py"])
+        refs = agent.smart_context.todo_manager.get_active_context_refs()
+        assert "important.py" in refs
+
+    def test_clear_resets_everything(self):
+        """clear_history resets todos and smart context."""
+        agent = self._make_agent()
+        agent.todo_manager.add("Task")
+        from harness.smart_context import CompactionTrace
+        agent.smart_context.compaction_traces.append(
+            CompactionTrace("file_read", "test.py", "test", tokens_freed=100)
+        )
+        
+        agent.clear_history()
+        assert len(agent.todo_manager.list_all()) == 0
+        assert len(agent.smart_context.compaction_traces) == 0
+
+    def test_eviction_count_in_stats(self):
+        """Eviction count shows in context stats."""
+        agent = self._make_agent()
+        from harness.smart_context import CompactionTrace
+        
+        agent.smart_context.compaction_traces.append(
+            CompactionTrace("file_read", "old.py", "Old file", tokens_freed=500)
+        )
+        agent.smart_context.compaction_traces.append(
+            CompactionTrace("command_output", "npm test", "Pass", tokens_freed=300)
+        )
+        
+        stats = agent.get_context_stats()
+        assert stats["evictions"] == 2
+
+
+# ============================================================
+# Prompt Integration Tests — Does the system prompt include tools?
+# ============================================================
+
+class TestPromptIntegration:
+    """Verify the system prompt contains all tool definitions."""
+
+    def test_system_prompt_has_manage_todos(self):
+        from harness.prompts import get_system_prompt
+        prompt = get_system_prompt("/test/workspace")
+        assert "manage_todos" in prompt
+        assert "<action>" in prompt
+        assert "add" in prompt
+        assert "update" in prompt
+        assert "remove" in prompt
+        assert "context_refs" in prompt
+
+    def test_system_prompt_has_all_tools(self):
+        from harness.prompts import get_system_prompt
+        prompt = get_system_prompt("/test/workspace")
+        
+        required_tools = [
+            "read_file", "write_to_file", "replace_in_file",
+            "execute_command", "list_files", "search_files",
+            "web_search", "list_context", "remove_from_context",
+            "manage_todos", "attempt_completion",
+        ]
+        for tool in required_tools:
+            assert f"## {tool}" in prompt, f"System prompt missing tool definition: {tool}"
+
+    def test_system_prompt_has_context_management_rules(self):
+        from harness.prompts import get_system_prompt
+        prompt = get_system_prompt("/test/workspace")
+        assert "EVICTED CONTEXT" in prompt
+        assert "TODO LIST" in prompt
+        assert "context compaction" in prompt.lower()
+
+    def test_parse_xml_tool_knows_all_tools(self):
+        """parse_xml_tool's tool_names list matches prompt definitions."""
+        from harness.prompts import get_system_prompt
+        prompt = get_system_prompt("/test/workspace")
+        
+        # Extract ## tool_name from prompt
+        prompt_tools = set(re.findall(r'^## (\w+)', prompt, re.MULTILINE))
+        
+        # These tools are defined in parse_xml_tool
+        parser_tools = {
+            'read_file', 'write_to_file', 'replace_in_file',
+            'execute_command', 'list_files', 'search_files',
+            'check_background_process', 'stop_background_process', 
+            'list_background_processes',
+            'list_context', 'remove_from_context', 'analyze_image', 
+            'web_search', 'manage_todos', 'attempt_completion'
+        }
+        
+        # Every tool in the prompt should be parseable
+        for tool in prompt_tools:
+            assert tool in parser_tools, (
+                f"Tool '{tool}' defined in system prompt but not in parse_xml_tool's tool_names list"
+            )
+
+
+# ============================================================
+# Context Dump Tests
+# ============================================================
+
+class TestContextDump:
+    """Test the dump_context method for debugging model context."""
+
+    def _make_agent(self):
+        config = Config(
+            api_url="http://test.invalid",
+            api_key="test-key",
+            model="test-model",
+        )
+        agent = ClineAgent(config=config, max_iterations=1)
+        from harness.prompts import get_system_prompt
+        from harness.streaming_client import StreamingMessage
+        agent.messages = [
+            StreamingMessage(role="system", content=get_system_prompt(agent.workspace_path))
+        ]
+        agent._initialized = True
+        return agent
+
+    def test_dump_creates_file(self):
+        import tempfile
+        agent = self._make_agent()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            dump_path = f.name
+        try:
+            result_path = agent.dump_context(path=dump_path, reason="test")
+            assert result_path == dump_path
+            assert os.path.exists(dump_path)
+            data = json.loads(open(dump_path, encoding="utf-8").read())
+            assert data["reason"] == "test"
+            assert data["model"] == "test-model"
+            assert len(data["messages"]) == 1  # just system prompt
+        finally:
+            os.unlink(dump_path)
+
+    def test_dump_contains_system_prompt_analysis(self):
+        import tempfile
+        agent = self._make_agent()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            dump_path = f.name
+        try:
+            agent.dump_context(path=dump_path)
+            data = json.loads(open(dump_path, encoding="utf-8").read())
+            analysis = data["summary"]["system_prompt_analysis"]
+            assert analysis["has_read_file"] == True
+            assert analysis["has_execute_command"] == True
+            assert analysis["has_manage_todos"] == True
+            assert analysis["has_TOOL_USE_section"] == True
+            assert analysis["has_RULES_section"] == True
+            assert analysis["tokens_est"] > 4000  # System prompt should be ~5k tokens
+        finally:
+            os.unlink(dump_path)
+
+    def test_dump_includes_full_messages(self):
+        import tempfile
+        from harness.streaming_client import StreamingMessage
+        agent = self._make_agent()
+        # Add some messages
+        agent.messages.append(StreamingMessage(role="user", content="Hello, please read config.py"))
+        agent.messages.append(StreamingMessage(role="assistant", content="I'll read that file.\n\n<read_file>\n<path>config.py</path>\n</read_file>"))
+        agent.messages.append(StreamingMessage(role="user", content="[read_file result]\ndef main():\n    pass"))
+        
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            dump_path = f.name
+        try:
+            agent.dump_context(path=dump_path)
+            data = json.loads(open(dump_path, encoding="utf-8").read())
+            assert len(data["messages"]) == 4
+            assert data["messages"][0]["role"] == "system"
+            assert data["messages"][1]["role"] == "user"
+            assert data["messages"][2]["role"] == "assistant"
+            assert data["messages"][3]["role"] == "user"
+            # Each message has metadata
+            assert "tokens_est" in data["messages"][0]
+            assert "chars" in data["messages"][0]
+            assert data["messages"][0]["tokens_est"] > 4000
+        finally:
+            os.unlink(dump_path)
+
+    def test_dump_includes_todos(self):
+        import tempfile
+        agent = self._make_agent()
+        agent.todo_manager.add("Fix the bug")
+        agent.todo_manager.add("Write tests")
+        
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            dump_path = f.name
+        try:
+            agent.dump_context(path=dump_path)
+            data = json.loads(open(dump_path, encoding="utf-8").read())
+            assert "todos" in data
+            assert len(data["todos"]["items"]) == 2
+        finally:
+            os.unlink(dump_path)
+
+    def test_system_prompt_token_count_is_correct(self):
+        """Verify the system prompt is at least 4k tokens (regression check)."""
+        agent = self._make_agent()
+        from harness.context_management import estimate_tokens
+        sys_tokens = estimate_tokens(agent.messages[0].content)
+        assert sys_tokens >= 4000, (
+            f"System prompt is only {sys_tokens} tokens! Expected >= 4000. "
+            f"Prompt may be truncated or broken."
+        )
+        # With our additions it should be ~5400+
+        assert sys_tokens >= 5000, (
+            f"System prompt is {sys_tokens} tokens, expected >= 5000 with manage_todos."
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

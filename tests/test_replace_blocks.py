@@ -12,7 +12,8 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from harness.cline_agent import parse_search_replace_blocks, parse_xml_tool
+from harness.tool_handlers import parse_search_replace_blocks
+from harness.cline_agent import parse_xml_tool
 
 
 def test_basic_search_replace():
