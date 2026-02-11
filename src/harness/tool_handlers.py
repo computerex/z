@@ -4,12 +4,57 @@ import asyncio
 import os
 import platform
 import re
+import signal
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 from rich.console import Console
+import psutil
 
 from .context_management import truncate_file_content, truncate_output
+from .logger import get_logger, log_exception, truncate as log_truncate
+
+log = get_logger("tools")
+
+
+def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
+    """Kill a process and all its descendants, cross-platform.
+    
+    Uses psutil to walk the process tree and kill children first,
+    then the parent. Works on Windows, Linux, and macOS.
+    """
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    
+    # Collect all children recursively before killing anything
+    children = []
+    try:
+        children = parent.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    
+    # Kill children first (leaf-to-root order)
+    for child in reversed(children):
+        try:
+            child.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    
+    # Kill the parent
+    try:
+        parent.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    
+    # Wait for all to die
+    gone, alive = psutil.wait_procs(children + [parent], timeout=timeout)
+    for p in alive:
+        try:
+            p.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
 
 
 # Regex to strip ANSI escape sequences that could trigger terminal responses
@@ -81,6 +126,7 @@ class ToolHandlers:
         # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
         self._background_procs: Dict[int, dict] = {}
         self._next_bg_id = 1
+        self._next_cmd_id = 1  # For unique command log files
         
         # Directory for spilled command output files
         self._output_dir = os.path.join(workspace_path, ".harness_output")
@@ -113,6 +159,7 @@ class ToolHandlers:
         os.makedirs(self._output_dir, exist_ok=True)
         filepath = os.path.join(self._output_dir, filename)
         Path(filepath).write_text(output, encoding="utf-8")
+        log.info("Output spilled to file: %s (%d tokens, %d chars)", filepath, est_tokens, len(output))
         
         # Build compact inline result
         lines = output.splitlines()
@@ -130,13 +177,16 @@ class ToolHandlers:
         )
     
     def _get_bg_log_path(self, proc_id: int) -> str:
-        """Get the log file path for a background process.
-        
-        Ensures the output directory exists (it may have been removed
-        between __init__ and now, e.g. by a clean command or .gitignore).
-        """
+        """Get the log file path for a background process."""
         os.makedirs(self._output_dir, exist_ok=True)
         return os.path.join(self._output_dir, f"bg_process_{proc_id}.log")
+    
+    def _get_cmd_log_path(self) -> str:
+        """Get a unique log file path for a foreground command."""
+        os.makedirs(self._output_dir, exist_ok=True)
+        cmd_id = self._next_cmd_id
+        self._next_cmd_id += 1
+        return os.path.join(self._output_dir, f"cmd_{cmd_id}.log")
     
     def _resolve_path(self, path: str) -> Path:
         """Resolve a path relative to workspace."""
@@ -145,41 +195,54 @@ class ToolHandlers:
             p = Path(self.workspace_path) / p
         return p.resolve()
     
-    async def _background_log_reader(self, bg_id: int, proc: asyncio.subprocess.Process):
-        """Continuously read output from a background process and append to log file."""
+    async def _background_log_tailer(self, bg_id: int, proc: asyncio.subprocess.Process,
+                                      log_path: str):
+        """Continuously tail a log file for a background process.
+        
+        Since the process output is shell-redirected to log_path, this task
+        just keeps reading new content and caching it in memory.
+        """
         info = self._background_procs.get(bg_id)
         if not info:
             return
         
-        log_path = info.get("log_file", self._get_bg_log_path(bg_id))
-        
+        file_pos = 0
         try:
-            with open(log_path, "a", encoding="utf-8", errors="replace") as log_fh:
-                while True:
-                    try:
-                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
-                    except asyncio.TimeoutError:
-                        if proc.returncode is not None:
-                            break
-                        continue
-                    
-                    if not line:
-                        break
-                    
-                    decoded = line.decode("utf-8", errors="replace").rstrip()
-                    log_fh.write(decoded + "\n")
-                    log_fh.flush()
-                    # Keep last 200 lines in memory for quick checks
-                    info["logs"].append(decoded)
-                    if len(info["logs"]) > 200:
-                        info["logs"] = info["logs"][-200:]
+            while proc.returncode is None:
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(file_pos)
+                        new_data = f.read()
+                        file_pos = f.tell()
+                    if new_data:
+                        for line in new_data.splitlines():
+                            info["logs"].append(line)
+                            if len(info["logs"]) > 200:
+                                info["logs"] = info["logs"][-200:]
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+                
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+            
+            # Final read after process exit
+            await asyncio.sleep(0.1)
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(file_pos)
+                    new_data = f.read()
+                if new_data:
+                    for line in new_data.splitlines():
+                        info["logs"].append(line)
+                        if len(info["logs"]) > 200:
+                            info["logs"] = info["logs"][-200:]
+            except Exception:
+                pass
         except Exception:
-            pass
-        
-        # Ensure returncode is populated once stdout closes
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except (asyncio.TimeoutError, Exception):
             pass
     
     async def cleanup_background_procs_async(self) -> None:
@@ -188,30 +251,15 @@ class ToolHandlers:
             try:
                 proc = info["proc"]
                 if proc.returncode is None:
-                    # On Windows, use taskkill to kill the entire process tree
-                    if platform.system() == "Windows":
-                        try:
-                            os.system(f'taskkill /F /T /PID {proc.pid} >nul 2>&1')
-                        except:
-                            pass
+                    kill_process_tree(proc.pid)
                     try:
-                        proc.terminate()
-                    except:
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
+                    except (asyncio.TimeoutError, Exception):
                         pass
-                    # Wait for process to finish (properly closes transports)
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        try:
-                            proc.kill()
-                            await asyncio.wait_for(proc.wait(), timeout=1.0)
-                        except:
-                            pass
-                # Cancel the log reader task
                 if "task" in info and info["task"]:
                     try:
                         info["task"].cancel()
-                    except:
+                    except Exception:
                         pass
             except Exception:
                 pass
@@ -219,35 +267,19 @@ class ToolHandlers:
     
     def cleanup_background_procs(self) -> None:
         """Terminate all background processes safely (sync wrapper)."""
-        # Try to use async cleanup if event loop is available
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Schedule async cleanup
-                asyncio.create_task(self.cleanup_background_procs_async())
-            else:
-                # Run async cleanup
-                loop.run_until_complete(self.cleanup_background_procs_async())
-        except RuntimeError:
-            # No event loop - do basic sync cleanup
-            for pid, info in list(self._background_procs.items()):
-                try:
-                    proc = info["proc"]
-                    if proc.returncode is None:
-                        if platform.system() == "Windows":
-                            os.system(f'taskkill /F /T /PID {proc.pid} >nul 2>&1')
-                        try:
-                            proc.terminate()
-                        except:
-                            pass
-                    if "task" in info and info["task"]:
-                        try:
-                            info["task"].cancel()
-                        except:
-                            pass
-                except Exception:
-                    pass
-            self._background_procs.clear()
+        for pid, info in list(self._background_procs.items()):
+            try:
+                proc = info["proc"]
+                if proc.returncode is None:
+                    kill_process_tree(proc.pid)
+                if "task" in info and info["task"]:
+                    try:
+                        info["task"].cancel()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._background_procs.clear()
     
     def list_background_procs(self) -> list:
         """List all background processes with their status."""
@@ -286,8 +318,11 @@ class ToolHandlers:
         range parameters instead.
         """
         path = self._resolve_path(params.get("path", ""))
+        log.debug("read_file: path=%s start_line=%s end_line=%s",
+                  path, params.get("start_line"), params.get("end_line"))
         
         if not path.exists():
+            log.warning("read_file: file not found: %s", path)
             return f"Error: File not found: {path}"
         
         rel_path = str(path.relative_to(self.workspace_path)) if str(path).startswith(self.workspace_path) else str(path)
@@ -361,10 +396,7 @@ class ToolHandlers:
         """Write content to a new file."""
         path = self._resolve_path(params.get("path", ""))
         content = params.get("content", "")
-        
-        # DEBUG: Log write operation
-        if os.environ.get("HARNESS_DEBUG"):
-            print(f"[DEBUG write_file] path={path}, content_len={len(content)}", flush=True)
+        log.info("write_file: path=%s content_len=%d", path, len(content))
         
         # Clean up invalid backtick escapes in Go files
         # Models sometimes generate \` or \`\`\` which are invalid in Go raw strings
@@ -408,8 +440,10 @@ class ToolHandlers:
         """
         path = self._resolve_path(params.get("path", ""))
         diff = params.get("diff", "")
+        log.info("replace_in_file: path=%s diff_len=%d", path, len(diff))
         
         if not path.exists():
+            log.warning("replace_in_file: file not found: %s", path)
             return f"Error: File not found: {path}"
         
         content = path.read_text(encoding="utf-8")
@@ -602,13 +636,20 @@ class ToolHandlers:
         return f"Successfully made {changes} replacement(s) in {path}"
     
     async def execute_command(self, params: Dict[str, str]) -> str:
-        """Execute a shell command with live output display and interrupt support."""
+        """Execute a shell command with live output display and interrupt support.
+        
+        All commands are launched with stdout/stderr redirected to a log file
+        (not piped to Python).  An async tail loop reads the log file for live
+        console output.  This unified approach means GUI applications can create
+        windows (stdout is not captured via pipe) while CLI tools still get
+        their output displayed and recorded.
+        """
         from .interrupt import is_interrupted, is_background_requested, reset_background
         
-        import subprocess
         command = params.get("command", "")
         background = params.get("background", "").lower() == "true"
         timeout_secs = 120  # Auto-background after this many seconds
+        log.info("execute_command: cmd=%s bg=%s", log_truncate(command, 200), background)
         
         # Show command being executed
         print()
@@ -618,72 +659,49 @@ class ToolHandlers:
         if background:
             return await self._run_background_command(command)
         
-        # Windows: create new process group to isolate from child process chaos
-        # This prevents multiprocessing fork bombs from taking down the harness
-        creationflags = 0
-        if platform.system() == "Windows":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        # ── Launch with file redirect ──────────────────────────────────
+        cmd_log_path = self._get_cmd_log_path()
         
-        # Foreground execution with interrupt/background/timeout support
-        # IMPORTANT: stdin=DEVNULL prevents interactive commands from stealing
-        # keyboard input, which would make Esc/Ctrl+C not work for interrupting.
+        # Shell-level redirect: stdout+stderr go to the log file.
+        # The process itself runs without Python pipes so GUI windows work.
+        # NOTE: create_subprocess_shell already invokes the platform shell
+        # (cmd.exe on Windows, /bin/sh on Unix), so we must NOT wrap with
+        # an extra "cmd /c" — that breaks commands containing double quotes.
+        wrapped = f'{command} > "{cmd_log_path}" 2>&1'
+        
         proc = await asyncio.create_subprocess_shell(
-            command,
+            wrapped,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
             cwd=self.workspace_path,
-            creationflags=creationflags,
         )
+        log.info("Process launched: PID=%d log=%s", proc.pid, cmd_log_path)
         
-        output_lines = []
+        # ── Tail loop: read log file for live output ───────────────────
+        output_lines: List[str] = []
         start_time = time.time()
         hint_shown = False
-        consecutive_timeouts = 0  # Track idle readline timeouts after process exit
+        file_pos = 0
         
         try:
-            while True:
+            while proc.returncode is None:
                 elapsed = time.time() - start_time
                 
                 # Check for interrupt (Esc)
                 if is_interrupted():
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        proc.kill()
+                    self._kill_proc(proc)
                     self.console.print(f"\n[yellow][STOP] Command interrupted[/yellow]")
-                    raw_output = "\n".join(output_lines)
-                    output = self.spill_output_to_file(raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
+                    raw_output = self._read_log_file(cmd_log_path)
+                    output = self.spill_output_to_file(
+                        raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
                     return f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}" if output else "Command interrupted (no output)"
                 
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
-                    reset_background()  # Reset flag so next command doesn't also go to background
+                    reset_background()
                     self.console.print(f"\n[cyan]-> Sending to background...[/cyan]")
-                    proc_id = self._next_bg_id
-                    self._next_bg_id += 1
-                    log_path = self._get_bg_log_path(proc_id)
-                    # Write existing output to log file
-                    Path(log_path).write_text("\n".join(output_lines) + "\n", encoding="utf-8")
-                    self._background_procs[proc_id] = {
-                        "proc": proc, 
-                        "command": command, 
-                        "started": start_time,
-                        "logs": output_lines.copy(),
-                        "log_file": log_path,
-                        "task": None
-                    }
-                    task = asyncio.create_task(self._background_log_reader(proc_id, proc))
-                    self._background_procs[proc_id]["task"] = task
-                    self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
-                    output = "\n".join(output_lines[-30:])
-                    return (
-                        f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
-                        f"Log file: {log_path}\n"
-                        f"Use read_file on the log file to inspect stdout/stderr at any time.\n"
-                        f"Output so far:\n{output}"
-                    )
+                    return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
@@ -693,95 +711,34 @@ class ToolHandlers:
                 # Auto-background after timeout
                 if elapsed > timeout_secs:
                     self.console.print(f"\n[yellow][TIME] Command running for {timeout_secs}s - auto-backgrounding[/yellow]")
-                    proc_id = self._next_bg_id
-                    self._next_bg_id += 1
-                    log_path = self._get_bg_log_path(proc_id)
-                    # Write existing output to log file
-                    Path(log_path).write_text("\n".join(output_lines) + "\n", encoding="utf-8")
-                    self._background_procs[proc_id] = {
-                        "proc": proc, 
-                        "command": command, 
-                        "started": start_time,
-                        "logs": output_lines.copy(),
-                        "log_file": log_path,
-                        "task": None
-                    }
-                    task = asyncio.create_task(self._background_log_reader(proc_id, proc))
-                    self._background_procs[proc_id]["task"] = task
-                    self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
-                    raw_output = "\n".join(output_lines)
-                    output = self.spill_output_to_file(raw_output, f"autobg_{command.split()[0] if command else 'cmd'}")
-                    return (
-                        f"Command auto-backgrounded after {timeout_secs}s (ID: {proc_id}, PID: {proc.pid}).\n"
-                        f"Log file: {log_path}\n"
-                        f"Use read_file on the log file to inspect stdout/stderr at any time.\n"
-                        f"Output captured:\n{output}"
-                    ) if output else f"Command auto-backgrounded (ID: {proc_id}, no output yet).\nLog file: {log_path}"
+                    return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
+                # Read new content from log file
+                file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
+                
+                # Poll process exit (non-blocking)
                 try:
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
-                    consecutive_timeouts = 0  # Reset on successful read
+                    await asyncio.wait_for(proc.wait(), timeout=0.15)
                 except asyncio.TimeoutError:
-                    # On Windows with piped commands (e.g. cmd1 | findstr),
-                    # the pipe may never deliver EOF even after the process
-                    # exits, causing this loop to spin forever.  Detect this
-                    # by counting consecutive timeouts after the process has
-                    # already exited and breaking out.
-                    if proc.returncode is not None:
-                        consecutive_timeouts += 1
-                        if consecutive_timeouts >= 3:  # 3 × 0.1s = 0.3s grace
-                            # Drain any remaining buffered data
-                            try:
-                                remaining = await asyncio.wait_for(
-                                    proc.stdout.read(65536), timeout=0.2
-                                )
-                                if remaining:
-                                    for chunk_line in remaining.decode("utf-8", errors="replace").splitlines():
-                                        output_lines.append(chunk_line)
-                                        safe_line = sanitize_terminal_output(chunk_line)
-                                        self.console.print(f"[dim]  {safe_line}[/dim]")
-                            except (asyncio.TimeoutError, Exception):
-                                pass
-                            break
-                    else:
-                        # Process still running — just poll in case it exited
-                        # between the readline timeout and now.
-                        try:
-                            ret = proc.returncode  # non-blocking check
-                            if ret is None and hasattr(proc, '_transport') and proc._transport:
-                                rc = proc._transport.get_returncode()
-                                if rc is not None:
-                                    proc._returncode = rc
-                        except Exception:
-                            pass
-                    continue
-                    
-                if not line:
-                    break
-                    
-                decoded = line.decode("utf-8", errors="replace").rstrip()
-                output_lines.append(decoded)
-                # Sanitize before printing to prevent terminal escape sequences
-                # in binary output from triggering terminal responses that the
-                # keyboard monitor would misinterpret as user input (e.g. Escape)
-                safe_line = sanitize_terminal_output(decoded)
-                self.console.print(f"[dim]  {safe_line}[/dim]")
+                    pass
             
-            await proc.wait()
+            # Process has exited — do one final read to catch any trailing output
+            await asyncio.sleep(0.1)  # Brief pause for OS to flush file buffers
+            self._tail_log_file(cmd_log_path, file_pos, output_lines)
+            
             exit_code = proc.returncode
-            
+            elapsed_cmd = time.time() - start_time
+            log.info("execute_command finished: cmd=%s exit=%d elapsed=%.1fs output_lines=%d",
+                     log_truncate(command, 80), exit_code, elapsed_cmd, len(output_lines))
             if exit_code == 0:
                 self.console.print(f"[green][OK] Exit code: {exit_code}[/green]")
             else:
+                log.warning("Command failed: exit=%d cmd=%s", exit_code, log_truncate(command, 120))
                 self.console.print(f"[red][X] Exit code: {exit_code}[/red]")
             
             # Build raw output and spill to file if huge
-            raw_output = "\n".join(output_lines) or "(no output)"
-            
-            # First apply line-level truncation for sanity
+            raw_output = self._read_log_file(cmd_log_path) or "(no output)"
             output = truncate_output(raw_output, max_lines=300, keep_start=80, keep_end=80)
-            
-            # Then spill to file if still too large for context
             output = self.spill_output_to_file(output, f"cmd_{command.split()[0] if command else 'cmd'}")
             
             # Add to context if significant output
@@ -791,64 +748,138 @@ class ToolHandlers:
             return output
             
         except Exception as e:
-            proc.kill()
-            raw_output = "\n".join(output_lines)
+            log_exception(log, f"execute_command exception: {log_truncate(command, 80)}", e)
+            self._kill_proc(proc)
+            raw_output = self._read_log_file(cmd_log_path)
             output = self.spill_output_to_file(raw_output, "cmd_error") if raw_output else ""
             return f"Error: {str(e)}\nOutput captured:\n{output}" if output else f"Error: {str(e)}"
     
-    async def _run_background_command(self, command: str) -> str:
-        """Run a command in background with output streamed to a log file."""
-        import subprocess
+    # ── Helpers for file-redirect execution ─────────────────────────────
+    
+    def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:
+        """Read new content from a log file starting at file_pos.
         
-        # Windows: create new process group to isolate from child process chaos
-        creationflags = 0
-        if platform.system() == "Windows":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-        
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=self.workspace_path,
-            creationflags=creationflags,
-        )
-        
-        # Store background process with log buffer
+        Displays new lines in the console and appends to output_lines.
+        Returns the updated file position.
+        """
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(file_pos)
+                new_data = f.read()
+                new_pos = f.tell()
+            if new_data:
+                for line in new_data.splitlines():
+                    output_lines.append(line)
+                    safe_line = sanitize_terminal_output(line)
+                    self.console.print(f"[dim]  {safe_line}[/dim]")
+            return new_pos
+        except FileNotFoundError:
+            return file_pos
+        except Exception:
+            return file_pos
+    
+    def _read_log_file(self, log_path: str) -> str:
+        """Read the entire contents of a log file."""
+        try:
+            return Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+    
+    def _kill_proc(self, proc: asyncio.subprocess.Process) -> None:
+        """Kill a process and its entire process tree."""
+        kill_process_tree(proc.pid)
+    
+    def _promote_to_background(self, proc, command: str, start_time: float,
+                                log_path: str, output_lines: List[str]) -> str:
+        """Promote a foreground process to a tracked background process."""
         proc_id = self._next_bg_id
         self._next_bg_id += 1
         
-        # Create log file for this background process
+        self._background_procs[proc_id] = {
+            "proc": proc,
+            "command": command,
+            "started": start_time,
+            "logs": output_lines.copy()[-200:],
+            "log_file": log_path,
+            "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
+        }
+        self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        recent = "\n".join(output_lines[-30:])
+        return (
+            f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
+            f"Log file: {log_path}\n"
+            f"Use read_file on the log file to inspect stdout/stderr at any time.\n"
+            f"Output so far:\n{recent}"
+        )
+
+    async def create_plan(self, params: Dict[str, str], context_summary: str = "") -> str:
+        """Delegate a complex reasoning task to Claude CLI (Opus 4.6).
+        
+        Auto-attaches context summary (todos, recent files, workspace info).
+        """
+        import subprocess
+        
+        prompt = params.get("prompt", "").strip()
+        if not prompt:
+            return "Error: 'prompt' is required for create_plan."
+        
+        # Build full prompt with context
+        full_prompt = prompt
+        if context_summary:
+            full_prompt = f"CONTEXT:\n{context_summary}\n\nTASK:\n{prompt}"
+        
+        args = ["claude", "-p", full_prompt, "--dangerously-skip-permissions"]
+        
+        # Use configured model if available
+        claude_model = getattr(self, '_claude_model', None)
+        if claude_model:
+            args.extend(["--model", claude_model])
+        
+        command = subprocess.list2cmdline(args)
+        self.console.print(f"[bold yellow]{'─' * 4} create_plan (Claude CLI) {'─' * 25}[/bold yellow]")
+        result = await self.execute_command({"command": command})
+        self.console.print(f"[bold yellow]{'─' * 4} create_plan done {'─' * 32}[/bold yellow]")
+        return result
+    
+    async def _run_background_command(self, command: str) -> str:
+        """Run a command in background with output redirected to a log file."""
+        log.info("_run_background_command: cmd=%s", log_truncate(command, 120))
+        
+        proc_id = self._next_bg_id
+        self._next_bg_id += 1
         log_path = self._get_bg_log_path(proc_id)
         
-        # Wait briefly to capture initial output
-        output_lines = []
+        # Shell-level redirect to log file (no cmd /c wrapper — see execute_command)
+        wrapped = f'{command} > "{log_path}" 2>&1'
+        
+        proc = await asyncio.create_subprocess_shell(
+            wrapped,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=self.workspace_path,
+        )
+        
+        # Brief pause to capture initial output
+        await asyncio.sleep(0.5)
+        initial_output = []
         try:
-            with open(log_path, "w", encoding="utf-8") as log_fh:
-                for _ in range(20):
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.1)
-                    if not line:
-                        break
-                    decoded = line.decode("utf-8", errors="replace").rstrip()
-                    output_lines.append(decoded)
-                    log_fh.write(decoded + "\n")
-                    safe_line = sanitize_terminal_output(decoded)
-                    self.console.print(f"[dim]  {safe_line}[/dim]")
-        except asyncio.TimeoutError:
+            data = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            initial_output = data.splitlines()[-10:]
+            for line in initial_output:
+                safe_line = sanitize_terminal_output(line)
+                self.console.print(f"[dim]  {safe_line}[/dim]")
+        except Exception:
             pass
         
-        # Store process and start log reader
         self._background_procs[proc_id] = {
-            "proc": proc, 
-            "command": command, 
+            "proc": proc,
+            "command": command,
             "started": time.time(),
-            "logs": output_lines.copy(),
+            "logs": initial_output.copy(),
             "log_file": log_path,
-            "task": None
+            "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
-        # Start background log reader (appends to log file)
-        task = asyncio.create_task(self._background_log_reader(proc_id, proc))
-        self._background_procs[proc_id]["task"] = task
         
         self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
         return (
@@ -856,8 +887,9 @@ class ToolHandlers:
             f"Log file: {log_path}\n"
             f"Use read_file on the log file to inspect stdout/stderr at any time.\n"
             f"Use check_background_process for status and recent output.\n"
-            f"Initial output:\n" + "\n".join(output_lines[-10:])
+            f"Initial output:\n" + "\n".join(initial_output)
         )
+    
     
     async def list_files(self, params: Dict[str, str]) -> str:
         """List files in a directory."""
@@ -918,6 +950,7 @@ class ToolHandlers:
         path = self._resolve_path(params.get("path", "."))
         regex = params.get("regex", "")
         file_pattern = params.get("file_pattern", "*")
+        log.debug("search_files: path=%s regex=%s file_pattern=%s", path, regex, file_pattern)
         
         if not path.exists():
             return f"Error: Directory not found: {path}"
@@ -1057,14 +1090,13 @@ class ToolHandlers:
         if proc.returncode is not None:
             return f"Process [{bg_id}] already exited with code {proc.returncode}"
         
+        kill_process_tree(proc.pid)
         try:
-            proc.terminate()
-            # Wait briefly for graceful termination
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
         
-        # Cancel log reader
+        # Cancel log tailer
         if "task" in info and info["task"]:
             info["task"].cancel()
         

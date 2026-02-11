@@ -6,6 +6,10 @@ import signal
 from typing import Optional
 from dataclasses import dataclass
 
+from .logger import get_logger
+
+_log = get_logger("interrupt")
+
 
 @dataclass
 class InterruptState:
@@ -22,10 +26,12 @@ class InterruptState:
     def trigger(self, reason: str = "user"):
         self.interrupted = True
         self.reason = reason
+        _log.info("INTERRUPT triggered: reason=%s", reason)
     
     def trigger_background(self):
         self.background = True
         self.reason = "background"
+        _log.info("BACKGROUND requested")
 
 
 # Global interrupt state
@@ -74,8 +80,10 @@ class KeyboardMonitor:
     def start(self):
         """Start monitoring for keys."""
         if self._running and self._thread and self._thread.is_alive():
+            _log.debug("KeyboardMonitor.start() — already running")
             return
         
+        _log.debug("KeyboardMonitor.start()")
         self._running = True
         self._stop_event.clear()
         reset_interrupt()
@@ -99,6 +107,7 @@ class KeyboardMonitor:
     
     def stop(self):
         """Stop monitoring."""
+        _log.debug("KeyboardMonitor.stop()")
         self._running = False
         self._stop_event.set()
         

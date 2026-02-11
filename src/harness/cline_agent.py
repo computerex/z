@@ -7,6 +7,7 @@ import re
 import time
 import json
 import datetime
+import html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -27,6 +28,9 @@ from .tool_handlers import ToolHandlers
 from .todo_manager import TodoManager, TodoStatus
 from .smart_context import SmartContextManager
 from .status_line import StatusLine
+from .logger import get_logger, log_exception, truncate as log_truncate
+
+log = get_logger("agent")
 
 
 @dataclass
@@ -145,8 +149,35 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         'execute_command', 'list_files', 'search_files',
         'check_background_process', 'stop_background_process', 'list_background_processes',
         'list_context', 'remove_from_context', 'analyze_image', 'web_search',
-        'manage_todos', 'attempt_completion'
+        'manage_todos', 'attempt_completion',
+        'set_reasoning_mode', 'create_plan',
     ]
+
+    # Compatibility parser for shorthand style:
+    # <tool_call>list_files path="." recursive="true" />
+    shorthand_matches = []
+    shorthand_pattern = r'<tool_call>\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([^<]*?)(?:/>\s*|>\s*</tool_call>)'
+    for m in re.finditer(shorthand_pattern, content, re.DOTALL):
+        tool_name = m.group(1)
+        if tool_name not in tool_names:
+            continue
+
+        attr_blob = m.group(2) or ""
+        params: Dict[str, str] = {}
+        for attr in re.finditer(
+            r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))',
+            attr_blob,
+            re.DOTALL,
+        ):
+            key = attr.group(1)
+            value = attr.group(2) or attr.group(3) or attr.group(4) or ""
+            params[key] = html.unescape(value)
+
+        shorthand_matches.append((m.end(), ParsedToolCall(name=tool_name, parameters=params)))
+
+    if shorthand_matches:
+        shorthand_matches.sort(key=lambda x: x[0], reverse=True)
+        return shorthand_matches[0][1]
     
     # Tools that may have nested XML examples in their content
     complex_content_tools = {'write_to_file', 'replace_in_file'}
@@ -210,7 +241,8 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
                     'result', 'query', 'image_path', 'process_id', 'item', 
                     'search_term', 'count', 'recursive', 'id', 'lines', 'question',
                     'action', 'title', 'status', 'parent_id', 'notes', 'context_refs',
-                    'start_line', 'end_line', 'offset', 'limit']
+                    'start_line', 'end_line', 'offset', 'limit',
+                    'prompt', 'mode']
     complex_params = ['content', 'diff']
     
     # For tools with complex content (write_to_file, replace_in_file),
@@ -258,6 +290,53 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     return ParsedToolCall(name=tool_name, parameters=params)
 
 
+def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
+    """Parse ALL tool calls from content, in the order they appear.
+    
+    Unlike parse_xml_tool (which returns only the last match),
+    this returns every non-overlapping tool call so that the agent
+    can execute them sequentially. This is essential for batched
+    operations like adding multiple todo items in one response.
+    """
+    stripped = strip_thinking_blocks(content)
+    
+    tool_names = [
+        'read_file', 'write_to_file', 'replace_in_file',
+        'execute_command', 'list_files', 'search_files',
+        'check_background_process', 'stop_background_process', 'list_background_processes',
+        'list_context', 'remove_from_context', 'analyze_image', 'web_search',
+        'manage_todos', 'attempt_completion',
+        'set_reasoning_mode', 'create_plan',
+    ]
+    
+    # Find all <tool_name>...</tool_name> blocks with their positions
+    matches = []  # (start_pos, end_pos, tool_name)
+    for tool_name in tool_names:
+        pattern = rf'<{tool_name}>(.*?)</{tool_name}>'
+        for m in re.finditer(pattern, stripped, re.DOTALL):
+            matches.append((m.start(), m.end(), tool_name, m.group(0)))
+    
+    # Sort by start position (order of appearance)
+    matches.sort(key=lambda x: x[0])
+    
+    # Remove overlapping matches (keep earliest)
+    filtered = []
+    last_end = -1
+    for start, end, tool_name, raw in matches:
+        if start >= last_end:
+            filtered.append((start, end, tool_name, raw))
+            last_end = end
+    
+    # Parse each match into a ParsedToolCall using the existing parser
+    results = []
+    for start, end, tool_name, raw in filtered:
+        parsed = parse_xml_tool(raw)
+        if parsed:
+            results.append(parsed)
+    
+    return results
+
+
 class ClineAgent:
     """Agent using Cline-style XML tool format with streaming."""
     
@@ -266,12 +345,19 @@ class ClineAgent:
         config: Config,
         console: Optional[Console] = None,
         max_iterations: int = 30,
+        providers: Optional[Dict[str, dict]] = None,
+        claude_cli_config: Optional[dict] = None,
     ):
         self.config = config
         self.console = console or Console()
         self.max_iterations = max_iterations
         self.workspace_path = str(Path.cwd().resolve())
         self.cost_tracker = get_global_tracker()
+        
+        # Reasoning mode switching
+        self.providers = providers or {}
+        self.claude_cli_config = claude_cli_config or {}
+        self.reasoning_mode = "normal"  # default boot mode
         
         # Conversation history
         self.messages: List[StreamingMessage] = []
@@ -312,6 +398,36 @@ class ClineAgent:
             context=self.context,
             duplicate_detector=self._duplicate_detector
         )
+        # Set claude model for create_plan tool
+        self.tool_handlers._claude_model = self.claude_cli_config.get("model")
+
+    def _system_prompt(self) -> str:
+        """Return the system prompt for this agent."""
+        return get_system_prompt(self.workspace_path)
+    
+    def _handle_set_reasoning_mode(self, params: Dict[str, str]) -> str:
+        """Switch the underlying LLM provider based on reasoning mode."""
+        mode = (params.get("mode") or "").strip().lower()
+        if mode not in ("fast", "normal"):
+            return f"Error: mode must be 'fast' or 'normal'. Got '{mode}'."
+        
+        provider = self.providers.get(mode)
+        if not provider:
+            available = list(self.providers.keys()) or ["(none configured)"]
+            return f"Error: provider '{mode}' not configured in models.json. Available: {available}"
+        
+        old_mode = self.reasoning_mode
+        if old_mode == mode:
+            return f"Already in '{mode}' mode (model: {provider['model']})."
+        
+        self.reasoning_mode = mode
+        self.config = Config(
+            api_url=provider["api_url"],
+            api_key=provider["api_key"],
+            model=provider["model"],
+        )
+        log.info("Reasoning mode changed: %s -> %s (model: %s)", old_mode, mode, provider["model"])
+        return f"Reasoning mode changed: {old_mode} -> {mode} (model: {provider['model']})"
     
     async def cleanup_background_procs_async(self) -> None:
         """Terminate all background processes safely (async)."""
@@ -373,6 +489,8 @@ class ClineAgent:
             "smart_context": self.smart_context.to_dict(),
         }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        log.debug("Session saved: path=%s messages=%d context_items=%d",
+                  path, len(self.messages), len(context_items))
     
     def load_session(self, path: str, inject_resume: bool = True) -> bool:
         """Load conversation history and context.
@@ -390,14 +508,14 @@ class ClineAgent:
             # If messages[0] is not a system prompt, inject a fresh one
             if not self.messages or self.messages[0].role != "system":
                 self.console.print("[yellow][!] Session missing system prompt - injecting fresh one[/yellow]")
-                system_msg = StreamingMessage(role="system", content=get_system_prompt(self.workspace_path))
+                system_msg = StreamingMessage(role="system", content=self._system_prompt())
                 self.messages.insert(0, system_msg)
             else:
                 # Verify system prompt has tool definitions (not truncated/evicted)
                 sys_content = self.messages[0].content
                 if not isinstance(sys_content, str) or "TOOL USE" not in sys_content or "read_file" not in sys_content:
                     self.console.print("[yellow][!] System prompt appears corrupted - replacing with fresh one[/yellow]")
-                    self.messages[0] = StreamingMessage(role="system", content=get_system_prompt(self.workspace_path))
+                    self.messages[0] = StreamingMessage(role="system", content=self._system_prompt())
             
             # Load context if present
             if "context" in data:
@@ -431,8 +549,11 @@ class ClineAgent:
                     self.messages.append(StreamingMessage(role="user", content=resume_msg))
             
             self._initialized = True
+            log.info("Session loaded: path=%s messages=%d context_items=%d",
+                     path, len(self.messages), len(self.context.list_items()))
             return True
         except Exception as e:
+            log_exception(log, f"Failed to load session from {path}", e)
             self.console.print(f"[red][!] Failed to load session: {e}[/red]")
             return False
     
@@ -659,13 +780,17 @@ class ClineAgent:
     
     async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
         """Run the agent with streaming output."""
+        log.info("agent.run START reasoning_mode=%s interrupt=%s msg_count=%d input=%s",
+                 self.reasoning_mode, enable_interrupt, len(self.messages),
+                 log_truncate(user_input, 150))
         
         # Initialize system prompt if first run
         if not self._initialized:
             self.messages = [
-                StreamingMessage(role="system", content=get_system_prompt(self.workspace_path)),
+                StreamingMessage(role="system", content=self._system_prompt()),
             ]
             self._initialized = True
+            log.debug("System prompt initialised (%d chars)", len(self.messages[0].content))
         
         # Add user message
         self.messages.append(StreamingMessage(role="user", content=user_input))
@@ -679,7 +804,13 @@ class ClineAgent:
             start_monitoring()
         
         try:
-            return await self._run_loop()
+            result = await self._run_loop()
+            log.info("agent.run DONE reasoning_mode=%s result_len=%d",
+                     self.reasoning_mode, len(result or ""))
+            return result
+        except Exception as exc:
+            log_exception(log, f"agent.run FAILED reasoning_mode={self.reasoning_mode}", exc)
+            raise
         finally:
             self.status.clear()
             if enable_interrupt:
@@ -687,23 +818,46 @@ class ClineAgent:
     
     async def _run_loop(self) -> str:
         """Main agent loop."""
-        async with StreamingJSONClient(
-            api_key=self.config.api_key,
-            base_url=self.config.api_url,
-            model=self.config.model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-        ) as client:
-            
-            # Get model limits for auto-truncation
-            _, max_allowed = get_model_limits(self.config.model)
-            
+        # Client is created inside the loop so that reasoning-mode switches
+        # (which change self.config) take effect on the very next API call.
+        client: Optional[StreamingJSONClient] = None
+        _client_model: Optional[str] = None  # track which config the client was built for
+
+        async def _ensure_client():
+            """Create or recreate the streaming client when config changes."""
+            nonlocal client, _client_model
+            config_key = f"{self.config.api_url}|{self.config.model}"
+            if client is not None and _client_model == config_key:
+                return  # already up-to-date
+            if client is not None:
+                await client.__aexit__(None, None, None)
+                log.info("Closed old client (was %s), opening new one for %s",
+                         _client_model, config_key)
+            client = StreamingJSONClient(
+                api_key=self.config.api_key,
+                base_url=self.config.api_url,
+                model=self.config.model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+            )
+            await client.__aenter__()
+            _client_model = config_key
+
+        try:
             for iteration in range(self.max_iterations):
+                # (Re)create client if config changed (e.g. after set_reasoning_mode)
+                await _ensure_client()
+                _, max_allowed = get_model_limits(self.config.model)
+
+                log.debug("_run_loop iteration=%d/%d reasoning_mode=%s tokens=%d msgs=%d",
+                          iteration + 1, self.max_iterations, self.reasoning_mode,
+                          estimate_messages_tokens(self.messages), len(self.messages))
                 self.status.set_iterations(iteration + 1, self.max_iterations)
                 
                 # Check for interrupt BEFORE starting new iteration
                 # This ensures user can stop between iterations
                 if is_interrupted():
+                    log.info("Interrupted before iteration %d", iteration + 1)
                     self.status.clear()
                     self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
                     return "[Interrupted - session preserved. Type to continue or start new request]"
@@ -715,6 +869,8 @@ class ClineAgent:
                 self._last_token_count = estimate_messages_tokens(self.messages)
                 compact_threshold = int(max_allowed * 0.85)
                 if self._last_token_count > compact_threshold:
+                    log.info("Context compaction triggered: %d tokens > %d threshold",
+                             self._last_token_count, compact_threshold)
                     self.status.update("Compacting context...", StatusLine.COMPACTING)
                     # Smart compaction: dedup → compact low-priority → evict lowest-scored
                     self.messages, freed, report = self.smart_context.compact_context(
@@ -722,6 +878,8 @@ class ClineAgent:
                     )
                     if freed > 0:
                         self._last_token_count = estimate_messages_tokens(self.messages)
+                        log.info("Compaction freed %d tokens, now %d tokens. Report: %s",
+                                 freed, self._last_token_count, report)
                         self.console.print(f"[dim][!] Smart compaction: freed {freed:,} tokens ({report})[/dim]")
                         
                         # Inject reorientation so the agent knows context changed
@@ -767,6 +925,9 @@ class ClineAgent:
                 # Stream the response - using raw mode (no JSON parsing)
                 # Web search disabled by default to avoid unnecessary searches
                 # Use /search command for explicit web searches
+                api_t0 = time.time()
+                log.info("API request: model=%s tokens_in=%d iter=%d",
+                         self.config.model, self._last_token_count, iteration + 1)
                 response = await client.chat_stream_raw(
                     messages=self.messages,
                     on_content=on_chunk,
@@ -774,6 +935,10 @@ class ClineAgent:
                     enable_web_search=False,
                     status_line=self.status,
                 )
+                api_elapsed = time.time() - api_t0
+                log.info("API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d",
+                         response.finish_reason, response.interrupted, api_elapsed,
+                         len(full_content))
                 
                 self.status.clear()
                 print()  # Newline after stream
@@ -819,6 +984,8 @@ class ClineAgent:
                     tool_calls=0,
                     finish_reason=response.finish_reason,
                 )
+                log.debug("Usage: in=%d out=%d finish_reason=%s",
+                          input_tokens, output_tokens, response.finish_reason)
                 
                 # Detect truncated output: the model hit max_tokens mid-response.
                 # This commonly happens after compaction frees space, the model
@@ -826,6 +993,8 @@ class ClineAgent:
                 output_truncated = response.is_truncated or self._has_unclosed_tool_tag(full_content)
                 
                 if output_truncated:
+                    log.warning("Output truncated at iteration %d (content_len=%d)",
+                                iteration + 1, len(full_content))
                     self.console.print("[dim][!] Output truncated — asking model to continue[/dim]")
                     # Save the partial response and ask the model to finish
                     self.messages.append(StreamingMessage(role="assistant", content=full_content))
@@ -839,8 +1008,16 @@ class ClineAgent:
                     ))
                     continue  # next iteration will get the continuation
                 
-                # Parse XML tool call from content
-                tool_call = parse_xml_tool(full_content)
+                # Parse ALL XML tool calls from content (not just the last one)
+                all_tool_calls = parse_all_xml_tools(full_content)
+                tool_call = all_tool_calls[-1] if all_tool_calls else None
+                
+                if all_tool_calls:
+                    log.info("Tools parsed: %d call(s) — %s",
+                             len(all_tool_calls),
+                             ", ".join(tc.name for tc in all_tool_calls))
+                else:
+                    log.debug("No tool call parsed from response (len=%d)", len(full_content))
                 
                 # Reasoning checkpoint enforcement: if we previously injected
                 # a "stop and think" checkpoint, strictly require reasoning now.
@@ -870,14 +1047,11 @@ class ClineAgent:
                     with open(debug_file, "w", encoding="utf-8") as f:
                         f.write(f"=== Full Model Output ({len(full_content)} chars) ===\n")
                         f.write(full_content)
-                        f.write(f"\n\n=== Parsed Tool Call ===\n")
-                        f.write(f"{tool_call}\n")
-                        if tool_call:
-                            f.write(f"tool={tool_call.name}, params={tool_call.parameters}\n")
+                        f.write(f"\n\n=== Parsed Tool Calls ({len(all_tool_calls)}) ===\n")
+                        for tc in all_tool_calls:
+                            f.write(f"  tool={tc.name}, params={tc.parameters}\n")
                     print(f"[DEBUG] Saved model output to {debug_file}")
-                    print(f"[DEBUG] parse_xml_tool returned: {tool_call}")
-                    if tool_call:
-                        print(f"[DEBUG] tool={tool_call.name}, params keys={list(tool_call.parameters.keys())}")
+                    print(f"[DEBUG] parse_all_xml_tools returned: {len(all_tool_calls)} calls")
                 
                 if not tool_call:
                     # No tool call — model produced text. Reset reasoning counters.
@@ -896,29 +1070,51 @@ class ClineAgent:
                     self.messages.append(StreamingMessage(role="assistant", content=full_content))
                     return full_content
                 
-                # Execute the tool
-                self.status.update(f"Executing: {tool_call.name}", StatusLine.TOOL_EXEC)
-                tool_result = await self._execute_tool(tool_call)
+                # Execute tool(s) — if multiple calls found, run them all
+                tool_results_combined = []
+                _mode_switched = False
+                for tc_idx, tc in enumerate(all_tool_calls):
+                    self.status.update(f"Executing: {tc.name}" + (f" ({tc_idx+1}/{len(all_tool_calls)})" if len(all_tool_calls) > 1 else ""), StatusLine.TOOL_EXEC)
+                    tool_t0 = time.time()
+                    log.info("Tool exec START: %s (%d/%d)", tc.name, tc_idx+1, len(all_tool_calls))
+                    tc_result = await self._execute_tool(tc)
+                    tool_elapsed = time.time() - tool_t0
+                    log.info("Tool exec DONE: %s elapsed=%.1fs result_len=%d",
+                             tc.name, tool_elapsed, len(tc_result or ""))
+                    
+                    # Check for interrupt between tool calls
+                    if is_interrupted():
+                        self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
+                        self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                        return "[Interrupted - session preserved. Type to continue or start new request]"
+                    
+                    # Spill each individual result BEFORE combining, so that
+                    # small results stay inline even when there are many calls.
+                    tc_result = self.tool_handlers.spill_output_to_file(
+                        tc_result, tc.name
+                    )
+                    
+                    if len(all_tool_calls) > 1:
+                        tool_results_combined.append(f"[{tc.name} result ({tc_idx+1}/{len(all_tool_calls)})]:\n{tc_result}")
+                    else:
+                        tool_results_combined.append(tc_result)
+                    
+                    # If reasoning mode just changed, the remaining tool calls
+                    # were generated by the OLD model — discard them and let
+                    # the new model decide what to do next.
+                    if tc.name == "set_reasoning_mode" and "changed" in tc_result:
+                        remaining = len(all_tool_calls) - tc_idx - 1
+                        if remaining > 0:
+                            log.info("Mode switched mid-batch — discarding %d remaining tool calls from old model", remaining)
+                            self.console.print(f"[dim][!] Mode switched — re-planning with new model ({remaining} queued calls discarded)[/dim]")
+                            tool_results_combined.append(
+                                f"[SYSTEM: Reasoning mode changed. {remaining} tool call(s) from the previous model were discarded. "
+                                f"You are now running on the new model. Re-assess what to do next.]"
+                            )
+                        _mode_switched = True
+                        break
                 
-                # Check for interrupt after tool execution
-                if is_interrupted():
-                    self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
-                    # Still save the partial conversation
-                    self.messages.append(StreamingMessage(role="assistant", content=full_content))
-                    if tool_result:
-                        self.messages.append(StreamingMessage(
-                            role="user",
-                            content=f"[{tool_call.name} result - interrupted]\n{tool_result[:500]}..."
-                        ))
-                    return "[Interrupted - session preserved. Type to continue or start new request]"
-                
-                # Spill any large tool result to a file, keeping only a
-                # compact preview inline.  This applies uniformly to ALL tools
-                # (read_file, search_files, execute_command, etc.) so that no
-                # single tool result can blow up the context window.
-                tool_result = self.tool_handlers.spill_output_to_file(
-                    tool_result, tool_call.name
-                )
+                tool_result = "\n\n".join(tool_results_combined)
                 
                 # Track reasoning quality for checkpoint detection
                 _is_exempt = tool_call.name in ('manage_todos', 'attempt_completion', 'list_context')
@@ -982,8 +1178,12 @@ class ClineAgent:
                     content=result_content
                 ))
             
+            log.warning("Max iterations reached (%d)", self.max_iterations)
             self.status.clear()
             return "Max iterations reached."
+        finally:
+            if client is not None:
+                await client.__aexit__(None, None, None)
     
     # Tool tag names that the model emits as XML tool calls
     _TOOL_TAGS = [
@@ -992,6 +1192,7 @@ class ClineAgent:
         'check_background_process', 'stop_background_process', 'list_background_processes',
         'list_context', 'remove_from_context', 'analyze_image', 'web_search',
         'manage_todos', 'attempt_completion',
+        'set_reasoning_mode', 'create_plan',
     ]
 
     @staticmethod
@@ -1041,7 +1242,7 @@ class ClineAgent:
                     entry["last_error"] = result[:200]
                     n = entry["failures"]
                     if n >= 3:
-                        self.console.print(f"[bold red]   ⚠ {n} consecutive edit failures on this file![/bold red]")
+                        self.console.print(f"[bold red]   {n} consecutive edit failures on this file![/bold red]")
                         result += (
                             f"\n\n[REPEATED FAILURE — {n} consecutive failed edits on this file]\n"
                             f"You are stuck in a loop. STOP and try a DIFFERENT approach:\n"
@@ -1061,7 +1262,6 @@ class ClineAgent:
                     self._edit_failures.pop(norm_path, None)
                 
             elif tool.name == "execute_command":
-                # execute_command handles its own display
                 result = await self.tool_handlers.execute_command(tool.parameters)
                 
             elif tool.name == "list_files":
@@ -1091,6 +1291,18 @@ class ClineAgent:
             elif tool.name == "list_background_processes":
                 self.console.print(f"[cyan]> Listing background processes[/cyan]")
                 result = await self.tool_handlers.list_background_processes(tool.parameters)
+            
+            elif tool.name == "set_reasoning_mode":
+                mode = tool.parameters.get("mode", "")
+                self.console.print(f"[bold yellow]> Switching reasoning mode:[/bold yellow] {mode}")
+                result = self._handle_set_reasoning_mode(tool.parameters)
+                
+            elif tool.name == "create_plan":
+                prompt = tool.parameters.get("prompt", "")
+                self.console.print(f"[bold yellow]> Creating plan (Claude CLI)[/bold yellow]")
+                # Auto-build context summary
+                context_summary = self._build_plan_context()
+                result = await self.tool_handlers.create_plan(tool.parameters, context_summary=context_summary)
                 
             elif tool.name == "list_context":
                 self.console.print(f"[blue]> Listing context[/blue]")
@@ -1119,6 +1331,8 @@ class ClineAgent:
                 action = tool.parameters.get("action", "list")
                 self.console.print(f"[blue]> Todo:[/blue] {action}")
                 result = self._handle_manage_todos(tool.parameters)
+                # Render live todo panel after any todo change
+                self.todo_manager.print_todo_panel(self.console)
                 
             elif tool.name == "attempt_completion":
                 self.console.print("[green]> Task complete[/green]")
@@ -1130,8 +1344,36 @@ class ClineAgent:
             return result
             
         except Exception as e:
+            log_exception(log, f"Tool execution failed: {tool.name}", e)
             self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
             return f"Error: {str(e)}"
+    
+    def _build_plan_context(self) -> str:
+        """Build a context summary to pass to create_plan (Claude CLI)."""
+        parts = []
+        
+        # Active todos
+        todo_state = self.todo_manager.format_list(include_completed=False)
+        if todo_state and "empty" not in todo_state.lower():
+            parts.append(f"ACTIVE TODOS:\n{todo_state}")
+        
+        # Recent context items (last 5 files/outputs)
+        items = self.context.list_items()
+        if items:
+            recent = sorted(items, key=lambda x: x.added_at, reverse=True)[:5]
+            ctx_lines = ["RECENT CONTEXT:"]
+            for item in recent:
+                # Include a preview, not full content
+                preview = item.content[:500]
+                if len(item.content) > 500:
+                    preview += f"\n... ({len(item.content):,} chars total)"
+                ctx_lines.append(f"\n--- {item.type}: {item.source} ---\n{preview}")
+            parts.append("\n".join(ctx_lines))
+        
+        # Working directory
+        parts.append(f"WORKSPACE: {self.workspace_path}")
+        
+        return "\n\n".join(parts)
     
     def _handle_manage_todos(self, params: Dict[str, str]) -> str:
         """Handle the manage_todos tool."""

@@ -41,7 +41,11 @@ class Config:
     embedding_model: str = "all-MiniLM-L6-v2"
     
     @classmethod
-    def from_json(cls, workspace: Optional[Path] = None) -> "Config":
+    def from_json(
+        cls,
+        workspace: Optional[Path] = None,
+        overrides: Optional[dict] = None,
+    ) -> "Config":
         """Load configuration from JSON files.
         
         Priority (later overrides earlier):
@@ -59,6 +63,9 @@ class Config:
         ws_config = load_json_config(get_workspace_config_path(workspace))
         config_data.update(ws_config)
         
+        if overrides:
+            config_data.update(overrides)
+        
         return cls(
             api_url=config_data.get("api_url", ""),
             api_key=config_data.get("api_key", ""),
@@ -70,7 +77,11 @@ class Config:
         )
     
     @classmethod
-    def from_env(cls, env_path: Optional[Path] = None, workspace: Optional[Path] = None) -> "Config":
+    def from_env(
+        cls,
+        env_path: Optional[Path] = None,
+        workspace: Optional[Path] = None,
+    ) -> "Config":
         """Load configuration from JSON config files.
         
         Priority (later overrides earlier):

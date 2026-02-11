@@ -18,7 +18,7 @@ import pytest
 # Ensure src is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from harness.cline_agent import parse_xml_tool, ParsedToolCall, ClineAgent
+from harness.cline_agent import parse_xml_tool, parse_all_xml_tools, ParsedToolCall, ClineAgent
 from harness.config import Config
 from harness.todo_manager import TodoManager, TodoStatus
 from harness.smart_context import SmartContextManager
@@ -118,6 +118,16 @@ class TestParseXmlTool:
         assert result.parameters["path"] == "src/"
         assert result.parameters["recursive"] == "true"
 
+    def test_parse_tool_call_shorthand_list_files(self):
+        content = """I'll inspect the repo layout first.
+
+<tool_call>list_files path="." recursive="true" />"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "list_files"
+        assert result.parameters["path"] == "."
+        assert result.parameters["recursive"] == "true"
+
     def test_parse_search_files(self):
         content = """<search_files>
 <path>src/</path>
@@ -203,6 +213,101 @@ Actually, let me read a different file instead.
         assert result is not None
         assert result.name == "read_file"
         assert result.parameters["path"] == "correct_file.py"
+
+
+# ============================================================
+# Multi-Tool-Call Parsing Tests
+# ============================================================
+
+class TestParseAllXmlTools:
+    """Test that parse_all_xml_tools finds every tool call in order."""
+
+    def test_single_tool(self):
+        content = """<read_file>
+<path>foo.py</path>
+</read_file>"""
+        results = parse_all_xml_tools(content)
+        assert len(results) == 1
+        assert results[0].name == "read_file"
+        assert results[0].parameters["path"] == "foo.py"
+
+    def test_multiple_manage_todos(self):
+        """The exact scenario that was broken: 3 manage_todos in one response."""
+        content = """I'll create a todo list.
+
+<manage_todos>
+<action>add</action>
+<title>Delete evoke.exe</title>
+</manage_todos>
+
+<manage_todos>
+<action>add</action>
+<title>Rebuild evoke.exe</title>
+</manage_todos>
+
+<manage_todos>
+<action>add</action>
+<title>Launch evoke.exe</title>
+</manage_todos>"""
+        results = parse_all_xml_tools(content)
+        assert len(results) == 3
+        assert results[0].parameters["title"] == "Delete evoke.exe"
+        assert results[1].parameters["title"] == "Rebuild evoke.exe"
+        assert results[2].parameters["title"] == "Launch evoke.exe"
+
+    def test_mixed_tool_types(self):
+        content = """<manage_todos>
+<action>update</action>
+<id>1</id>
+<status>in-progress</status>
+</manage_todos>
+
+<read_file>
+<path>src/main.py</path>
+</read_file>"""
+        results = parse_all_xml_tools(content)
+        assert len(results) == 2
+        assert results[0].name == "manage_todos"
+        assert results[1].name == "read_file"
+
+    def test_no_tools(self):
+        content = "Just some plain text with no XML tool calls."
+        results = parse_all_xml_tools(content)
+        assert len(results) == 0
+
+    def test_with_thinking_blocks(self):
+        content = """<thinking>Let me plan this out.</thinking>
+
+<manage_todos>
+<action>add</action>
+<title>First task</title>
+</manage_todos>
+
+<manage_todos>
+<action>add</action>
+<title>Second task</title>
+</manage_todos>"""
+        results = parse_all_xml_tools(content)
+        assert len(results) == 2
+        assert results[0].parameters["title"] == "First task"
+        assert results[1].parameters["title"] == "Second task"
+
+    def test_parse_all_preserves_order(self):
+        content = """<manage_todos>
+<action>add</action>
+<title>A</title>
+</manage_todos>
+<manage_todos>
+<action>add</action>
+<title>B</title>
+</manage_todos>
+<manage_todos>
+<action>add</action>
+<title>C</title>
+</manage_todos>"""
+        results = parse_all_xml_tools(content)
+        titles = [r.parameters["title"] for r in results]
+        assert titles == ["A", "B", "C"]
 
 
 # ============================================================
@@ -471,6 +576,48 @@ class TestToolDispatch:
         result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
         assert "Error" in result
         assert "Unknown action" in result
+
+    def test_dispatch_set_reasoning_mode(self):
+        """set_reasoning_mode should change the agent's reasoning mode."""
+        agent = self._make_agent()
+        # Set up providers so mode switching works
+        agent.providers = {
+            "fast": {"api_url": "http://fast.invalid", "api_key": "fk", "model": "fast-model"},
+            "normal": {"api_url": "http://normal.invalid", "api_key": "nk", "model": "normal-model"},
+        }
+        assert agent.reasoning_mode == "normal"
+        
+        tool = ParsedToolCall(
+            name="set_reasoning_mode",
+            parameters={"mode": "fast"},
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "fast" in result
+        assert agent.reasoning_mode == "fast"
+        assert agent.config.model == "fast-model"
+    
+    def test_dispatch_set_reasoning_mode_invalid(self):
+        """Invalid mode should return an error."""
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="set_reasoning_mode",
+            parameters={"mode": "ultra"},
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Error" in result
+    
+    def test_dispatch_set_reasoning_mode_already_set(self):
+        """Switching to current mode should return 'already in' message."""
+        agent = self._make_agent()
+        agent.providers = {
+            "normal": {"api_url": "http://n.invalid", "api_key": "k", "model": "m"},
+        }
+        tool = ParsedToolCall(
+            name="set_reasoning_mode",
+            parameters={"mode": "normal"},
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Already" in result
 
 
 # ============================================================
@@ -749,6 +896,7 @@ class TestPromptIntegration:
             "execute_command", "list_files", "search_files",
             "web_search", "list_context", "remove_from_context",
             "manage_todos", "attempt_completion",
+            "set_reasoning_mode", "create_plan",
         ]
         for tool in required_tools:
             assert f"## {tool}" in prompt, f"System prompt missing tool definition: {tool}"
@@ -775,7 +923,8 @@ class TestPromptIntegration:
             'check_background_process', 'stop_background_process', 
             'list_background_processes',
             'list_context', 'remove_from_context', 'analyze_image', 
-            'web_search', 'manage_todos', 'attempt_completion'
+            'web_search', 'manage_todos', 'attempt_completion',
+            'set_reasoning_mode', 'create_plan',
         }
         
         # Every tool in the prompt should be parseable
@@ -896,6 +1045,322 @@ class TestContextDump:
         assert sys_tokens >= 5000, (
             f"System prompt is {sys_tokens} tokens, expected >= 5000 with manage_todos."
         )
+
+
+# ============================================================
+# Reasoning Mode Tests
+# ============================================================
+
+class TestSetReasoningMode:
+    """Test the set_reasoning_mode tool and mode switching."""
+
+    def _make_agent(self):
+        config = Config(
+            api_url="http://normal.invalid",
+            api_key="normal-key",
+            model="normal-model",
+        )
+        providers = {
+            "fast": {"api_url": "http://fast.invalid", "api_key": "fast-key", "model": "fast-model"},
+            "normal": {"api_url": "http://normal.invalid", "api_key": "normal-key", "model": "normal-model"},
+        }
+        agent = ClineAgent(config=config, max_iterations=1, providers=providers)
+        return agent
+
+    def test_default_mode_is_normal(self):
+        agent = self._make_agent()
+        assert agent.reasoning_mode == "normal"
+
+    def test_switch_to_fast(self):
+        agent = self._make_agent()
+        result = agent._handle_set_reasoning_mode({"mode": "fast"})
+        assert "fast" in result
+        assert agent.reasoning_mode == "fast"
+        assert agent.config.model == "fast-model"
+        assert agent.config.api_url == "http://fast.invalid"
+
+    def test_switch_back_to_normal(self):
+        agent = self._make_agent()
+        agent._handle_set_reasoning_mode({"mode": "fast"})
+        result = agent._handle_set_reasoning_mode({"mode": "normal"})
+        assert "normal" in result
+        assert agent.reasoning_mode == "normal"
+        assert agent.config.model == "normal-model"
+
+    def test_invalid_mode_returns_error(self):
+        agent = self._make_agent()
+        result = agent._handle_set_reasoning_mode({"mode": "turbo"})
+        assert "Error" in result
+        assert agent.reasoning_mode == "normal"  # unchanged
+
+    def test_already_in_mode(self):
+        agent = self._make_agent()
+        result = agent._handle_set_reasoning_mode({"mode": "normal"})
+        assert "Already" in result
+
+    def test_no_provider_configured(self):
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=1, providers={})
+        result = agent._handle_set_reasoning_mode({"mode": "fast"})
+        assert "Error" in result
+        assert "not configured" in result
+
+
+class TestParseReasoningModeXml:
+    """Test that parse_xml_tool correctly handles set_reasoning_mode and create_plan XML."""
+
+    def test_parse_set_reasoning_mode(self):
+        content = """I'll switch to fast mode for bulk file reads.
+
+<set_reasoning_mode>
+<mode>fast</mode>
+</set_reasoning_mode>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "set_reasoning_mode"
+        assert result.parameters["mode"] == "fast"
+
+    def test_parse_create_plan(self):
+        content = """This requires deep reasoning. Let me delegate to Claude.
+
+<create_plan>
+<prompt>Design a migration plan for the auth system from sessions to JWT.</prompt>
+</create_plan>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "create_plan"
+        assert "migration plan" in result.parameters["prompt"]
+
+    def test_parse_create_plan_long_prompt(self):
+        content = """<create_plan>
+<prompt>I need to refactor the authentication system from session-based to JWT.
+The current code is in src/auth/ with 3 main files.
+Design a migration plan that:
+1) lists all files that need changes
+2) specifies the order of changes
+3) identifies potential breaking changes</prompt>
+</create_plan>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "create_plan"
+        assert "refactor" in result.parameters["prompt"]
+        assert "breaking changes" in result.parameters["prompt"]
+
+
+class TestCreatePlanContext:
+    """Test that _build_plan_context produces a useful context summary."""
+
+    def _make_agent(self):
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=1)
+        return agent
+
+    def test_context_includes_workspace(self):
+        agent = self._make_agent()
+        ctx = agent._build_plan_context()
+        assert "WORKSPACE" in ctx
+        assert agent.workspace_path in ctx
+
+    def test_context_includes_todos(self):
+        agent = self._make_agent()
+        agent.todo_manager.add("Fix auth bug")
+        agent.todo_manager.add("Write tests")
+        ctx = agent._build_plan_context()
+        assert "ACTIVE TODOS" in ctx
+        assert "Fix auth bug" in ctx
+
+    def test_context_includes_recent_files(self):
+        agent = self._make_agent()
+        agent.context.add("file", "src/main.py", "def main():\n    pass\n")
+        ctx = agent._build_plan_context()
+        assert "RECENT CONTEXT" in ctx
+        assert "src/main.py" in ctx
+
+    def test_context_empty_when_no_data(self):
+        agent = self._make_agent()
+        ctx = agent._build_plan_context()
+        # Should still have workspace at minimum
+        assert "WORKSPACE" in ctx
+        # Should NOT have todos or recent context sections
+        assert "ACTIVE TODOS" not in ctx
+
+
+# ============================================================
+# Provider Loading Tests
+# ============================================================
+
+class TestProviderLoading:
+    """Test load_providers and load_claude_cli_config from harness.py."""
+
+    def test_load_providers_new_format(self, tmp_path):
+        """Load providers with new key names (fast/normal)."""
+        import importlib.util
+        _harness_script = os.path.join(os.path.dirname(__file__), '..', 'harness.py')
+        _spec = importlib.util.spec_from_file_location("harness_entry", _harness_script)
+        _harness_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_harness_mod)
+        
+        models_dir = tmp_path / ".z"
+        models_dir.mkdir()
+        (models_dir / "models.json").write_text(json.dumps({
+            "providers": {
+                "fast": {"api_url": "http://fast", "api_key": "fk", "model": "fast-m"},
+                "normal": {"api_url": "http://normal", "api_key": "nk", "model": "normal-m"},
+            }
+        }))
+        
+        providers = _harness_mod.load_providers(str(tmp_path))
+        assert "fast" in providers
+        assert "normal" in providers
+
+    def test_load_providers_old_format(self, tmp_path):
+        """Load providers with old key names (low/orchestrator) — should normalise."""
+        import importlib.util
+        _harness_script = os.path.join(os.path.dirname(__file__), '..', 'harness.py')
+        _spec = importlib.util.spec_from_file_location("harness_entry", _harness_script)
+        _harness_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_harness_mod)
+        
+        models_dir = tmp_path / ".z"
+        models_dir.mkdir()
+        (models_dir / "models.json").write_text(json.dumps({
+            "providers": {
+                "low": {"api_url": "http://low", "api_key": "lk", "model": "low-m"},
+                "orchestrator": {"api_url": "http://orch", "api_key": "ok", "model": "orch-m"},
+            }
+        }))
+        
+        providers = _harness_mod.load_providers(str(tmp_path))
+        assert "fast" in providers
+        assert "normal" in providers
+        assert "low" not in providers
+        assert "orchestrator" not in providers
+
+    def test_load_providers_missing_file(self, tmp_path):
+        """Missing models.json returns empty dict."""
+        import importlib.util
+        _harness_script = os.path.join(os.path.dirname(__file__), '..', 'harness.py')
+        _spec = importlib.util.spec_from_file_location("harness_entry", _harness_script)
+        _harness_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_harness_mod)
+        
+        providers = _harness_mod.load_providers(str(tmp_path))
+        assert providers == {}
+
+    def test_load_claude_cli_config(self, tmp_path):
+        """Load claude_cli config section."""
+        import importlib.util
+        _harness_script = os.path.join(os.path.dirname(__file__), '..', 'harness.py')
+        _spec = importlib.util.spec_from_file_location("harness_entry", _harness_script)
+        _harness_mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_harness_mod)
+        
+        models_dir = tmp_path / ".z"
+        models_dir.mkdir()
+        (models_dir / "models.json").write_text(json.dumps({
+            "providers": {},
+            "claude_cli": {"model": "claude-opus-4.6", "flags": ["--dangerously-skip-permissions"]}
+        }))
+        
+        config = _harness_mod.load_claude_cli_config(str(tmp_path))
+        assert config["model"] == "claude-opus-4.6"
+
+
+# ============================================================
+# Todo Panel Rendering Tests
+# ============================================================
+
+class TestTodoPanelRendering:
+    """Test the Rich visual todo panel rendering."""
+
+    def test_render_empty_panel(self):
+        mgr = TodoManager()
+        panel = mgr.render_todo_panel()
+        assert panel is not None
+        assert panel.title == "Todo List"
+        # Should have a "No todos yet" message
+
+    def test_render_panel_with_items(self):
+        mgr = TodoManager()
+        mgr.add("Task one")
+        mgr.add("Task two")
+        panel = mgr.render_todo_panel()
+        assert panel.title == "Todo List"
+        # Should not raise
+
+    def test_render_panel_with_hierarchy(self):
+        mgr = TodoManager()
+        parent = mgr.add("Parent task")
+        child = mgr.add("Child task", parent_id=parent.id)
+        mgr.update(parent.id, status="in-progress")
+        mgr.update(child.id, status="completed")
+        panel = mgr.render_todo_panel()
+        assert panel is not None
+
+    def test_render_panel_progress(self):
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        mgr = TodoManager()
+        mgr.add("Task 1")
+        mgr.add("Task 2")
+        mgr.update(1, status="completed")
+        # Capture output
+        buf = StringIO()
+        con = RichConsole(file=buf, force_terminal=True, width=80)
+        mgr.print_todo_panel(con)
+        output = buf.getvalue()
+        assert "50%" in output
+        assert "1/2" in output
+
+    def test_render_panel_all_complete(self):
+        mgr = TodoManager()
+        mgr.add("Done 1")
+        mgr.add("Done 2")
+        mgr.update(1, status="completed")
+        mgr.update(2, status="completed")
+        panel = mgr.render_todo_panel()
+        assert panel.border_style == "green"
+
+    def test_render_panel_in_progress(self):
+        mgr = TodoManager()
+        mgr.add("Active")
+        mgr.update(1, status="in-progress")
+        panel = mgr.render_todo_panel()
+        assert panel.border_style == "yellow"
+
+    def test_render_panel_blocked(self):
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        mgr = TodoManager()
+        mgr.add("Blocked task")
+        mgr.update(1, status="blocked")
+        buf = StringIO()
+        con = RichConsole(file=buf, force_terminal=True, width=80)
+        mgr.print_todo_panel(con)
+        output = buf.getvalue()
+        assert "blocked" in output.lower() or "1 blocked" in output.lower()
+
+    def test_print_todo_panel_empty_is_noop(self):
+        """print_todo_panel should do nothing if there are no items."""
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        mgr = TodoManager()
+        buf = StringIO()
+        con = RichConsole(file=buf, force_terminal=True, width=80)
+        mgr.print_todo_panel(con)
+        assert buf.getvalue() == ""
+
+    def test_render_panel_with_notes(self):
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        mgr = TodoManager()
+        mgr.add("Task with notes")
+        mgr.update(1, notes="Some working note here")
+        buf = StringIO()
+        con = RichConsole(file=buf, force_terminal=True, width=80)
+        mgr.print_todo_panel(con)
+        output = buf.getvalue()
+        assert "Some working note" in output
 
 
 if __name__ == "__main__":
