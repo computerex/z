@@ -288,6 +288,7 @@ class StreamingJSONClient:
         check_interrupt: Optional[Callable[[], bool]] = None,
         enable_web_search: bool = False,
         web_search_count: int = 5,
+        status_line: Optional[object] = None,
     ) -> StreamingChatResponse:
         """Stream raw text response (no JSON parsing) - for XML tool format.
         
@@ -337,14 +338,42 @@ class StreamingJSONClient:
                     response.raise_for_status()
                     
                     line_buffer = ""
-                    async for chunk in response.aiter_bytes():
-                        if debug_log:
-                            raw_chunks.append(chunk)
+                    # Use polling loop instead of 'async for' so we can
+                    # check for interrupt every 300ms even when the server
+                    # is slow to emit tokens (e.g. during initial thinking).
+                    aiter = response.aiter_bytes().__aiter__()
+                    pending_read = None
+                    while True:
                         # Check for interrupt
                         if check_interrupt and check_interrupt():
+                            if pending_read and not pending_read.done():
+                                pending_read.cancel()
+                                try:
+                                    await pending_read
+                                except (asyncio.CancelledError, StopAsyncIteration):
+                                    pass
                             interrupted = True
                             finish_reason = "interrupted"
                             break
+                        
+                        # Start a new read if we don't have one pending
+                        if pending_read is None:
+                            pending_read = asyncio.ensure_future(aiter.__anext__())
+                        
+                        # Wait for chunk with timeout so we can check interrupts
+                        done, _ = await asyncio.wait({pending_read}, timeout=0.3)
+                        
+                        if not done:
+                            continue  # Timeout — loop back to check interrupt
+                        
+                        try:
+                            chunk = pending_read.result()
+                        except StopAsyncIteration:
+                            break
+                        pending_read = None
+                        
+                        if debug_log:
+                            raw_chunks.append(chunk)
                         
                         line_buffer += chunk.decode('utf-8', errors='ignore')
                         
@@ -423,8 +452,20 @@ class StreamingJSONClient:
                 if e.response.status_code in (429, 500, 502, 503):
                     if attempt < max_retries:
                         wait = min(2 ** (attempt + 1), 60)
-                        print(f"\n⚠️  HTTP {e.response.status_code}. Retry in {wait}s...")
-                        await asyncio.sleep(wait)
+                        reason = f"HTTP {e.response.status_code}"
+                        print(f"\n⚠️  {reason}. Retry {attempt+1}/{max_retries} in {wait}s...")
+                        if status_line and hasattr(status_line, 'set_retry'):
+                            status_line.set_retry(attempt + 1, max_retries, wait, reason)
+                        # Interruptible sleep — check every 300ms
+                        _remaining = wait
+                        while _remaining > 0:
+                            await asyncio.sleep(min(0.3, _remaining))
+                            _remaining -= 0.3
+                            if check_interrupt and check_interrupt():
+                                return StreamingChatResponse(
+                                    content=full_content, raw_json=full_content,
+                                    finish_reason="interrupted", interrupted=True,
+                                )
                         continue
                 raise RuntimeError(f"API error: {e}")
                 
@@ -432,9 +473,21 @@ class StreamingJSONClient:
                 last_error = e
                 if attempt < max_retries:
                     wait = min(2 ** (attempt + 1), 60)
-                    print(f"\n⚠️  Connection error. Retry in {wait}s...")
-                    await asyncio.sleep(wait)
+                    reason = type(e).__name__
+                    print(f"\n⚠️  {reason}. Retry {attempt+1}/{max_retries} in {wait}s...")
+                    if status_line and hasattr(status_line, 'set_retry'):
+                        status_line.set_retry(attempt + 1, max_retries, wait, reason)
+                    # Interruptible sleep — check every 300ms
+                    _remaining = wait
+                    while _remaining > 0:
+                        await asyncio.sleep(min(0.3, _remaining))
+                        _remaining -= 0.3
+                        if check_interrupt and check_interrupt():
+                            return StreamingChatResponse(
+                                content=full_content, raw_json=full_content,
+                                finish_reason="interrupted", interrupted=True,
+                            )
                     continue
-                raise RuntimeError(f"Request failed: {e}")
+                raise RuntimeError(f"Request failed after {max_retries} retries: {e}")
         
         raise RuntimeError(f"Failed after {max_retries} retries: {last_error}")

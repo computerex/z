@@ -52,3 +52,6 @@ debug_*.py
 
 # Sessions
 .sessions/
+
+# Harness output spill files
+.harness_output/

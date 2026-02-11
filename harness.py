@@ -302,6 +302,7 @@ def create_prompt_session(history_file: Path) -> "PromptSession":
 
 async def run_single(agent: ClineAgent, user_input: str, console: Console):
     """Run a single user request."""
+    start_time = time.time()
     try:
         result = await agent.run(user_input)
     except asyncio.CancelledError:
@@ -311,6 +312,8 @@ async def run_single(agent: ClineAgent, user_input: str, console: Console):
         console.print("\n[yellow][STOP] Interrupted[/yellow]")
         result = "[Interrupted]"
     
+    elapsed = time.time() - start_time
+    
     # Show final response
     if result:
         console.print()
@@ -319,14 +322,32 @@ async def run_single(agent: ClineAgent, user_input: str, console: Console):
     # Show cost and context stats
     cost = get_global_tracker().get_summary()
     stats = agent.get_context_stats()
+    breakdown = agent.get_token_breakdown()
+    
+    todo_line = ""
+    if stats.get('todos_total', 0) > 0:
+        todo_line = f"\nTodos: {stats['todos_completed']}/{stats['todos_total']} done, {stats['todos_active']} active"
+    
+    eviction_line = ""
+    if stats.get('evictions', 0) > 0:
+        eviction_line = f"\nEvictions: {stats['evictions']} context items evicted"
+    
+    # Format elapsed time
+    if elapsed < 60:
+        elapsed_str = f"{elapsed:.1f}s"
+    else:
+        mins = int(elapsed) // 60
+        secs = int(elapsed) % 60
+        elapsed_str = f"{mins}m{secs:02d}s"
     
     console.print(Panel(
-        f"API Calls: {cost.total_calls}\n"
+        f"API Calls: {cost.total_calls}  |  Elapsed: {elapsed_str}\n"
         f"Tokens: {cost.total_input_tokens:,} in / {cost.total_output_tokens:,} out\n"
         f"Cost: ${cost.total_cost:.4f}\n"
         f"---------------\n"
         f"Context: {stats['tokens']:,} tokens ({stats['percent']:.0f}% of {stats['max_allowed']:,} limit)\n"
-        f"Messages: {stats['messages']} | Items: {stats['context_items']} ({stats['context_chars']:,} chars)",
+        f"System: {breakdown['system']:,}t | Conv: {breakdown['conversation']:,}t | Messages: {stats['messages']}"
+        f"{todo_line}{eviction_line}",
         title="Stats",
         border_style="blue"
     ))
@@ -377,8 +398,7 @@ def main():
     os.chdir(workspace)
     
     # Load config
-    harness_dir = Path(__file__).parent
-    config = Config.from_env(harness_dir / ".env")
+    config = Config.from_json(workspace=Path(workspace))
     config.validate()
     
     # Create a single persistent event loop for the entire session
@@ -577,6 +597,90 @@ def main():
                         console.print(f"[dim]Compacted: {before:,} -> {after:,} tokens (-{removed:,})[/dim]")
                         continue
                     
+                    elif cmd == '/todo':
+                        if not cmd_arg:
+                            # Show full todo list
+                            todo_text = agent.todo_manager.format_list()
+                            console.print(f"[dim]{todo_text}[/dim]")
+                        elif cmd_arg.startswith("add "):
+                            title = cmd_arg[4:].strip()
+                            item = agent.todo_manager.add(title=title)
+                            console.print(f"[dim]Added todo [{item.id}]: {title}[/dim]")
+                        elif cmd_arg.startswith("done "):
+                            try:
+                                item_id = int(cmd_arg[5:].strip())
+                                item = agent.todo_manager.update(item_id, status="completed")
+                                if item:
+                                    console.print(f"[dim]Completed: [{item.id}] {item.title}[/dim]")
+                                else:
+                                    console.print(f"[dim]Todo [{item_id}] not found[/dim]")
+                            except ValueError:
+                                console.print("[dim]Usage: /todo done <id>[/dim]")
+                        elif cmd_arg.startswith("rm "):
+                            try:
+                                item_id = int(cmd_arg[3:].strip())
+                                if agent.todo_manager.remove(item_id):
+                                    console.print(f"[dim]Removed todo [{item_id}][/dim]")
+                                else:
+                                    console.print(f"[dim]Todo [{item_id}] not found[/dim]")
+                            except ValueError:
+                                console.print("[dim]Usage: /todo rm <id>[/dim]")
+                        elif cmd_arg.strip() == "clear":
+                            agent.todo_manager.clear()
+                            console.print("[dim]All todos cleared.[/dim]")
+                        else:
+                            console.print("[dim]Usage: /todo [add <title>|done <id>|rm <id>|clear][/dim]")
+                        continue
+                    
+                    elif cmd == '/smart':
+                        # Show smart context analysis
+                        from harness.context_management import get_model_limits as _gml
+                        _, max_allowed = _gml(config.model)
+                        analysis = agent.smart_context.analyze_messages(agent.messages, max_allowed)
+                        console.print(f"[dim]Context: {analysis['total_tokens']:,} / {analysis['budget_tokens']:,} tokens[/dim]")
+                        console.print(f"[dim]Over budget: {analysis['over_budget']}[/dim]")
+                        console.print(f"[dim]Active todos: {analysis['active_todo_count']}[/dim]")
+                        if analysis['duplicates']:
+                            console.print(f"[dim]Duplicate files: {analysis['duplicates']}[/dim]")
+                        if analysis['auto_evict']:
+                            console.print(f"[dim]Auto-evict candidates: {len(analysis['auto_evict'])}[/dim]")
+                            for c in analysis['auto_evict'][:5]:
+                                console.print(f"[dim]  - {c.content_type}: {c.source} ({c.token_count}t, rel={c.relevance_score:.2f})[/dim]")
+                        if analysis['propose_evict']:
+                            console.print(f"[dim]Proposed evictions: {len(analysis['propose_evict'])}[/dim]")
+                            for c in analysis['propose_evict'][:5]:
+                                console.print(f"[dim]  - {c.content_type}: {c.source} ({c.token_count}t, rel={c.relevance_score:.2f})[/dim]")
+                        if agent.smart_context.eviction_traces:
+                            console.print(f"[dim]Total evictions this session: {len(agent.smart_context.eviction_traces)}[/dim]")
+                        continue
+                    
+                    elif cmd == '/dump':
+                        dump_path = agent.dump_context(reason="user_requested")
+                        console.print(f"[dim]Context dumped to: {dump_path}[/dim]")
+                        # Also show quick summary
+                        breakdown = agent.get_token_breakdown()
+                        console.print(f"[dim]  System prompt: {breakdown['system']:,} tokens ({len(agent.messages[0].content) if agent.messages else 0:,} chars)[/dim]")
+                        console.print(f"[dim]  Conversation:  {breakdown['conversation']:,} tokens ({breakdown['message_count']} messages)[/dim]")
+                        console.print(f"[dim]  Total:         {breakdown['total']:,} tokens[/dim]")
+                        # Verify system prompt integrity 
+                        if agent.messages and agent.messages[0].role == "system":
+                            sys_content = agent.messages[0].content
+                            tools_present = []
+                            tools_missing = []
+                            for tool in ['read_file', 'write_to_file', 'replace_in_file', 
+                                        'execute_command', 'manage_todos', 'attempt_completion']:
+                                if tool in sys_content:
+                                    tools_present.append(tool)
+                                else:
+                                    tools_missing.append(tool)
+                            if tools_missing:
+                                console.print(f"[red]  WARNING: System prompt MISSING tools: {', '.join(tools_missing)}[/red]")
+                            else:
+                                console.print(f"[dim]  System prompt OK: all {len(tools_present)} core tools present[/dim]")
+                        else:
+                            console.print("[red]  WARNING: No system message found![/red]")
+                        continue
+                    
                     elif cmd == '/config':
                         key_preview = config.api_key[:8] + "..." if config.api_key else "(not set)"
                         console.print(f"[dim]API URL: {config.api_url}[/dim]")
@@ -628,15 +732,25 @@ def main():
   /config            - Show current API configuration
   /iter [n]          - Show or set max iterations
   /clip [question]   - Analyze image from clipboard
+  /todo              - Show todo list
+  /todo add <title>  - Add a todo
+  /todo done <id>    - Mark todo as completed
+  /todo rm <id>      - Remove a todo
+  /todo clear        - Clear all todos
+  /smart             - Show smart context analysis
+  /dump              - Dump full model context to JSON file
   /save              - Save current session
   /history           - Show message count
   /bg                - List background processes
   /ctx               - Show context container
   /exit              - Save and exit
 
-Keys during commands:
-  Esc                - Stop/interrupt
-  Ctrl+B             - Send to background"""
+Debug: set HARNESS_DEBUG_CONTEXT=1 to auto-log context before each API call
+
+Keys during agent work:
+  Esc                - Stop/interrupt (responds within ~300ms)
+  Ctrl+B             - Send running command to background
+  Ctrl+C             - Interrupt (press twice within 2s to exit)"""
                         if HAS_PROMPT_TOOLKIT:
                             help_text += """
 
@@ -660,6 +774,9 @@ Input:
                     last_interrupt_time = time.time()  # Start the 2-second window
                 except Exception as e:
                     console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
+                
+                # Auto-save session after each exchange to prevent data loss
+                agent.save_session(str(session_path))
                 print()  # Blank line between requests
                 
             except KeyboardInterrupt:

@@ -155,7 +155,7 @@ def truncate_output(
 
 def truncate_file_content(
     content: str,
-    max_bytes: int = 400_000,  # ~100k tokens
+    max_bytes: int = 120_000,  # ~30k tokens
 ) -> str:
     """Truncate file content if too large."""
     if len(content) <= max_bytes:
@@ -190,16 +190,25 @@ class DuplicateDetector:
     def clear(self):
         self._read_files.clear()
     
+    # Protected message indices that must never be modified
+    PROTECTED_INDICES = {0, 1, 2}  # system prompt, first user-assistant pair
+
     @classmethod
     def replace_old_reads(cls, messages: List, path: str, new_index: int) -> int:
         """
         Replace older reads of the same file with a notice.
         Returns count of replacements made.
+        
+        NOTE: This is largely superseded by SmartContextManager.consolidate_duplicates()
+        which provides more sophisticated duplicate handling.
         """
         count = 0
         for i, msg in enumerate(messages):
             if i >= new_index:
                 break
+            # CRITICAL: Never modify protected messages (system prompt, first pair)
+            if i in cls.PROTECTED_INDICES:
+                continue
             content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
             
             # Check if this is a tool result with this file path
