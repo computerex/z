@@ -3,9 +3,14 @@
 import json
 import asyncio
 import os
+import time
 import httpx
 from typing import Any, Callable, Dict, List, Optional, Union
 from dataclasses import dataclass, field
+
+from .logger import get_logger, log_exception
+
+_log = get_logger("streaming")
 
 
 @dataclass 
@@ -299,6 +304,10 @@ class StreamingJSONClient:
         """
         
         url = f"{self.base_url}/chat/completions"
+        msg_count = len(messages)
+        est_chars = sum(len(m.content) if isinstance(m.content, str) else 0 for m in messages)
+        _log.info("chat_stream_raw: url=%s model=%s msgs=%d est_chars=%d web_search=%s",
+                  url, self.model, msg_count, est_chars, enable_web_search)
         payload = {
             "model": self.model,
             "messages": [m.to_dict() for m in messages],
@@ -322,6 +331,7 @@ class StreamingJSONClient:
         
         last_error = None
         debug_log = os.environ.get("HARNESS_DEBUG_API")
+        _req_t0 = time.time()
         
         for attempt in range(max_retries + 1):
             try:
@@ -438,6 +448,11 @@ class StreamingJSONClient:
                             f.write(chunk)
                     print(f"\n[DEBUG] Raw API response saved to: {debug_path}")
                 
+                _req_elapsed = time.time() - _req_t0
+                _log.info("chat_stream_raw complete: finish=%s interrupted=%s "
+                          "content_len=%d elapsed=%.1fs usage=%s",
+                          finish_reason, interrupted, len(full_content),
+                          _req_elapsed, usage)
                 return StreamingChatResponse(
                     content=full_content,
                     raw_json=full_content,
@@ -449,10 +464,14 @@ class StreamingJSONClient:
                 
             except httpx.HTTPStatusError as e:
                 last_error = e
+                _log.warning("HTTP error %d on attempt %d/%d: %s",
+                             e.response.status_code, attempt + 1, max_retries, e)
                 if e.response.status_code in (429, 500, 502, 503):
                     if attempt < max_retries:
                         wait = min(2 ** (attempt + 1), 60)
                         reason = f"HTTP {e.response.status_code}"
+                        _log.info("Retrying in %ds (attempt %d/%d) reason=%s",
+                                  wait, attempt + 1, max_retries, reason)
                         print(f"\n⚠️  {reason}. Retry {attempt+1}/{max_retries} in {wait}s...")
                         if status_line and hasattr(status_line, 'set_retry'):
                             status_line.set_retry(attempt + 1, max_retries, wait, reason)
@@ -471,9 +490,13 @@ class StreamingJSONClient:
                 
             except (httpx.TimeoutException, httpx.RequestError) as e:
                 last_error = e
+                _log.warning("Connection error on attempt %d/%d: %s: %s",
+                             attempt + 1, max_retries, type(e).__name__, e)
                 if attempt < max_retries:
                     wait = min(2 ** (attempt + 1), 60)
                     reason = type(e).__name__
+                    _log.info("Retrying in %ds (attempt %d/%d) reason=%s",
+                              wait, attempt + 1, max_retries, reason)
                     print(f"\n⚠️  {reason}. Retry {attempt+1}/{max_retries} in {wait}s...")
                     if status_line and hasattr(status_line, 'set_retry'):
                         status_line.set_retry(attempt + 1, max_retries, wait, reason)

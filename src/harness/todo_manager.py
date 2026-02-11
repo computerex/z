@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
+from rich.panel import Panel
+from rich.tree import Tree
+from rich.text import Text
+from rich.console import Console
+
 
 class TodoStatus(str, Enum):
     NOT_STARTED = "not-started"
@@ -270,3 +275,99 @@ class TodoManager:
         self._items.clear()
         self._next_id = 1
         self._original_request = ""
+
+    # ── Rich visual panel ────────────────────────────────────────────
+
+    _STATUS_STYLE = {
+        TodoStatus.COMPLETED: ("checkmark", "green", "✔"),
+        TodoStatus.IN_PROGRESS: ("half-circle", "yellow", "◐"),
+        TodoStatus.NOT_STARTED: ("circle", "dim", "○"),
+        TodoStatus.BLOCKED: ("blocked", "red", "✗"),
+    }
+
+    def render_todo_panel(self) -> Panel:
+        """Build a Rich Panel containing a tree of todos with status icons.
+
+        Returns a renderable Panel suitable for ``console.print()``.
+        """
+        items = self.list_all()
+        if not items:
+            return Panel(Text("No todos yet.", style="dim"), title="Todo List", border_style="dim")
+
+        # Progress summary
+        total = len(items)
+        completed = sum(1 for i in items if i.status == TodoStatus.COMPLETED)
+        in_progress = sum(1 for i in items if i.status == TodoStatus.IN_PROGRESS)
+        blocked = sum(1 for i in items if i.status == TodoStatus.BLOCKED)
+        pct = int(completed / total * 100) if total else 0
+
+        # Build progress bar  ████░░░░░░  40%
+        bar_width = 20
+        filled = int(bar_width * completed / total) if total else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+        progress_text = Text()
+        progress_text.append(bar, style="green")
+        progress_text.append(f"  {pct}%  ", style="bold")
+        progress_text.append(f"({completed}/{total} done", style="dim")
+        if in_progress:
+            progress_text.append(f", {in_progress} active", style="yellow")
+        if blocked:
+            progress_text.append(f", {blocked} blocked", style="red")
+        progress_text.append(")", style="dim")
+
+        tree = Tree(progress_text)
+
+        # Group into roots and children
+        roots = [i for i in items if not i.parent_id]
+        children_map: Dict[int, List[TodoItem]] = {}
+        for item in items:
+            if item.parent_id:
+                children_map.setdefault(item.parent_id, []).append(item)
+
+        for root in roots:
+            _, style, icon = self._STATUS_STYLE.get(root.status, ("", "dim", "?"))
+            label = Text()
+            label.append(f"{icon} ", style=style)
+            label.append(f"[{root.id}] ", style="dim")
+            if root.status == TodoStatus.COMPLETED:
+                label.append(root.title, style="green strike")
+            elif root.status == TodoStatus.IN_PROGRESS:
+                label.append(root.title, style="yellow bold")
+            elif root.status == TodoStatus.BLOCKED:
+                label.append(root.title, style="red")
+            else:
+                label.append(root.title)
+            if root.notes:
+                label.append(f"  ({root.notes[:60]})", style="dim italic")
+            
+            branch = tree.add(label)
+
+            for child in children_map.get(root.id, []):
+                _, cstyle, cicon = self._STATUS_STYLE.get(child.status, ("", "dim", "?"))
+                clabel = Text()
+                clabel.append(f"{cicon} ", style=cstyle)
+                clabel.append(f"[{child.id}] ", style="dim")
+                if child.status == TodoStatus.COMPLETED:
+                    clabel.append(child.title, style="green strike")
+                elif child.status == TodoStatus.IN_PROGRESS:
+                    clabel.append(child.title, style="yellow bold")
+                elif child.status == TodoStatus.BLOCKED:
+                    clabel.append(child.title, style="red")
+                else:
+                    clabel.append(child.title)
+                if child.notes:
+                    clabel.append(f"  ({child.notes[:60]})", style="dim italic")
+                branch.add(clabel)
+
+        border = "green" if completed == total and total > 0 else "yellow" if in_progress else "blue"
+        return Panel(tree, title="Todo List", border_style=border, padding=(0, 1))
+
+    def print_todo_panel(self, console: Optional[Console] = None) -> None:
+        """Print the todo panel to the given (or default) console.
+        
+        Does nothing if the todo list is empty.
+        """
+        if not self._items:
+            return
+        con = console or Console()
+        con.print(self.render_todo_panel())
