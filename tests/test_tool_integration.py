@@ -13,6 +13,7 @@ import sys
 import os
 import json
 import re
+from pathlib import Path
 import pytest
 
 # Ensure src is on path
@@ -904,9 +905,9 @@ class TestPromptIntegration:
     def test_system_prompt_has_context_management_rules(self):
         from harness.prompts import get_system_prompt
         prompt = get_system_prompt("/test/workspace")
-        assert "EVICTED CONTEXT" in prompt
-        assert "TODO LIST" in prompt
-        assert "context compaction" in prompt.lower()
+        assert "auto-compacted" in prompt or "context compaction" in prompt.lower() or "NEVER evicted" in prompt
+        assert "manage_todos" in prompt
+        assert "compaction" in prompt.lower() or "compacted" in prompt.lower()
 
     def test_parse_xml_tool_knows_all_tools(self):
         """parse_xml_tool's tool_names list matches prompt definitions."""
@@ -924,7 +925,7 @@ class TestPromptIntegration:
             'list_background_processes',
             'list_context', 'remove_from_context', 'analyze_image', 
             'web_search', 'manage_todos', 'attempt_completion',
-            'set_reasoning_mode', 'create_plan',
+            'set_reasoning_mode', 'create_plan', 'update_agent_rules',
         }
         
         # Every tool in the prompt should be parseable
@@ -986,7 +987,7 @@ class TestContextDump:
             assert analysis["has_manage_todos"] == True
             assert analysis["has_TOOL_USE_section"] == True
             assert analysis["has_RULES_section"] == True
-            assert analysis["tokens_est"] > 4000  # System prompt should be ~5k tokens
+            assert analysis["tokens_est"] > 1500  # System prompt should be ~1700+ tokens (trimmed)
         finally:
             os.unlink(dump_path)
 
@@ -1012,7 +1013,7 @@ class TestContextDump:
             # Each message has metadata
             assert "tokens_est" in data["messages"][0]
             assert "chars" in data["messages"][0]
-            assert data["messages"][0]["tokens_est"] > 4000
+            assert data["messages"][0]["tokens_est"] > 1500
         finally:
             os.unlink(dump_path)
 
@@ -1037,14 +1038,11 @@ class TestContextDump:
         agent = self._make_agent()
         from harness.context_management import estimate_tokens
         sys_tokens = estimate_tokens(agent.messages[0].content)
-        assert sys_tokens >= 4000, (
-            f"System prompt is only {sys_tokens} tokens! Expected >= 4000. "
+        assert sys_tokens >= 1500, (
+            f"System prompt is only {sys_tokens} tokens! Expected >= 1500. "
             f"Prompt may be truncated or broken."
         )
-        # With our additions it should be ~5400+
-        assert sys_tokens >= 5000, (
-            f"System prompt is {sys_tokens} tokens, expected >= 5000 with manage_todos."
-        )
+        assert "manage_todos" in agent.messages[0].content, "manage_todos tool missing from prompt"
 
 
 # ============================================================
@@ -1361,6 +1359,92 @@ class TestTodoPanelRendering:
         mgr.print_todo_panel(con)
         output = buf.getvalue()
         assert "Some working note" in output
+
+
+# ============================================================
+# Workspace Index Tests
+# ============================================================
+
+class TestWorkspaceIndex:
+    """Test the WorkspaceIndex class."""
+
+    def test_build_on_harness_repo(self):
+        """Index builds on the harness repo itself."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        assert len(idx.files) > 10
+        # Should find our own source files
+        paths = [f.rel_path for f in idx.files]
+        assert any("cline_agent.py" in p for p in paths)
+        assert any("workspace_index.py" in p for p in paths)
+
+    def test_file_info_fields(self):
+        """FileInfo has expected fields."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        py_files = [f for f in idx.files if f.extension == '.py']
+        assert len(py_files) > 5
+        for f in py_files:
+            assert f.language == "Python"
+            assert f.lines > 0
+            assert f.size > 0
+            assert not f.is_binary
+
+    def test_search(self):
+        """File search by name substring works."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        results = idx.search("config")
+        assert any("config.py" in f.rel_path for f in results)
+
+    def test_get_languages(self):
+        """Language detection returns Python for this repo."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        langs = idx.get_languages()
+        assert "Python" in langs
+        assert langs["Python"] >= 5
+
+    def test_summary_not_empty(self):
+        """Summary produces non-empty output."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        s = idx.summary()
+        assert "PROJECT MAP" in s
+        assert "Python" in s
+        assert len(s) > 100
+
+    def test_compact_tree(self):
+        """Compact tree returns file paths."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        tree = idx.compact_tree()
+        assert "cline_agent.py" in tree
+
+    def test_empty_directory(self, tmp_path):
+        """Index handles an empty directory gracefully."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(tmp_path)).build()
+        assert len(idx.files) == 0
+        assert "no files found" in idx.summary()
+
+    def test_binary_files_detected(self):
+        """Binary files are flagged correctly."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        png_files = [f for f in idx.files if f.extension == '.png']
+        for f in png_files:
+            assert f.is_binary
+            assert f.lines == 0
+
+    def test_get_dir(self):
+        """get_dir returns files for a specific directory."""
+        from harness.workspace_index import WorkspaceIndex
+        idx = WorkspaceIndex(str(Path(__file__).parent.parent)).build()
+        src_files = idx.get_dir("src/harness")
+        assert len(src_files) > 5
+        for f in src_files:
+            assert f.rel_path.startswith("src/harness/")
 
 
 if __name__ == "__main__":

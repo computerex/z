@@ -28,6 +28,8 @@ from .tool_handlers import ToolHandlers
 from .todo_manager import TodoManager, TodoStatus
 from .smart_context import SmartContextManager
 from .status_line import StatusLine
+from .workspace_index import WorkspaceIndex
+from .tool_registry import get_tool_names, get_complex_content_tools, get_metrics
 from .logger import get_logger, log_exception, truncate as log_truncate
 
 log = get_logger("agent")
@@ -144,14 +146,7 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     # Strip thinking blocks first (MiniMax outputs these)
     content = strip_thinking_blocks(content)
     
-    tool_names = [
-        'read_file', 'write_to_file', 'replace_in_file',
-        'execute_command', 'list_files', 'search_files',
-        'check_background_process', 'stop_background_process', 'list_background_processes',
-        'list_context', 'remove_from_context', 'analyze_image', 'web_search',
-        'manage_todos', 'attempt_completion',
-        'set_reasoning_mode', 'create_plan',
-    ]
+    tool_names = get_tool_names()
 
     # Compatibility parser for shorthand style:
     # <tool_call>list_files path="." recursive="true" />
@@ -242,7 +237,7 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
                     'search_term', 'count', 'recursive', 'id', 'lines', 'question',
                     'action', 'title', 'status', 'parent_id', 'notes', 'context_refs',
                     'start_line', 'end_line', 'offset', 'limit',
-                    'prompt', 'mode']
+                    'prompt', 'mode', 'rule', 'category']
     complex_params = ['content', 'diff']
     
     # For tools with complex content (write_to_file, replace_in_file),
@@ -300,14 +295,7 @@ def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
     """
     stripped = strip_thinking_blocks(content)
     
-    tool_names = [
-        'read_file', 'write_to_file', 'replace_in_file',
-        'execute_command', 'list_files', 'search_files',
-        'check_background_process', 'stop_background_process', 'list_background_processes',
-        'list_context', 'remove_from_context', 'analyze_image', 'web_search',
-        'manage_todos', 'attempt_completion',
-        'set_reasoning_mode', 'create_plan',
-    ]
+    tool_names = get_tool_names()
     
     # Find all <tool_name>...</tool_name> blocks with their positions
     matches = []  # (start_pos, end_pos, tool_name)
@@ -385,10 +373,21 @@ class ClineAgent:
         # {filepath: {"failures": int, "last_error": str}}
         self._edit_failures: Dict[str, dict] = {}
         
-        # Reasoning checkpoint: track consecutive tool calls with low reasoning
-        # When threshold is hit, inject a "stop and think" checkpoint
+        # Reasoning quality tracking
         self._consecutive_low_reasoning = 0
-        self._force_reasoning_next = False
+
+        # Budget forcing: force deeper thinking when <thinking> blocks are too shallow
+        self._budget_force_count = 0
+        self._BUDGET_FORCE_MAX = 3         # max continuations per response
+        self._BUDGET_THINKING_MIN = 800    # min chars for a "real" thinking block
+        
+        # Introspect tool tracking: gentle nudge system (non-adversarial)
+        # Instead of forcing thinking, we suggest using the introspect tool
+        # and reward good usage via positive reinforcement in tool results.
+        self._calls_since_introspect = 0      # tool calls since last introspect
+        self._results_since_introspect = []   # (tool_name, snippet) tuples for introspect prompt
+        self._INTROSPECT_NUDGE_THRESHOLD = 6  # suggest introspect after N tool calls
+        self._active_client = None            # set during _run_loop for introspect tool access
         
         # Tool handlers - delegates all tool execution logic
         self.tool_handlers = ToolHandlers(
@@ -400,10 +399,255 @@ class ClineAgent:
         )
         # Set claude model for create_plan tool
         self.tool_handlers._claude_model = self.claude_cli_config.get("model")
+        
+        # Workspace index — built once at startup
+        self.workspace_index = WorkspaceIndex(self.workspace_path).build()
 
     def _system_prompt(self) -> str:
         """Return the system prompt for this agent."""
-        return get_system_prompt(self.workspace_path)
+        index_summary = self.workspace_index.summary() if self.workspace_index.files else ""
+        return get_system_prompt(self.workspace_path, project_map=index_summary)
+    
+    @staticmethod
+    def _thinking_system_prompt() -> str:
+        """System prompt for deep analysis mode (introspect tool) — no tool definitions."""
+        return (
+            "You are a highly skilled software engineer in deep analysis mode. "
+            "You've been working on a coding task and have gathered information. "
+            "Your job right now is to THINK DEEPLY — not to act.\n\n"
+            "CRITICAL: No tools are available. Do NOT output any XML tags like "
+            "<introspect>, <read_file>, <execute_command>, <create_plan>, etc. "
+            "Write ONLY natural language prose. Any XML tags will be stripped.\n\n"
+            "Write an extended reasoning monologue — multiple paragraphs. This is your "
+            "working memory. Use it to organize your understanding, trace through "
+            "details, identify patterns, catch issues, and plan your approach.\n\n"
+            "Think like you're talking to yourself while solving a hard problem:\n"
+            "- Trace through what you've seen: code structure, data flow, dependencies\n"
+            "- Make connections between different pieces of information\n"
+            "- Self-correct: 'Wait, actually...', 'Hmm, that contradicts...'\n"
+            "- Consider alternatives, tradeoffs, and edge cases\n"
+            "- Identify what you don't know yet and what matters most\n"
+            "- Plan concrete next steps with clear reasoning for each\n\n"
+            "Write several paragraphs minimum. Go deep. The more thorough your "
+            "analysis, the better your subsequent actions will be."
+        )
+    
+    def _build_introspect_prompt(self, focus: str = "") -> str:
+        """Build the user message for an introspect tool call."""
+        parts = []
+        
+        if focus:
+            parts.append(f"FOCUS: {focus}")
+        
+        # Active task context
+        todo_state = self.todo_manager.format_list(include_completed=False)
+        if todo_state and "empty" not in todo_state.lower():
+            parts.append(f"\nACTIVE TASKS:\n{todo_state}")
+        
+        # Recent results summary
+        if self._results_since_introspect:
+            parts.append("\nRecent tool results to analyze:")
+            for tool_name, snippet in self._results_since_introspect[-8:]:
+                parts.append(f"  - {tool_name}: {snippet}")
+        
+        parts.append(
+            "\n[DEEP ANALYSIS MODE — No tools available. "
+            "Analyze everything you've learned from the conversation above. "
+            "Write an extended monologue — trace through the code, make connections, "
+            "identify issues, plan your approach. "
+            "The full conversation history above contains all the information you've gathered.]"
+        )
+        
+        return "\n".join(parts)
+    
+    _INTROSPECT_MIN_CHARS = 600   # minimum chars for a useful introspect pass
+    _INTROSPECT_MAX_CONTINUATIONS = 2  # max times to push for more depth
+    
+    async def _execute_introspect(self, focus: str = "") -> str:
+        """Execute the introspect tool: a dedicated API call with no tools available.
+        
+        Makes a separate API call using a system prompt WITHOUT tool definitions,
+        so the model can ONLY produce reasoning. If the initial output is too short,
+        we push the model to continue (up to _INTROSPECT_MAX_CONTINUATIONS times).
+        The thinking output is returned as the tool result.
+        
+        Includes an anti-loop guard: if introspect was just called (0 tool calls
+        since last introspect), returns a redirect message instead of executing.
+        """
+        # Anti-loop guard: prevent back-to-back introspect calls
+        if self._calls_since_introspect == 0:
+            log.info("Introspect anti-loop: called again with 0 intervening tool calls, redirecting")
+            self.console.print("  [dim]• Introspect skipped (just used — act on your analysis first)[/dim]")
+            return (
+                "[Introspect was just used. You already have a deep analysis in your "
+                "conversation memory above. Act on those insights now — read more files, "
+                "make edits, run commands. Call introspect again after gathering new information.]"
+            )
+        
+        log.info("Introspect tool called: focus=%r calls_since=%d results=%d",
+                 focus[:80] if focus else "(none)",
+                 self._calls_since_introspect, len(self._results_since_introspect))
+        
+        self.console.print(
+            "  [dim]•[/dim] [bold magenta]Deep analysis[/bold magenta]"
+            + (f" [dim]{focus[:80]}[/dim]" if focus else "")
+        )
+        
+        # Build thinking messages: swap system prompt, keep conversation, add thinking prompt
+        thinking_messages = list(self.messages)  # shallow copy
+        thinking_messages[0] = StreamingMessage(
+            role="system",
+            content=self._thinking_system_prompt()
+        )
+        thinking_messages.append(StreamingMessage(
+            role="user",
+            content=self._build_introspect_prompt(focus)
+        ))
+        
+        full_thinking = ""
+        api_t0 = time.time()
+        client = self._active_client
+        
+        # Build a set of tag patterns to suppress from the live stream.
+        # The thinking model sometimes emits XML tool tags despite being told not to.
+        _suppress_tags = set(get_tool_names())
+        
+        for attempt in range(1 + self._INTROSPECT_MAX_CONTINUATIONS):
+            first_token = True
+            chunk_text = ""
+            _tag_buf = ""       # buffer for potential XML tag detection
+            _in_tag = False     # currently inside a < ... > sequence
+            _suppress = False   # current tag should be suppressed
+            
+            def _flush_tag_buf():
+                """Flush buffered tag to stdout (it wasn't a tool tag)."""
+                nonlocal _tag_buf
+                if _tag_buf:
+                    sys.stdout.write(_tag_buf)
+                    sys.stdout.flush()
+                    _tag_buf = ""
+            
+            def on_chunk(c: str):
+                nonlocal chunk_text, first_token, _tag_buf, _in_tag, _suppress
+                if first_token:
+                    self.status.clear()
+                    first_token = False
+                chunk_text += c
+                
+                # Stream filtering: suppress XML tool tags from display
+                if c == '<' and not _in_tag:
+                    _flush_tag_buf()
+                    _in_tag = True
+                    _suppress = False
+                    _tag_buf = c
+                    return
+                
+                if _in_tag:
+                    _tag_buf += c
+                    if c == '>':
+                        # Tag complete — check if it's a tool tag
+                        # Extract tag name: <tagname ...> or </tagname>
+                        m = re.match(r'</?(\w+)', _tag_buf)
+                        if m and m.group(1) in _suppress_tags:
+                            # Suppress this tag (don't display it)
+                            _tag_buf = ""
+                        else:
+                            _flush_tag_buf()
+                        _in_tag = False
+                        return
+                    # Safety: if tag buffer gets too long, it's not a real tag
+                    if len(_tag_buf) > 80:
+                        _flush_tag_buf()
+                        _in_tag = False
+                    return
+                
+                sys.stdout.write(c)
+                sys.stdout.flush()
+            
+            self.status.update(
+                "Thinking deeply..." if attempt == 0 else "Continuing analysis...",
+                StatusLine.SENDING,
+            )
+            response = await client.chat_stream_raw(
+                messages=thinking_messages,
+                on_content=on_chunk,
+                check_interrupt=is_interrupted,
+                status_line=self.status,
+            )
+            _flush_tag_buf()  # flush any trailing buffered content
+            self.status.clear()
+            
+            full_thinking += chunk_text
+            
+            # Track cost for this sub-call
+            input_tokens = estimate_messages_tokens(thinking_messages)
+            output_tokens = estimate_tokens(chunk_text)
+            self.cost_tracker.record_call(
+                model=self.config.model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                duration_ms=0,
+                tool_calls=0,
+                finish_reason=response.finish_reason,
+            )
+            
+            # Check if output is deep enough
+            if (len(full_thinking) >= self._INTROSPECT_MIN_CHARS
+                    or response.interrupted
+                    or response.is_truncated):
+                break
+            
+            # Output too short — push for more depth
+            log.info("Introspect attempt %d too short (%d chars, need %d). Continuing.",
+                     attempt + 1, len(full_thinking), self._INTROSPECT_MIN_CHARS)
+            
+            # Add the short response and a continuation prompt
+            thinking_messages.append(StreamingMessage(
+                role="assistant", content=chunk_text
+            ))
+            thinking_messages.append(StreamingMessage(
+                role="user",
+                content=(
+                    f"You've only written {len(full_thinking.split())} words. "
+                    "Go much deeper. Trace through specific code paths you read. "
+                    "Identify concrete bugs with file names and line numbers. "
+                    "Consider race conditions, resource leaks, error handling gaps. "
+                    "What are the non-obvious issues? What could break under load? "
+                    "Continue your analysis."
+                )
+            ))
+        
+        print()  # newline after stream
+        api_elapsed = time.time() - api_t0
+        
+        # Strip XML tool tags that the thinking model sometimes emits
+        # despite being told not to (it pattern-matches from conversation history).
+        _tool_names_pattern = '|'.join(re.escape(n) for n in get_tool_names())
+        full_thinking = re.sub(
+            rf'</?(?:{_tool_names_pattern})\b[^>]*>',
+            '', full_thinking
+        ).strip()
+        
+        # Reset nudge counters — model just introspected deeply
+        self._calls_since_introspect = 0
+        self._results_since_introspect = []
+        self._consecutive_low_reasoning = 0
+        
+        # Build result with positive reinforcement
+        word_count = len(full_thinking.split())
+        log.info("Introspect complete: %d words, %d chars, %.1fs",
+                 word_count, len(full_thinking), api_elapsed)
+        
+        result = (
+            f"[Deep analysis complete — {word_count} words, {api_elapsed:.1f}s]\n\n"
+            f"{full_thinking}\n\n"
+            "---\n"
+            "Your analysis is now part of your conversation memory. "
+            "Use these insights to guide your next actions. "
+            "Continue using introspect whenever you need to synthesize "
+            "new information or plan complex changes."
+        )
+        return result
     
     def _handle_set_reasoning_mode(self, params: Dict[str, str]) -> str:
         """Switch the underlying LLM provider based on reasoning mode."""
@@ -428,6 +672,47 @@ class ClineAgent:
         )
         log.info("Reasoning mode changed: %s -> %s (model: %s)", old_mode, mode, provider["model"])
         return f"Reasoning mode changed: {old_mode} -> {mode} (model: {provider['model']})"
+    
+    def _handle_update_agent_rules(self, params: Dict[str, str]) -> str:
+        """Append a rule/preference to the workspace agent.md file."""
+        rule = (params.get("rule") or "").strip()
+        if not rule:
+            return "Error: 'rule' parameter is required."
+        
+        category = (params.get("category") or "preference").strip().lower()
+        valid_categories = ("preference", "convention", "behavior", "project", "workflow")
+        if category not in valid_categories:
+            category = "preference"
+        
+        agent_md = Path(self.workspace_path) / "agent.md"
+        
+        # Build the entry
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d")
+        entry = f"\n## [{category}] — {timestamp}\n{rule}\n"
+        
+        # Create or append
+        is_new = not agent_md.exists() or agent_md.stat().st_size == 0
+        if is_new:
+            header = (
+                "# Agent Rules\n\n"
+                "This file contains project-specific rules, user preferences, and conventions.\n"
+                "The AI agent reads this file at the start of every session and follows all rules.\n"
+                "You can edit this file manually at any time.\n"
+            )
+            agent_md.write_text(header + entry, encoding="utf-8")
+            log.info("Created agent.md with initial rule: [%s] %s", category, rule[:80])
+        else:
+            with agent_md.open("a", encoding="utf-8") as f:
+                f.write(entry)
+            log.info("Appended to agent.md: [%s] %s", category, rule[:80])
+        
+        # Refresh the system prompt so the new rule takes effect immediately
+        if self.messages and self.messages[0].role == "system":
+            self.messages[0] = StreamingMessage(role="system", content=self._system_prompt())
+            log.debug("System prompt refreshed after agent.md update")
+        
+        return f"Rule recorded in agent.md [{category}]: {rule}"
     
     async def cleanup_background_procs_async(self) -> None:
         """Terminate all background processes safely (async)."""
@@ -565,24 +850,26 @@ class ClineAgent:
         # Get last user request (not tool results)
         last_user_request = None
         for msg in reversed(self.messages):
-            if msg.role == "user" and not msg.content.startswith("[") and not msg.content.startswith("<"):
-                last_user_request = msg.content[:200]
+            text = msg.content if isinstance(msg.content, str) else ""
+            if msg.role == "user" and text and not text.startswith("[") and not text.startswith("<"):
+                last_user_request = text[:200]
                 break
         
         # Get last assistant action
         last_action = None
         for msg in reversed(self.messages):
+            text = msg.content if isinstance(msg.content, str) else ""
             if msg.role == "assistant":
                 # Extract tool name if any
-                if "<read_file>" in msg.content:
+                if "<read_file>" in text:
                     last_action = "reading files"
-                elif "<write_to_file>" in msg.content:
+                elif "<write_to_file>" in text:
                     last_action = "writing files"
-                elif "<execute_command>" in msg.content:
+                elif "<execute_command>" in text:
                     last_action = "executing commands"
-                elif "<search_files>" in msg.content:
+                elif "<search_files>" in text:
                     last_action = "searching code"
-                elif "<attempt_completion>" in msg.content:
+                elif "<attempt_completion>" in text:
                     last_action = "completing the task"
                 else:
                     last_action = "responding"
@@ -605,8 +892,9 @@ class ClineAgent:
         recovery = self.smart_context.build_context_recovery_notice()
         if recovery:
             summary_parts.append(f"\n{recovery}")
-        
-        return f"[Session resumed. {' '.join(summary_parts)}. Continue where you left off or ask what you need to know.]"
+
+        heuristic = " ".join(summary_parts)
+        return f"[Session resumed. {heuristic}. Continue where you left off or ask what you need to know.]"
     
     def clear_history(self) -> None:
         """Clear conversation history and context."""
@@ -829,18 +1117,27 @@ class ClineAgent:
             config_key = f"{self.config.api_url}|{self.config.model}"
             if client is not None and _client_model == config_key:
                 return  # already up-to-date
+            # Close old client first, then clear the reference so the finally
+            # block won't try to double-close if __aenter__ fails below.
             if client is not None:
-                await client.__aexit__(None, None, None)
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
                 log.info("Closed old client (was %s), opening new one for %s",
                          _client_model, config_key)
-            client = StreamingJSONClient(
+            client = None
+            _client_model = None
+            new_client = StreamingJSONClient(
                 api_key=self.config.api_key,
                 base_url=self.config.api_url,
                 model=self.config.model,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
             )
-            await client.__aenter__()
+            await new_client.__aenter__()
+            client = new_client
+            self._active_client = client
             _client_model = config_key
 
         try:
@@ -911,16 +1208,93 @@ class ClineAgent:
                 full_content = ""
                 first_token = True
                 
+                # ── XML stream filter state ──────────────────────────────
+                # Suppresses raw XML tool tags from the live display while
+                # still accumulating full_content for parsing afterwards.
+                _sf_tool_names = set(get_tool_names())
+                _sf_strip_tags = {'thinking', 'think'}  # strip tags, show content
+                _sf_suppressing: Optional[str] = None    # tool name of block being suppressed
+                _sf_tag_buf = ""     # buffer for tag detection / closing-tag scan
+                _sf_in_tag = False   # in DETECT_TAG state
+                _sf_had_visible = False  # whether any visible text was written
+                
+                def _sf_flush():
+                    """Flush buffered tag chars to stdout (wasn't a special tag)."""
+                    nonlocal _sf_tag_buf, _sf_had_visible
+                    if _sf_tag_buf:
+                        sys.stdout.write(_sf_tag_buf)
+                        sys.stdout.flush()
+                        _sf_had_visible = True
+                        _sf_tag_buf = ""
+
                 def on_chunk(c: str):
                     nonlocal full_content, first_token
+                    nonlocal _sf_suppressing, _sf_tag_buf, _sf_in_tag, _sf_had_visible
+                    
+                    # Always accumulate full content (needed for tool-call parsing)
+                    full_content += c
+                    
                     if first_token:
-                        # First token arrived — clear status line before writing
-                        # stream content to avoid ghost text interleaving
                         self.status.clear()
                         first_token = False
-                    full_content += c
+                    
+                    # ── SUPPRESS_BLOCK state: eat everything until </tool> ──
+                    if _sf_suppressing:
+                        _sf_tag_buf += c
+                        close = f"</{_sf_suppressing}>"
+                        if _sf_tag_buf.endswith(close):
+                            _sf_suppressing = None
+                            _sf_tag_buf = ""
+                        elif len(_sf_tag_buf) > len(close) + 30:
+                            # Trim buffer — keep enough tail for closing-tag detection
+                            _sf_tag_buf = _sf_tag_buf[-(len(close) + 10):]
+                        return
+                    
+                    # ── DETECT_TAG state: buffering after '<' ──
+                    if _sf_in_tag:
+                        _sf_tag_buf += c
+                        if c == '>':
+                            # Tag complete — classify it
+                            m = re.match(r'</?(\w+)', _sf_tag_buf)
+                            if m:
+                                tag_name = m.group(1)
+                                is_closing = _sf_tag_buf.startswith('</')
+                                if tag_name in _sf_tool_names:
+                                    if not is_closing:
+                                        # Opening tool tag → suppress entire block
+                                        _sf_suppressing = tag_name
+                                        _sf_tag_buf = ""
+                                    else:
+                                        # Orphaned closing tool tag → just eat it
+                                        _sf_tag_buf = ""
+                                    _sf_in_tag = False
+                                    return
+                                elif tag_name in _sf_strip_tags:
+                                    # Thinking tag → hide tag itself, keep content
+                                    _sf_tag_buf = ""
+                                    _sf_in_tag = False
+                                    return
+                                else:
+                                    _sf_flush()
+                            else:
+                                _sf_flush()
+                            _sf_in_tag = False
+                            return
+                        # Safety: overly long buffer means it's not a real tag
+                        if len(_sf_tag_buf) > 80:
+                            _sf_flush()
+                            _sf_in_tag = False
+                        return
+                    
+                    # ── NORMAL state ──
+                    if c == '<':
+                        _sf_in_tag = True
+                        _sf_tag_buf = c
+                        return
+                    
                     sys.stdout.write(c)
                     sys.stdout.flush()
+                    _sf_had_visible = True
                 
                 # Stream the response - using raw mode (no JSON parsing)
                 # Web search disabled by default to avoid unnecessary searches
@@ -940,8 +1314,10 @@ class ClineAgent:
                          response.finish_reason, response.interrupted, api_elapsed,
                          len(full_content))
                 
+                _sf_flush()  # Flush any trailing buffered content
                 self.status.clear()
-                print()  # Newline after stream
+                if _sf_had_visible:
+                    print()  # Newline after visible stream content
                 
                 # Display web search results if any
                 if response.has_web_search:
@@ -1019,28 +1395,34 @@ class ClineAgent:
                 else:
                     log.debug("No tool call parsed from response (len=%d)", len(full_content))
                 
-                # Reasoning checkpoint enforcement: if we previously injected
-                # a "stop and think" checkpoint, strictly require reasoning now.
-                if tool_call and self._force_reasoning_next and tool_call.name not in ('manage_todos', 'attempt_completion', 'list_context'):
-                    tag_pos = full_content.find(f'<{tool_call.name}>')
-                    if tag_pos >= 0:
-                        reasoning_text = full_content[:tag_pos].strip()
-                        reasoning_text = re.sub(r'<thinking>.*?</thinking>', '', reasoning_text, flags=re.DOTALL).strip()
-                        if len(reasoning_text) < 80:
-                            self.console.print("[dim][!] Reasoning checkpoint — asking model to think before continuing[/dim]")
-                            self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                # Budget forcing: if the model produced a <thinking> block but
+                # it's too shallow, strip the tool call and force it to keep
+                # thinking by appending "Wait, " as a continuation prompt.
+                # (This actually works because it modifies the assistant output.)
+                if tool_call and self._budget_force_count < self._BUDGET_FORCE_MAX:
+                    thinking_match = re.search(r'<thinking>(.*?)</thinking>', full_content, re.DOTALL)
+                    if thinking_match:
+                        thinking_text = thinking_match.group(1).strip()
+                        if len(thinking_text) < self._BUDGET_THINKING_MIN:
+                            self._budget_force_count += 1
+                            truncated = full_content[:thinking_match.start()]
+                            truncated += f"<thinking>\n{thinking_text}\nWait, "
+                            self.console.print(f"[dim][!] Thinking too brief ({len(thinking_text)} chars) — budget forcing ({self._budget_force_count}/{self._BUDGET_FORCE_MAX})[/dim]")
+                            log.info("Budget forcing: thinking=%d chars, attempt=%d/%d",
+                                     len(thinking_text), self._budget_force_count, self._BUDGET_FORCE_MAX)
+                            self.messages.append(StreamingMessage(role="assistant", content=truncated))
                             self.messages.append(StreamingMessage(
                                 role="user",
                                 content=(
-                                    "[SYSTEM: REASONING CHECKPOINT. You were asked to stop and think but jumped straight to a tool call. "
-                                    "Before continuing, you MUST write a short paragraph summarizing: "
-                                    "(1) what you have accomplished so far, (2) what your current objective is, "
-                                    "(3) what remains to be done, and (4) why this specific next step is correct. "
-                                    "Write your reasoning first, then repeat the tool call.]"
+                                    "[SYSTEM: Your thinking was too brief. Keep going — trace through the technical details, "
+                                    "explore alternatives, question assumptions. "
+                                    "Longer reasoning = better outcomes. Then proceed with your tool call.]"
                                 ),
                             ))
-                            continue  # force reasoning before allowing tool call
-                
+                            continue
+                    # Thinking was sufficient or no thinking block — reset counter
+                    self._budget_force_count = 0
+
                 # Debug output - save full content for analysis
                 if os.environ.get("HARNESS_DEBUG"):
                     debug_file = os.path.join(self.workspace_path, ".harness_debug.txt")
@@ -1056,8 +1438,7 @@ class ClineAgent:
                 if not tool_call:
                     # No tool call — model produced text. Reset reasoning counters.
                     self._consecutive_low_reasoning = 0
-                    self._force_reasoning_next = False
-                    
+
                     # Check for attempt_completion
                     if "<attempt_completion>" in full_content:
                         # Extract result
@@ -1065,8 +1446,8 @@ class ClineAgent:
                         result = match.group(1).strip() if match else full_content
                         self.messages.append(StreamingMessage(role="assistant", content=full_content))
                         return result
-                    
-                    # No tool call - final response
+
+                    # No tool call — final response to user
                     self.messages.append(StreamingMessage(role="assistant", content=full_content))
                     return full_content
                 
@@ -1090,9 +1471,11 @@ class ClineAgent:
                     
                     # Spill each individual result BEFORE combining, so that
                     # small results stay inline even when there are many calls.
-                    tc_result = self.tool_handlers.spill_output_to_file(
-                        tc_result, tc.name
-                    )
+                    # Introspect results stay in context — that's the whole point.
+                    if tc.name != "introspect":
+                        tc_result = self.tool_handlers.spill_output_to_file(
+                            tc_result, tc.name
+                        )
                     
                     if len(all_tool_calls) > 1:
                         tool_results_combined.append(f"[{tc.name} result ({tc_idx+1}/{len(all_tool_calls)})]:\n{tc_result}")
@@ -1115,22 +1498,40 @@ class ClineAgent:
                         break
                 
                 tool_result = "\n\n".join(tool_results_combined)
-                
-                # Track reasoning quality for checkpoint detection
-                _is_exempt = tool_call.name in ('manage_todos', 'attempt_completion', 'list_context')
-                if not _is_exempt:
-                    tag_pos = full_content.find(f'<{tool_call.name}>')
+
+                # Track reasoning quality (lightweight — feeds into nudge)
+                _exempt_tools = {'manage_todos', 'attempt_completion', 'list_context', 'introspect'}
+                _first_checkable = next(
+                    (tc for tc in all_tool_calls if tc.name not in _exempt_tools),
+                    None,
+                )
+                if _first_checkable:
+                    tag_pos = full_content.find(f'<{_first_checkable.name}>')
                     reasoning_text = ''
                     if tag_pos >= 0:
                         reasoning_text = full_content[:tag_pos].strip()
                         reasoning_text = re.sub(r'<thinking>.*?</thinking>', '', reasoning_text, flags=re.DOTALL).strip()
                     
-                    if len(reasoning_text) < 40:
+                    if len(reasoning_text) < 200:
                         self._consecutive_low_reasoning += 1
                     else:
-                        # Decent reasoning — reset the counter and clear force flag
                         self._consecutive_low_reasoning = 0
-                        self._force_reasoning_next = False
+                
+                # Introspect tool resets counters — model is actively reasoning
+                _has_introspect = any(tc.name == "introspect" for tc in all_tool_calls)
+                if _has_introspect:
+                    self._calls_since_introspect = 0
+                    self._results_since_introspect = []
+                    self._consecutive_low_reasoning = 0
+                else:
+                    self._calls_since_introspect += len(all_tool_calls)
+                    # Track results for building introspect prompt context
+                    _result_snippet = tool_result[:150].replace('\n', ' ').strip()
+                    if len(all_tool_calls) == 1:
+                        self._results_since_introspect.append((tc.name, _result_snippet))
+                    else:
+                        self._results_since_introspect.append(
+                            (f"{len(all_tool_calls)} tools", _result_snippet))
                 
                 # Add to history
                 self.messages.append(StreamingMessage(role="assistant", content=full_content))
@@ -1152,26 +1553,44 @@ class ClineAgent:
                             todo_hint += f" (+{len(not_started) - 5} more)"
                     header_parts.append(todo_hint)
                 
-                # Reasoning checkpoint: if too many consecutive low-reasoning calls,
-                # inject a "stop and think" interleaving checkpoint
-                CHECKPOINT_THRESHOLD = 3
-                if self._consecutive_low_reasoning >= CHECKPOINT_THRESHOLD and not _is_exempt:
-                    self.console.print(f"[dim][!] {self._consecutive_low_reasoning} consecutive tool calls without reasoning — injecting checkpoint[/dim]")
+                # Escalating nudge: suggest introspect after many calls without it
+                if not _has_introspect and self._calls_since_introspect >= self._INTROSPECT_NUDGE_THRESHOLD:
+                    n = self._calls_since_introspect
+                    if n >= self._INTROSPECT_NUDGE_THRESHOLD + 4:
+                        # Strong nudge after 10+ calls
+                        header_parts.append(
+                            f"[IMPORTANT: You've made {n} tool calls without using introspect. "
+                            "Stop and call <introspect> NOW to synthesize your findings. "
+                            "Introspect produces your best reasoning — use it before proceeding.]"
+                        )
+                    else:
+                        # Gentle nudge after 6+ calls
+                        header_parts.append(
+                            "[Tip: You've gathered a lot of information. "
+                            "Consider using the introspect tool to synthesize what you've "
+                            "learned before making changes.]"
+                        )
+                
+                # Nudge on errors (errors benefit most from deep analysis)
+                _error_patterns = ['error:', 'failed', 'panic:', 'exception',
+                                   'traceback', 'undefined:', 'syntax error']
+                if any(p in tool_result.lower() for p in _error_patterns):
                     header_parts.append(
-                        f"[REASONING CHECKPOINT — You have made {self._consecutive_low_reasoning} consecutive tool calls "
-                        "without substantive reasoning. STOP. Before making ANY more tool calls, "
-                        "write a paragraph summarizing: (1) what you have accomplished so far, "
-                        "(2) what your current objective is, (3) what remains to be done, "
-                        "and (4) your plan for the next steps. This is mandatory.]"
+                        "[Note: This result contains errors. "
+                        "Use introspect to analyze what went wrong before attempting fixes.]"
                     )
-                    self._force_reasoning_next = True
-                    self._consecutive_low_reasoning = 0  # reset after checkpoint
                 
                 header = "\n".join(header_parts)
-                if header:
-                    result_content = f"{header}\n\n[{tool_call.name} result]\n{tool_result}"
+                # Label: for multi-tool batches show count; for single tool
+                # use the actual tool name (tc is the last *executed* tool).
+                if len(tool_results_combined) > 1:
+                    _result_label = f"tool results ({len(tool_results_combined)} calls)"
                 else:
-                    result_content = f"[{tool_call.name} result]\n{tool_result}"
+                    _result_label = f"{tc.name} result"
+                if header:
+                    result_content = f"{header}\n\n[{_result_label}]\n{tool_result}"
+                else:
+                    result_content = f"[{_result_label}]\n{tool_result}"
                 
                 self.messages.append(StreamingMessage(
                     role="user",
@@ -1182,18 +1601,12 @@ class ClineAgent:
             self.status.clear()
             return "Max iterations reached."
         finally:
+            self._active_client = None
             if client is not None:
                 await client.__aexit__(None, None, None)
     
-    # Tool tag names that the model emits as XML tool calls
-    _TOOL_TAGS = [
-        'read_file', 'write_to_file', 'replace_in_file',
-        'execute_command', 'list_files', 'search_files',
-        'check_background_process', 'stop_background_process', 'list_background_processes',
-        'list_context', 'remove_from_context', 'analyze_image', 'web_search',
-        'manage_todos', 'attempt_completion',
-        'set_reasoning_mode', 'create_plan',
-    ]
+    # Tool tag names — derived from the single registry
+    _TOOL_TAGS = get_tool_names()
 
     @staticmethod
     def _has_unclosed_tool_tag(content: str) -> bool:
@@ -1214,24 +1627,49 @@ class ClineAgent:
         # Clear status line before any console output to prevent
         # ghost text from status line interleaving with tool output
         self.status.clear()
+        _metrics = get_metrics()
+        _t0 = time.time()
+        _success = True
+        _error_msg = None
         
+        try:
+            result = await self._dispatch_tool(tool)
+            return result
+        except Exception as e:
+            _success = False
+            _error_msg = str(e)
+            log_exception(log, f"Tool execution failed: {tool.name}", e)
+            self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
+            return f"Error: {str(e)}"
+        finally:
+            _elapsed = (time.time() - _t0) * 1000
+            _result_size = 0
+            # result is local to the try block; capture it safely
+            try:
+                _result_size = len(result) if 'result' in dir() else 0
+            except Exception:
+                pass
+            _metrics.record(tool.name, _elapsed, _success, _error_msg, _result_size)
+
+    async def _dispatch_tool(self, tool: ParsedToolCall) -> str:
+        """Dispatch a parsed tool call to its handler. Returns result string."""
         try:
             if tool.name == "read_file":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[cyan]> Reading:[/cyan] {path}")
                 result = await self.tool_handlers.read_file(tool.parameters)
                 lines = result.count('\n') + 1
-                self.console.print(f"[dim]   ({lines} lines)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(f"    [dim]… {lines} lines[/dim]")
                 
             elif tool.name == "write_to_file":
                 path = tool.parameters.get("path", "")
                 content = tool.parameters.get("content", "")
-                self.console.print(f"[green]> Writing:[/green] {path} ({len(content)} bytes)")
+                self.console.print(f"  [dim]•[/dim] [green]Wrote[/green] [dim]{rich_escape(path)} ({len(content)} bytes)[/dim]")
                 result = await self.tool_handlers.write_file(tool.parameters)
                 
             elif tool.name == "replace_in_file":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[yellow]> Editing:[/yellow] {path}")
+                self.console.print(f"  [dim]•[/dim] [yellow]Edited[/yellow] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.replace_in_file(tool.parameters)
                 
                 # Thrash detection: track consecutive failures
@@ -1242,7 +1680,7 @@ class ClineAgent:
                     entry["last_error"] = result[:200]
                     n = entry["failures"]
                     if n >= 3:
-                        self.console.print(f"[bold red]   {n} consecutive edit failures on this file![/bold red]")
+                        self.console.print(f"    [bold red]{n} consecutive edit failures on this file![/bold red]")
                         result += (
                             f"\n\n[REPEATED FAILURE — {n} consecutive failed edits on this file]\n"
                             f"You are stuck in a loop. STOP and try a DIFFERENT approach:\n"
@@ -1266,76 +1704,85 @@ class ClineAgent:
                 
             elif tool.name == "list_files":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"[blue]> Listing:[/blue] {path}")
                 result = await self.tool_handlers.list_files(tool.parameters)
                 count = len(result.splitlines())
-                self.console.print(f"[dim]   ({count} items)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [blue]Listed[/blue] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(f"    [dim]… {count} items[/dim]")
                 
             elif tool.name == "search_files":
                 regex = tool.parameters.get("regex", "")
-                self.console.print(f"[magenta]> Searching:[/magenta] {regex}")
                 result = await self.tool_handlers.search_files(tool.parameters)
                 matches = len(result.splitlines()) if result != "(no matches)" else 0
-                self.console.print(f"[dim]   ({matches} matches)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [magenta]Searched[/magenta] [dim]{rich_escape(regex)}[/dim]")
+                self.console.print(f"    [dim]… {matches} matches[/dim]")
                 
             elif tool.name == "check_background_process":
                 bg_id = tool.parameters.get("id", "")
-                self.console.print(f"[cyan]> Checking background process:[/cyan] {bg_id or 'all'}")
+                self.console.print(f"  [dim]•[/dim] [cyan]Checking process[/cyan] [dim]{bg_id or 'all'}[/dim]")
                 result = await self.tool_handlers.check_background_process(tool.parameters)
                 
             elif tool.name == "stop_background_process":
                 bg_id = tool.parameters.get("id", "")
-                self.console.print(f"[red]> Stopping background process:[/red] {bg_id}")
+                self.console.print(f"  [dim]•[/dim] [red]Stopping process[/red] [dim]{bg_id}[/dim]")
                 result = await self.tool_handlers.stop_background_process(tool.parameters)
                 
             elif tool.name == "list_background_processes":
-                self.console.print(f"[cyan]> Listing background processes[/cyan]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Listing background processes[/cyan]")
                 result = await self.tool_handlers.list_background_processes(tool.parameters)
             
             elif tool.name == "set_reasoning_mode":
                 mode = tool.parameters.get("mode", "")
-                self.console.print(f"[bold yellow]> Switching reasoning mode:[/bold yellow] {mode}")
+                self.console.print(f"  [dim]•[/dim] [bold yellow]Switching mode[/bold yellow] [dim]→ {mode}[/dim]")
                 result = self._handle_set_reasoning_mode(tool.parameters)
                 
             elif tool.name == "create_plan":
                 prompt = tool.parameters.get("prompt", "")
-                self.console.print(f"[bold yellow]> Creating plan (Claude CLI)[/bold yellow]")
+                self.console.print(f"  [dim]•[/dim] [bold yellow]Creating plan[/bold yellow] [dim](Claude CLI)[/dim]")
                 # Auto-build context summary
                 context_summary = self._build_plan_context()
                 result = await self.tool_handlers.create_plan(tool.parameters, context_summary=context_summary)
                 
+            elif tool.name == "update_agent_rules":
+                rule = tool.parameters.get("rule", "")
+                category = tool.parameters.get("category", "preference")
+                self.console.print(f"  [dim]•[/dim] [bold cyan]Recording rule[/bold cyan] [dim][{category}] {rich_escape(rule[:60])}[/dim]")
+                result = self._handle_update_agent_rules(tool.parameters)
+                
             elif tool.name == "list_context":
-                self.console.print(f"[blue]> Listing context[/blue]")
                 result = self.context.summary()
-                self.console.print(f"[dim]   ({len(self.context.list_items())} items, {self.context.total_size():,} chars)[/dim]")
+                n_items = len(self.context.list_items())
+                self.console.print(f"  [dim]•[/dim] [blue]Listed context[/blue] [dim]({n_items} items, {self.context.total_size():,} chars)[/dim]")
                 
             elif tool.name == "remove_from_context":
                 item_id = tool.parameters.get("id", "")
                 source = tool.parameters.get("source", "")
-                self.console.print(f"[yellow]> Removing from context:[/yellow] {item_id or source}")
+                self.console.print(f"  [dim]•[/dim] [yellow]Removed from context[/yellow] [dim]{rich_escape(item_id or source)}[/dim]")
                 result = self._remove_from_context(tool.parameters)
                 
             elif tool.name == "analyze_image":
                 path = tool.parameters.get("path", "")
                 question = tool.parameters.get("question", "Describe this image in detail.")
-                self.console.print(f"[magenta]> Analyzing image:[/magenta] {path}")
+                self.console.print(f"  [dim]•[/dim] [magenta]Analyzing image[/magenta] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.analyze_image(tool.parameters)
                 
             elif tool.name == "web_search":
                 query = tool.parameters.get("query", "")
-                self.console.print(f"[cyan]> Web Search:[/cyan] {query}")
-                self.console.print("[dim]  (searching... this may take up to 2 minutes)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Web search[/cyan] [dim]{rich_escape(query)}[/dim]")
                 result = await self.tool_handlers.web_search(tool.parameters)
                 
             elif tool.name == "manage_todos":
                 action = tool.parameters.get("action", "list")
-                self.console.print(f"[blue]> Todo:[/blue] {action}")
+                self.console.print(f"  [dim]•[/dim] [blue]Todo[/blue] [dim]{action}[/dim]")
                 result = self._handle_manage_todos(tool.parameters)
                 # Render live todo panel after any todo change
                 self.todo_manager.print_todo_panel(self.console)
                 
+            elif tool.name == "introspect":
+                focus = tool.parameters.get("focus", "")
+                result = await self._execute_introspect(focus)
+                
             elif tool.name == "attempt_completion":
-                self.console.print("[green]> Task complete[/green]")
+                self.console.print("  [dim]•[/dim] [green]Task complete[/green]")
                 result = "Task completed."
                 
             else:
@@ -1344,9 +1791,7 @@ class ClineAgent:
             return result
             
         except Exception as e:
-            log_exception(log, f"Tool execution failed: {tool.name}", e)
-            self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
-            return f"Error: {str(e)}"
+            raise  # Re-raise — _execute_tool handles logging + metrics
     
     def _build_plan_context(self) -> str:
         """Build a context summary to pass to create_plan (Claude CLI)."""
@@ -1405,8 +1850,9 @@ class ClineAgent:
             if not self.todo_manager.original_request and len(self.todo_manager.list_all()) == 1:
                 # Find the original user message
                 for msg in self.messages:
-                    if msg.role == "user" and not msg.content.startswith("["):
-                        self.todo_manager.set_original_request(msg.content[:500])
+                    _text = msg.content if isinstance(msg.content, str) else ""
+                    if msg.role == "user" and _text and not _text.startswith("["):
+                        self.todo_manager.set_original_request(_text[:500])
                         break
             
             return f"Added todo [{item.id}]: {item.title}\n\n{self.todo_manager.format_list()}"
@@ -1495,7 +1941,3 @@ class ClineAgent:
                 return f"No context items matching '{source}'."
         else:
             return "Error: Provide either 'id' or 'source' parameter."
-
-
-# Alias for backward compatibility
-StreamingAgent = ClineAgent

@@ -229,19 +229,27 @@ class ToolHandlers:
                 except asyncio.TimeoutError:
                     pass
             
-            # Final read after process exit
-            await asyncio.sleep(0.1)
-            try:
-                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(file_pos)
-                    new_data = f.read()
-                if new_data:
-                    for line in new_data.splitlines():
-                        info["logs"].append(line)
-                        if len(info["logs"]) > 200:
-                            info["logs"] = info["logs"][-200:]
-            except Exception:
-                pass
+            # Post-exit grace period: keep reading in case a detached child
+            # process (e.g. GUI app) is still writing to the log file via
+            # inherited file handles.  Stop after 5s of no new content.
+            idle_elapsed = 0.0
+            while idle_elapsed < 5.0:
+                await asyncio.sleep(0.5)
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        f.seek(file_pos)
+                        new_data = f.read()
+                        file_pos = f.tell()
+                    if new_data:
+                        for line in new_data.splitlines():
+                            info["logs"].append(line)
+                            if len(info["logs"]) > 200:
+                                info["logs"] = info["logs"][-200:]
+                        idle_elapsed = 0.0  # reset — still getting output
+                    else:
+                        idle_elapsed += 0.5
+                except Exception:
+                    idle_elapsed += 0.5
         except Exception:
             pass
     
@@ -652,23 +660,28 @@ class ToolHandlers:
         log.info("execute_command: cmd=%s bg=%s", log_truncate(command, 200), background)
         
         # Show command being executed
-        print()
         mode_indicator = "[bg] " if background else ""
-        self.console.print(f"[dim]$ {mode_indicator}{command}[/dim]")
+        cmd_short = command.split('\n')[0][:120]  # First line, truncated
+        self.console.print(f"\n  [dim]•[/dim] Running [dim]{mode_indicator}{cmd_short}[/dim]")
         
         if background:
             return await self._run_background_command(command)
         
         # ── Launch with file redirect ──────────────────────────────────
         cmd_log_path = self._get_cmd_log_path()
-        
+
+        # Truncate the log file before launching so the tail loop never
+        # reads stale content from a previous session (the cmd_id counter
+        # resets on each harness start, so filenames are reused).
+        Path(cmd_log_path).write_text("", encoding="utf-8")
+
         # Shell-level redirect: stdout+stderr go to the log file.
         # The process itself runs without Python pipes so GUI windows work.
         # NOTE: create_subprocess_shell already invokes the platform shell
         # (cmd.exe on Windows, /bin/sh on Unix), so we must NOT wrap with
         # an extra "cmd /c" — that breaks commands containing double quotes.
         wrapped = f'{command} > "{cmd_log_path}" 2>&1'
-        
+
         proc = await asyncio.create_subprocess_shell(
             wrapped,
             stdin=asyncio.subprocess.DEVNULL,
@@ -691,7 +704,7 @@ class ToolHandlers:
                 # Check for interrupt (Esc)
                 if is_interrupted():
                     self._kill_proc(proc)
-                    self.console.print(f"\n[yellow][STOP] Command interrupted[/yellow]")
+                    self.console.print(f"\n    [yellow]⏹ Command interrupted[/yellow]")
                     raw_output = self._read_log_file(cmd_log_path)
                     output = self.spill_output_to_file(
                         raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
@@ -700,17 +713,20 @@ class ToolHandlers:
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
                     reset_background()
-                    self.console.print(f"\n[cyan]-> Sending to background...[/cyan]")
+                    self.console.print(f"\n    [cyan]→ Sending to background...[/cyan]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
-                    self.console.print(f"[dim]  (Ctrl+B to background, Esc to stop)[/dim]")
+                    self.console.print(f"    [dim](Ctrl+B to background, Esc to stop)[/dim]")
                     hint_shown = True
                 
-                # Auto-background after timeout
-                if elapsed > timeout_secs:
-                    self.console.print(f"\n[yellow][TIME] Command running for {timeout_secs}s - auto-backgrounding[/yellow]")
+                # Auto-background after timeout.  Use a shorter timeout for
+                # commands producing no output — likely GUI apps (e.g. notepad)
+                # that block cmd.exe but have no console output to tail.
+                effective_timeout = 10 if not output_lines else timeout_secs
+                if elapsed > effective_timeout:
+                    self.console.print(f"\n    [cyan]→ No output for {elapsed:.0f}s, sending to background...[/cyan]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Read new content from log file
@@ -724,17 +740,39 @@ class ToolHandlers:
             
             # Process has exited — do one final read to catch any trailing output
             await asyncio.sleep(0.1)  # Brief pause for OS to flush file buffers
-            self._tail_log_file(cmd_log_path, file_pos, output_lines)
-            
+            file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
+
+            # Detached GUI app detection: if the shell exited very quickly with
+            # little or no output, the actual app may have detached (e.g. Windows
+            # GUI subsystem) and is still writing to the log file via inherited
+            # handles.  Wait briefly, then check if the log is growing — if so,
+            # promote to background so the standard log tailer keeps monitoring.
+            elapsed_so_far = time.time() - start_time
+            if elapsed_so_far < 2.0 and len(output_lines) < 3:
+                log.info("Fast exit with little output (%.1fs, %d lines) — "
+                         "checking for detached GUI app", elapsed_so_far, len(output_lines))
+                await asyncio.sleep(1.0)
+                file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
+                if output_lines:
+                    # Log file is growing — a detached app is still running.
+                    # Promote to background so the log tailer keeps reading.
+                    self.console.print(f"    [cyan]→ Detached process detected, sending to background...[/cyan]")
+                    return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
+
             exit_code = proc.returncode
             elapsed_cmd = time.time() - start_time
             log.info("execute_command finished: cmd=%s exit=%d elapsed=%.1fs output_lines=%d",
                      log_truncate(command, 80), exit_code, elapsed_cmd, len(output_lines))
+            # Show collapsed line count if output was truncated
+            n_lines = len(output_lines)
+            if n_lines > self._MAX_LIVE_DISPLAY:
+                self.console.print(f"    [dim]… +{n_lines - self._MAX_LIVE_DISPLAY} lines[/dim]")
+            
             if exit_code == 0:
-                self.console.print(f"[green][OK] Exit code: {exit_code}[/green]")
+                self.console.print(f"    [dim](exit 0, {elapsed_cmd:.1f}s)[/dim]")
             else:
                 log.warning("Command failed: exit=%d cmd=%s", exit_code, log_truncate(command, 120))
-                self.console.print(f"[red][X] Exit code: {exit_code}[/red]")
+                self.console.print(f"    [red]✗ exit {exit_code}[/red] [dim]({elapsed_cmd:.1f}s)[/dim]")
             
             # Build raw output and spill to file if huge
             raw_output = self._read_log_file(cmd_log_path) or "(no output)"
@@ -756,10 +794,15 @@ class ToolHandlers:
     
     # ── Helpers for file-redirect execution ─────────────────────────────
     
+    # Maximum lines to show live before collapsing (show first N, then summarize)
+    _MAX_LIVE_DISPLAY = 10
+
     def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:
         """Read new content from a log file starting at file_pos.
         
         Displays new lines in the console and appends to output_lines.
+        After _MAX_LIVE_DISPLAY lines, suppresses further live display —
+        the final summary is printed by execute_command on completion.
         Returns the updated file position.
         """
         try:
@@ -770,8 +813,12 @@ class ToolHandlers:
             if new_data:
                 for line in new_data.splitlines():
                     output_lines.append(line)
-                    safe_line = sanitize_terminal_output(line)
-                    self.console.print(f"[dim]  {safe_line}[/dim]")
+                    n = len(output_lines)
+                    if n <= self._MAX_LIVE_DISPLAY:
+                        safe_line = sanitize_terminal_output(line)
+                        self.console.print(f"    [dim]{safe_line}[/dim]")
+                    elif n == self._MAX_LIVE_DISPLAY + 1:
+                        self.console.print(f"    [dim]… +more lines (running)[/dim]")
             return new_pos
         except FileNotFoundError:
             return file_pos
@@ -803,7 +850,7 @@ class ToolHandlers:
             "log_file": log_path,
             "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
-        self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        self.console.print(f"    [green]→ Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
         recent = "\n".join(output_lines[-30:])
         return (
             f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
@@ -816,9 +863,13 @@ class ToolHandlers:
         """Delegate a complex reasoning task to Claude CLI (Opus 4.6).
         
         Auto-attaches context summary (todos, recent files, workspace info).
-        """
-        import subprocess
         
+        NOTE: This does NOT go through execute_command.  The prompt may contain
+        newlines, quotes, pipes, angle brackets, etc. that would be mangled by
+        shell quoting / redirect.  Instead we launch the claude CLI directly
+        via create_subprocess_exec and pipe the prompt through a temp file
+        passed with the -p flag reading from file, or via stdin.
+        """
         prompt = params.get("prompt", "").strip()
         if not prompt:
             return "Error: 'prompt' is required for create_plan."
@@ -828,18 +879,135 @@ class ToolHandlers:
         if context_summary:
             full_prompt = f"CONTEXT:\n{context_summary}\n\nTASK:\n{prompt}"
         
-        args = ["claude", "-p", full_prompt, "--dangerously-skip-permissions"]
-        
-        # Use configured model if available
-        claude_model = getattr(self, '_claude_model', None)
-        if claude_model:
-            args.extend(["--model", claude_model])
-        
-        command = subprocess.list2cmdline(args)
-        self.console.print(f"[bold yellow]{'─' * 4} create_plan (Claude CLI) {'─' * 25}[/bold yellow]")
-        result = await self.execute_command({"command": command})
-        self.console.print(f"[bold yellow]{'─' * 4} create_plan done {'─' * 32}[/bold yellow]")
-        return result
+        # Write prompt to a temp file to avoid all shell quoting issues.
+        # Claude CLI reads -p from the command line, but we can pipe via stdin
+        # using the '-' convention or just pass a sanitized file reference.
+        # Safest approach: write to file, pass via stdin with --pipe flag.
+        import tempfile
+        prompt_file = None
+        try:
+            # Write prompt to temp file
+            prompt_file = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', prefix='harness_plan_',
+                dir=self._output_dir, delete=False, encoding='utf-8'
+            )
+            prompt_file.write(full_prompt)
+            prompt_file.close()
+            prompt_path = prompt_file.name
+            
+            # Build args: claude reads prompt from stdin via -p "$(cat file)"
+            # Actually simplest: use -p @file or just pipe stdin.
+            # Claude CLI supports: echo "prompt" | claude -p -
+            # But safest: claude -p with the file contents piped via stdin
+            args = ["claude", "-p", "-", "--dangerously-skip-permissions"]
+            
+            # Use configured model if available
+            claude_model = getattr(self, '_claude_model', None)
+            if claude_model:
+                args.extend(["--model", claude_model])
+            
+            log.info("create_plan: launching Claude CLI with %d-char prompt via stdin", len(full_prompt))
+            self.console.print(f"[bold yellow]{'─' * 4} create_plan (Claude CLI) {'─' * 25}[/bold yellow]")
+            self.console.print(f"[dim]  Prompt: {len(full_prompt)} chars | Model: {claude_model or 'default'}[/dim]")
+            
+            # Launch directly (no shell) with stdin pipe for the prompt
+            # and stdout/stderr piped for capture
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=self.workspace_path,
+            )
+            
+            # Send prompt via stdin and collect output
+            output_chunks = []
+            start_time = time.time()
+            
+            # Write prompt to stdin, then close it
+            proc.stdin.write(full_prompt.encode('utf-8'))
+            await proc.stdin.drain()
+            proc.stdin.close()
+            
+            # Read output line by line with live display
+            while True:
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if proc.returncode is not None:
+                        break
+                    # Check for interrupt
+                    from .interrupt import is_interrupted
+                    if is_interrupted():
+                        self._kill_proc(proc)
+                        self.console.print(f"\n[yellow][STOP] create_plan interrupted[/yellow]")
+                        partial = "\n".join(output_chunks)
+                        return f"create_plan interrupted after {time.time() - start_time:.0f}s.\nPartial output:\n{partial}"
+                    continue
+                
+                if not line:
+                    break
+                
+                decoded = line.decode('utf-8', errors='replace').rstrip()
+                output_chunks.append(decoded)
+                safe_line = sanitize_terminal_output(decoded)
+                self.console.print(f"[dim]  {safe_line}[/dim]")
+            
+            await proc.wait()
+            elapsed = time.time() - start_time
+            exit_code = proc.returncode
+            
+            self.console.print(f"[bold yellow]{'─' * 4} create_plan done {'─' * 32}[/bold yellow]")
+            
+            raw_output = "\n".join(output_chunks)
+            
+            if exit_code != 0:
+                log.warning("create_plan failed: exit=%d elapsed=%.1fs output_len=%d",
+                           exit_code, elapsed, len(raw_output))
+                self.console.print(f"[red][X] Claude CLI exit code: {exit_code}[/red]")
+                return f"Error: Claude CLI failed (exit code {exit_code}).\nOutput:\n{raw_output}" if raw_output else f"Error: Claude CLI failed (exit code {exit_code}, no output)"
+            
+            log.info("create_plan success: elapsed=%.1fs output_len=%d", elapsed, len(raw_output))
+            
+            if not raw_output.strip():
+                return "Error: Claude CLI returned empty output."
+            
+            # Save plan to persistent file for audit trail
+            plan_dir = os.path.join(self._output_dir, "plans")
+            os.makedirs(plan_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            plan_path = os.path.join(plan_dir, f"plan_{ts}.md")
+            Path(plan_path).write_text(
+                f"# create_plan — {ts}\n\n"
+                f"**Model**: {claude_model or 'default'}\n"
+                f"**Elapsed**: {elapsed:.1f}s\n\n"
+                f"## Prompt\n\n{full_prompt}\n\n"
+                f"## Response\n\n{raw_output}\n",
+                encoding='utf-8'
+            )
+            log.info("Plan saved to: %s", plan_path)
+            self.console.print(f"[dim]  Plan saved: {plan_path}[/dim]")
+            
+            # Truncate for context if very large
+            output = truncate_output(raw_output, max_lines=300, keep_start=80, keep_end=80)
+            output = self.spill_output_to_file(output, "create_plan")
+
+            # Prepend plan file path so the agent can read the full output
+            output = f"Plan saved to: {plan_path}\nRead this file to see exactly what the planner did before taking any action.\n\n{output}"
+
+            # Add to context
+            if len(output_chunks) > 3:
+                ctx_id = self.context.add("command_output", "create_plan", output)
+                return f"[Context ID: {ctx_id}]\n{output}"
+            return output
+            
+        finally:
+            # Clean up temp prompt file
+            if prompt_file and os.path.exists(prompt_file.name):
+                try:
+                    os.unlink(prompt_file.name)
+                except Exception:
+                    pass
     
     async def _run_background_command(self, command: str) -> str:
         """Run a command in background with output redirected to a log file."""
@@ -848,7 +1016,10 @@ class ToolHandlers:
         proc_id = self._next_bg_id
         self._next_bg_id += 1
         log_path = self._get_bg_log_path(proc_id)
-        
+
+        # Truncate before launch to avoid stale content from previous sessions
+        Path(log_path).write_text("", encoding="utf-8")
+
         # Shell-level redirect to log file (no cmd /c wrapper — see execute_command)
         wrapped = f'{command} > "{log_path}" 2>&1'
         
@@ -881,7 +1052,7 @@ class ToolHandlers:
             "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
         
-        self.console.print(f"[green]-> Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        self.console.print(f"    [green]→ Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
         return (
             f"Command started in background (ID: {proc_id}, PID: {proc.pid}).\n"
             f"Log file: {log_path}\n"

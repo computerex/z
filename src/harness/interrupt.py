@@ -95,11 +95,16 @@ class KeyboardMonitor:
         self._thread.start()
     
     def _sigint_handler(self, signum, frame):
-        """Handle Ctrl+C by triggering interrupt."""
+        """Handle Ctrl+C by triggering interrupt.
+        
+        First Ctrl+C → soft interrupt (set flag, agent checks it).
+        Second Ctrl+C → hard exit (raise KeyboardInterrupt).
+        """
+        was_already_interrupted = _interrupt_state.interrupted
         _interrupt_state.trigger("ctrl-c")
-        # Re-raise on second Ctrl+C for hard exit
-        if _interrupt_state.interrupted:
-            # Already interrupted once, this is the second time
+        if was_already_interrupted:
+            # Second Ctrl+C while already interrupted — hard exit
+            _log.warning("Second Ctrl+C — hard exit")
             if self._original_sigint and self._original_sigint != signal.SIG_DFL:
                 self._original_sigint(signum, frame)
             else:
