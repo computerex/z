@@ -55,3 +55,6 @@ debug_*.py
 
 # Harness output spill files
 .harness_output/
+
+# Model configuration
+.z/models.json
