@@ -238,7 +238,10 @@ def get_sessions_dir(workspace: str) -> Path:
     """Get sessions directory for a workspace."""
     harness_dir = Path(__file__).parent
     sessions_dir = harness_dir / ".sessions"
-    workspace_hash = hashlib.md5(workspace.encode()).hexdigest()[:12]
+    # Normalise the workspace path so that case differences on Windows
+    # (e.g. C:\Projects\evoke vs c:\projects\evoke) map to the same hash.
+    normalised = os.path.normcase(os.path.normpath(workspace))
+    workspace_hash = hashlib.md5(normalised.encode()).hexdigest()[:12]
     workspace_sessions = sessions_dir / workspace_hash
     workspace_sessions.mkdir(parents=True, exist_ok=True)
     return workspace_sessions
@@ -457,7 +460,7 @@ def main():
     # Load providers from models.json
     providers = load_providers(workspace)
     claude_cli_config = load_claude_cli_config(workspace)
-    
+
     if not providers:
         log.warning("No providers found in .z/models.json — falling back to default config")
     
@@ -810,6 +813,20 @@ def main():
                         user_input = f"Analyze this image: {img_path}\n\nQuestion: {question}"
                         # Fall through to process this request
                     
+                    elif cmd == '/index':
+                        idx = agent.workspace_index
+                        if cmd_arg.strip().lower() == 'rebuild':
+                            console.print("[dim]Rebuilding workspace index...[/dim]")
+                            idx.build()
+                            console.print(f"[dim]Index rebuilt: {len(idx.files)} files in {idx._build_time:.2f}s[/dim]")
+                        elif cmd_arg.strip().lower() == 'tree':
+                            console.print(f"[dim]{idx.compact_tree()}[/dim]")
+                        else:
+                            console.print(f"[dim]{idx.summary()}[/dim]")
+                            console.print(f"[dim]  /index rebuild  — re-scan workspace[/dim]")
+                            console.print(f"[dim]  /index tree     — show file list only[/dim]")
+                        continue
+                    
                     elif cmd == '/log':
                         log_file = os.path.join(workspace, ".harness_output", "harness.log")
                         if not os.path.exists(log_file):
@@ -853,6 +870,7 @@ def main():
   /history           - Show message count
   /bg                - List background processes
   /ctx               - Show context container
+  /index [rebuild|tree] - Show project map, rebuild index, or show file tree
   /log [n]           - Show last n lines of harness.log (default 30)
   /exit              - Save and exit
 

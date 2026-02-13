@@ -285,6 +285,7 @@ class SmartContextManager:
 
     Protected: system prompt (0), first user-assistant pair (1, 2),
     and the most recent N messages (``recent_window``).
+
     """
 
     def __init__(self, todo_manager: "TodoManager"):
@@ -798,7 +799,7 @@ class SmartContextManager:
                 r'|search_files|list_files|manage_todos|attempt_completion'
                 r'|list_context|remove_from_context|analyze_image|web_search'
                 r'|check_background_process|stop_background_process'
-                r'|list_background_processes)\b',
+                r'|list_background_processes|introspect)\b',
                 content,
             ))
             if has_tool_xml:
@@ -811,9 +812,8 @@ class SmartContextManager:
     # Compaction (content replacement)
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _compact_message(
-        content: str, msg_type: str, source: str,
+        self, content: str, msg_type: str, source: str,
     ) -> Tuple[str, str]:
         """Create a compact replacement.
 
