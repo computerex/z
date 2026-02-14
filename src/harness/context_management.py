@@ -39,12 +39,15 @@ def estimate_messages_tokens(messages: List[dict]) -> int:
 
 
 # Model context windows and safe limits (leave room for response)
+# Format: (context_window, max_allowed_input)
+# max_allowed_input leaves headroom for the model's output tokens.
 MODEL_LIMITS = {
-    "glm-4.7": (128_000, 98_000),      # (context_window, max_allowed)
+    "glm-4.7": (200_000, 128_000),     # 200K context, 128K max output
     "glm-4-plus": (128_000, 98_000),
     "deepseek-chat": (64_000, 37_000),
     "gpt-4": (128_000, 98_000),
     "claude-3": (200_000, 160_000),
+    "MiniMax-M2": (1_000_000, 200_000), # 1M context
 }
 
 DEFAULT_LIMIT = (128_000, 98_000)

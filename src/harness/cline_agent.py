@@ -1208,18 +1208,19 @@ class ClineAgent:
                 full_content = ""
                 first_token = True
                 
-                # ── XML stream filter state ──────────────────────────────
-                # Suppresses raw XML tool tags from the live display while
-                # still accumulating full_content for parsing afterwards.
+                # ── XML stream filter ────────────────────────────────────
+                # Suppresses raw XML tool tags from the live terminal while
+                # full_content still accumulates everything for parsing.
+                # IMPORTANT: chat_stream_raw passes MULTI-CHARACTER chunks
+                # to on_chunk, so we iterate char-by-char internally.
                 _sf_tool_names = set(get_tool_names())
-                _sf_strip_tags = {'thinking', 'think'}  # strip tags, show content
-                _sf_suppressing: Optional[str] = None    # tool name of block being suppressed
-                _sf_tag_buf = ""     # buffer for tag detection / closing-tag scan
-                _sf_in_tag = False   # in DETECT_TAG state
-                _sf_had_visible = False  # whether any visible text was written
+                _sf_strip_tags = {'thinking', 'think'}
+                _sf_suppressing: Optional[str] = None  # tool block being eaten
+                _sf_tag_buf = ""
+                _sf_in_tag = False
+                _sf_had_visible = False
                 
                 def _sf_flush():
-                    """Flush buffered tag chars to stdout (wasn't a special tag)."""
                     nonlocal _sf_tag_buf, _sf_had_visible
                     if _sf_tag_buf:
                         sys.stdout.write(_sf_tag_buf)
@@ -1227,18 +1228,11 @@ class ClineAgent:
                         _sf_had_visible = True
                         _sf_tag_buf = ""
 
-                def on_chunk(c: str):
-                    nonlocal full_content, first_token
+                def _sf_char(c: str):
+                    """Process a single character through the filter."""
                     nonlocal _sf_suppressing, _sf_tag_buf, _sf_in_tag, _sf_had_visible
                     
-                    # Always accumulate full content (needed for tool-call parsing)
-                    full_content += c
-                    
-                    if first_token:
-                        self.status.clear()
-                        first_token = False
-                    
-                    # ── SUPPRESS_BLOCK state: eat everything until </tool> ──
+                    # ── SUPPRESS_BLOCK: eat everything until </tool_name> ──
                     if _sf_suppressing:
                         _sf_tag_buf += c
                         close = f"</{_sf_suppressing}>"
@@ -1246,47 +1240,36 @@ class ClineAgent:
                             _sf_suppressing = None
                             _sf_tag_buf = ""
                         elif len(_sf_tag_buf) > len(close) + 30:
-                            # Trim buffer — keep enough tail for closing-tag detection
                             _sf_tag_buf = _sf_tag_buf[-(len(close) + 10):]
                         return
                     
-                    # ── DETECT_TAG state: buffering after '<' ──
+                    # ── DETECT_TAG: buffering after '<' ──
                     if _sf_in_tag:
                         _sf_tag_buf += c
                         if c == '>':
-                            # Tag complete — classify it
                             m = re.match(r'</?(\w+)', _sf_tag_buf)
                             if m:
-                                tag_name = m.group(1)
-                                is_closing = _sf_tag_buf.startswith('</')
-                                if tag_name in _sf_tool_names:
-                                    if not is_closing:
-                                        # Opening tool tag → suppress entire block
-                                        _sf_suppressing = tag_name
-                                        _sf_tag_buf = ""
-                                    else:
-                                        # Orphaned closing tool tag → just eat it
-                                        _sf_tag_buf = ""
-                                    _sf_in_tag = False
-                                    return
-                                elif tag_name in _sf_strip_tags:
-                                    # Thinking tag → hide tag itself, keep content
+                                tag = m.group(1)
+                                is_close = _sf_tag_buf.startswith('</')
+                                if tag in _sf_tool_names:
+                                    if not is_close:
+                                        _sf_suppressing = tag
                                     _sf_tag_buf = ""
                                     _sf_in_tag = False
                                     return
-                                else:
-                                    _sf_flush()
-                            else:
-                                _sf_flush()
+                                elif tag in _sf_strip_tags:
+                                    _sf_tag_buf = ""
+                                    _sf_in_tag = False
+                                    return
+                            _sf_flush()
                             _sf_in_tag = False
                             return
-                        # Safety: overly long buffer means it's not a real tag
                         if len(_sf_tag_buf) > 80:
                             _sf_flush()
                             _sf_in_tag = False
                         return
                     
-                    # ── NORMAL state ──
+                    # ── NORMAL ──
                     if c == '<':
                         _sf_in_tag = True
                         _sf_tag_buf = c
@@ -1295,6 +1278,16 @@ class ClineAgent:
                     sys.stdout.write(c)
                     sys.stdout.flush()
                     _sf_had_visible = True
+
+                def on_chunk(chunk: str):
+                    """Handle a (possibly multi-char) streaming chunk."""
+                    nonlocal full_content, first_token
+                    full_content += chunk
+                    if first_token:
+                        self.status.clear()
+                        first_token = False
+                    for c in chunk:
+                        _sf_char(c)
                 
                 # Stream the response - using raw mode (no JSON parsing)
                 # Web search disabled by default to avoid unnecessary searches
@@ -1364,14 +1357,16 @@ class ClineAgent:
                           input_tokens, output_tokens, response.finish_reason)
                 
                 # Detect truncated output: the model hit max_tokens mid-response.
-                # This commonly happens after compaction frees space, the model
-                # generates a long response, and the closing XML tag gets cut off.
-                output_truncated = response.is_truncated or self._has_unclosed_tool_tag(full_content)
+                # Only trigger continuation if there's an UNCLOSED tool tag —
+                # meaning the model was genuinely cut off mid-tool-call.
+                # If finish_reason is "length" but all tags are closed, the
+                # response is usable; don't waste iterations on continuation.
+                has_unclosed = self._has_unclosed_tool_tag(full_content)
                 
-                if output_truncated:
-                    log.warning("Output truncated at iteration %d (content_len=%d)",
+                if has_unclosed:
+                    log.warning("Output truncated (unclosed tool tag) at iteration %d (content_len=%d)",
                                 iteration + 1, len(full_content))
-                    self.console.print("[dim][!] Output truncated — asking model to continue[/dim]")
+                    self.console.print("[dim][!] Output truncated mid-tool-call — asking model to continue[/dim]")
                     # Save the partial response and ask the model to finish
                     self.messages.append(StreamingMessage(role="assistant", content=full_content))
                     self.messages.append(StreamingMessage(
@@ -1383,6 +1378,11 @@ class ClineAgent:
                         ),
                     ))
                     continue  # next iteration will get the continuation
+                elif response.is_truncated:
+                    # finish_reason was "length" but all tool tags are closed.
+                    # The model finished its work; just log it and proceed.
+                    log.info("finish_reason=length but all tool tags closed — proceeding normally (content_len=%d)",
+                             len(full_content))
                 
                 # Parse ALL XML tool calls from content (not just the last one)
                 all_tool_calls = parse_all_xml_tools(full_content)
@@ -1664,13 +1664,35 @@ class ClineAgent:
             elif tool.name == "write_to_file":
                 path = tool.parameters.get("path", "")
                 content = tool.parameters.get("content", "")
+                # Capture old content for diff (if file exists)
+                resolved = self.tool_handlers._resolve_path(path)
+                old_content = None
+                if resolved.exists():
+                    try:
+                        old_content = resolved.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
                 self.console.print(f"  [dim]•[/dim] [green]Wrote[/green] [dim]{rich_escape(path)} ({len(content)} bytes)[/dim]")
                 result = await self.tool_handlers.write_file(tool.parameters)
+                # Show diff for overwrites, or creation summary for new files
+                if old_content is not None and not result.startswith("Error:"):
+                    self._show_write_diff(old_content, content, path)
+                elif old_content is None and not result.startswith("Error:"):
+                    n_lines = content.count('\n') + 1
+                    self.console.print(f"    [green]+ {n_lines} lines[/green] [dim](new file)[/dim]")
                 
             elif tool.name == "replace_in_file":
                 path = tool.parameters.get("path", "")
+                diff_text = tool.parameters.get("diff", "")
                 self.console.print(f"  [dim]•[/dim] [yellow]Edited[/yellow] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.replace_in_file(tool.parameters)
+                
+                # Show pretty diff on success
+                if not result.startswith("Error:") and diff_text:
+                    from .tool_handlers import parse_search_replace_blocks
+                    blocks = parse_search_replace_blocks(diff_text)
+                    if blocks:
+                        self._show_diff_blocks(blocks, path)
                 
                 # Thrash detection: track consecutive failures
                 norm_path = str(self.tool_handlers._resolve_path(path))
@@ -1793,6 +1815,47 @@ class ClineAgent:
         except Exception as e:
             raise  # Re-raise — _execute_tool handles logging + metrics
     
+    # ── Pretty-printed diff display ─────────────────────────────────
+    _DIFF_CONTEXT = 2      # Context lines around each change
+    _DIFF_MAX_LINES = 20   # Max total diff lines before collapsing
+    
+    def _render_udiff(self, old_text: str, new_text: str) -> None:
+        """Render a unified diff between two strings, showing only real changes."""
+        import difflib
+        old_lines = old_text.splitlines(keepends=True)
+        new_lines = new_text.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(old_lines, new_lines, n=self._DIFF_CONTEXT))
+        
+        if not diff:
+            return
+        
+        shown = 0
+        for line in diff[2:]:  # skip --- / +++ headers
+            if shown >= self._DIFF_MAX_LINES:
+                remaining = len(diff) - 2 - shown
+                if remaining > 0:
+                    self.console.print(f"    [dim]… {remaining} more diff lines[/dim]")
+                break
+            text = line.rstrip('\n')
+            if line.startswith('+'):
+                self.console.print(f"    [green]{rich_escape(text)}[/green]")
+            elif line.startswith('-'):
+                self.console.print(f"    [red]{rich_escape(text)}[/red]")
+            elif line.startswith('@@'):
+                self.console.print(f"    [cyan]{rich_escape(text)}[/cyan]")
+            else:
+                self.console.print(f"    [dim]{rich_escape(text)}[/dim]")
+            shown += 1
+
+    def _show_diff_blocks(self, blocks: List[Tuple[str, str]], path: str) -> None:
+        """Display SEARCH/REPLACE blocks as a unified diff (only real changes)."""
+        for search, replace in blocks:
+            self._render_udiff(search, replace)
+    
+    def _show_write_diff(self, old_content: str, new_content: str, path: str) -> None:
+        """Display a unified diff for write_to_file overwrites."""
+        self._render_udiff(old_content, new_content)
+
     def _build_plan_context(self) -> str:
         """Build a context summary to pass to create_plan (Claude CLI)."""
         parts = []
