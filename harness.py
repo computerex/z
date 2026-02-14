@@ -336,6 +336,52 @@ class HarnessCompleter(Completer):
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
         
+        # Shell command completion with ! prefix
+        if text.startswith('!'):
+            cmd_part = text[1:].strip()
+            if not cmd_part:
+                # Just typed !, show common shell commands
+                common_cmds = ['ls', 'cd', 'pwd', 'git', 'npm', 'pip', 'python', 'node', 'cat', 'grep', 'find']
+                for cmd in common_cmds:
+                    yield Completion(
+                        f"!{cmd}",
+                        start_position=-len(text),
+                        display=cmd,
+                    )
+            else:
+                # Complete file paths for shell commands
+                if ' ' in cmd_part:
+                    # Completing a path argument
+                    prefix = cmd_part.split()[-1]
+                    try:
+                        import glob
+                        # Handle glob patterns
+                        if '*' in prefix or '?' in prefix:
+                            matches = glob.glob(prefix, recursive=False)
+                        else:
+                            # Complete from current directory
+                            matches = glob.glob(prefix + '*', recursive=False)
+                        for match in sorted(matches):
+                            display = match + ('/' if os.path.isdir(match) else '')
+                            yield Completion(
+                                f"!{cmd_part.rsplit(' ', 1)[0]} {match}",
+                                start_position=-len(prefix),
+                                display=display,
+                            )
+                    except Exception:
+                        pass
+                else:
+                    # Complete the command itself
+                    common_cmds = ['ls', 'cd', 'pwd', 'git', 'npm', 'pip', 'python', 'node', 'cat', 'grep', 'find', 'rm', 'cp', 'mv', 'mkdir', 'touch', 'echo', 'clear']
+                    for cmd in common_cmds:
+                        if cmd.startswith(cmd_part):
+                            yield Completion(
+                                f"!{cmd}",
+                                start_position=-len(text),
+                                display=cmd,
+                            )
+            return
+        
         # First, try history completion (if text doesn't start with /)
         if not text.startswith('/') and text.strip():
             prefix = text
@@ -696,7 +742,7 @@ def main():
             border_style="cyan",
             padding=(1, 2),
         ))
-        console.print("[dim]Type your request, or /help for commands. Esc to interrupt.[/dim]\n")
+        console.print("[dim]Type your request, !cmd for shell, or /help for commands. Esc to interrupt.[/dim]\n")
         
         # Create prompt session for multiline input
         history_file = get_sessions_dir(workspace) / ".history"
@@ -732,6 +778,20 @@ def main():
                         continue
                 
                 if not user_input:
+                    continue
+                
+                # Handle shell commands with ! prefix
+                if user_input.startswith("!"):
+                    shell_cmd = user_input[1:].strip()
+                    if shell_cmd:
+                        console.print(f"[dim]Executing: {shell_cmd}[/dim]")
+                        try:
+                            result = loop.run_until_complete(
+                                agent.tool_handlers.execute_command({"command": shell_cmd})
+                            )
+                            console.print(result)
+                        except Exception as e:
+                            console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
                     continue
                 
                 # Handle commands
@@ -1008,6 +1068,7 @@ def main():
                     
                     elif cmd in ('/help', '/?'):
                         help_text = """[dim]Commands:
+  !<command>          - Execute shell command directly
   /sessions          - List all sessions
   /session <name>    - Switch to session (creates if new)
   /delete <name>     - Delete a session
