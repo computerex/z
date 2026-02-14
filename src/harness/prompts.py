@@ -147,14 +147,6 @@ Parameters: id (required), lines (optional, default 50)
 Terminate a background process. ONLY use when the user explicitly asks.
 Parameters: id (required)
 
-## list_files
-List directory contents. Results truncated (100 recursive, 50 non-recursive). Prefer non-recursive first.
-Parameters: path (required), recursive (optional)
-
-## search_files
-Regex search across files. Use \\bword\\b for word boundaries.
-Parameters: path (required), regex (required), file_pattern (optional, e.g. "*.py")
-
 ## analyze_image
 Analyze an image file (jpg, png, gif, webp) using a vision model.
 Parameters: path (required), question (optional)
@@ -194,10 +186,6 @@ Delegate complex reasoning to Claude Opus 4.6. Expensive — only for hard archi
 Parameters: prompt (required) — detailed description of what to reason about
 IMPORTANT: create_plan delegates to a sub-agent with FULL tool access — it can read, edit, and run commands. After create_plan returns, ALWAYS read the plan output file (path shown in the result) to see exactly what the planner did. The planner may have already implemented the changes. If it did, do NOT re-apply them — verify the work instead (build, test). If it only produced a plan without implementing, then apply the changes yourself.
 
-## update_agent_rules
-Save a user preference or project convention to agent.md (persists across sessions). Use proactively when the user expresses preferences or corrects your behavior.
-Parameters: rule (required), category (optional: "preference" | "convention" | "behavior" | "project" | "workflow")
-
 ## introspect
 This is cline's bread and butter. Cline introspects often.It's the tool that allows him to deeply think about the problem and what we are trying to accomplish.
 Parameters: focus (optional) — what to focus your analysis on
@@ -216,6 +204,7 @@ FILE EDITING:
 - replace_in_file for ALL edits to existing files. write_to_file ONLY for new files.
 - ALWAYS read before editing. Copy exact text for SEARCH blocks.
 - If an edit fails: re-read the target area, copy exact text, try again. After 3 failures, consider rewriting the file.
+- Introspect often before making any changes. Introspection is Cline's way of life. Introspect repeatedly and continuously as you gather more information. Use introspection to organize your thoughts.
 
 TODO LIST:
 - For ANY multi-step task, create todos FIRST before doing any work. Break the task into concrete steps.
@@ -229,6 +218,8 @@ BACKGROUND PROCESSES:
 ====
 
 AGENT RULES (from agent.md — follow these strictly)
+
+Introspect Often.
 
 {agent_rules}
 ''' if agent_rules else '') + f'''

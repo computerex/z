@@ -109,11 +109,20 @@ TOOL_DEFS: List[ToolDef] = [
 TOOL_NAMES: List[str] = [t.name for t in TOOL_DEFS]
 TOOL_BY_NAME: Dict[str, ToolDef] = {t.name: t for t in TOOL_DEFS}
 COMPLEX_CONTENT_TOOLS: set = {t.name for t in TOOL_DEFS if t.complex_content}
+# All parameter names across all tools (for XML suppression)
+PARAM_NAMES: set = set()
+for tool in TOOL_DEFS:
+    PARAM_NAMES.update(p.name for p in tool.params)
 
 
 def get_tool_names() -> List[str]:
-    """Return the canonical list of tool names."""
+    """Return canonical list of tool names."""
     return TOOL_NAMES
+
+
+def get_param_names() -> set:
+    """Return set of all parameter names across all tools."""
+    return PARAM_NAMES
 
 
 def get_complex_content_tools() -> set:

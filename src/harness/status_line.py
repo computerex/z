@@ -34,8 +34,10 @@ class StatusLine:
     COMPACTING = "compacting"
     WAITING = "waiting"
 
-    # Spinner frames for active states
+    # Spinner frames for active states (minimal dots)
     _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    # Cyan ANSI color for spinner/icon
+    _CYAN = "\033[36m"
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled and sys.stdout.isatty()
@@ -121,19 +123,21 @@ class StatusLine:
         # Pick icon based on state
         icon = self._get_icon()
 
-        # Build the line
-        iter_part = ""
+        # Build compact line: icon text │ iter │ elapsed
+        parts = [f"{icon} {self._text}"]
         if self._max_iterations > 0:
-            iter_part = f" [{self._iteration}/{self._max_iterations}]"
-
+            parts.append(f"iter: {self._iteration}/{self._max_iterations}")
+        if elapsed_str:
+            parts.append(elapsed_str)
+        
         cols = shutil.get_terminal_size().columns
-        line = f" {icon} {self._text}{iter_part}  {elapsed_str} "
+        line = " " + " │ ".join(parts) + " "
 
         # Truncate if too wide
         if len(line) > cols:
             line = line[:cols - 1] + "…"
 
-        # Dim styling via ANSI
+        # Dim + cyan icon via ANSI
         dim = "\033[2m"
         reset = "\033[0m"
 
@@ -142,16 +146,18 @@ class StatusLine:
         self._visible = True
 
     def _get_icon(self) -> str:
-        """Get the current icon/spinner character."""
+        """Get the current icon/spinner character with cyan coloring."""
+        c = self._CYAN
+        r = "\033[0m\033[2m"  # reset to dim (we're inside a dim block)
         if self._state in (self.STREAMING,):
-            return "◉"  # Solid dot for active streaming
+            return f"{c}●{r}"
         if self._state == self.IDLE:
-            return "◯"
+            return f"{c}○{r}"
         if self._state == self.RETRYING:
-            return "⟳"
+            return f"{c}⟳{r}"
         # Animated spinner for all other active states
         self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER)
-        return self._SPINNER[self._spinner_idx]
+        return f"{c}{self._SPINNER[self._spinner_idx]}{r}"
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:

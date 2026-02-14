@@ -359,8 +359,8 @@ class TodoManager:
                     clabel.append(f"  ({child.notes[:60]})", style="dim italic")
                 branch.add(clabel)
 
-        border = "green" if completed == total and total > 0 else "yellow" if in_progress else "blue"
-        return Panel(tree, title="Todo List", border_style=border, padding=(0, 1))
+        border = "green" if completed == total and total > 0 else "yellow" if in_progress else "cyan"
+        return Panel(tree, title="[bold cyan]Todo List[/bold cyan]", border_style=border, padding=(0, 1))
 
     def print_todo_panel(self, console: Optional[Console] = None) -> None:
         """Print the todo panel to the given (or default) console.

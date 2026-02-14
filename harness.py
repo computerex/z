@@ -40,7 +40,9 @@ try:
     from prompt_toolkit.keys import Keys
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.document import Document
     HAS_PROMPT_TOOLKIT = True
     
     class SafeFileHistory(FileHistory):
@@ -307,13 +309,171 @@ def list_sessions(workspace: str) -> list[tuple[str, datetime, int]]:
     return sessions
 
 
-def create_prompt_session(history_file: Path) -> "PromptSession":
+class HarnessCompleter(Completer):
+    """Tab completer for commands, file paths, and history."""
+    
+    COMMANDS = [
+        '/sessions', '/session', '/delete', '/clear', '/save',
+        '/history', '/bg', '/mode', '/ctx', '/tokens', '/compact',
+        '/todo', '/smart', '/dump', '/config', '/iter', '/clip',
+        '/index', '/log', '/help', '/?', '/exit', '/quit', '/q',
+    ]
+    
+    def __init__(self, workspace: Path, history: SafeFileHistory = None):
+        self.workspace = workspace
+        self.history = history
+        self._history_cache = []
+        self._load_history()
+    
+    def _load_history(self):
+        """Load history strings for completion."""
+        if self.history:
+            try:
+                self._history_cache = list(self.history.load_history_strings())
+            except Exception:
+                self._history_cache = []
+    
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        
+        # First, try history completion (if text doesn't start with /)
+        if not text.startswith('/') and text.strip():
+            prefix = text
+            for hist_item in self._history_cache:
+                if hist_item.startswith(prefix) and hist_item != prefix:
+                    yield Completion(
+                        hist_item,
+                        start_position=-len(prefix),
+                        display=hist_item[:40] + '...' if len(hist_item) > 40 else hist_item,
+                    )
+            # Only show history if we have matches, otherwise continue
+            if any(h.startswith(prefix) for h in self._history_cache):
+                return
+        
+        # Complete commands
+        if text.startswith('/'):
+            # Get the partial command
+            parts = text.split()
+            if len(parts) == 1:
+                # Completing the command itself
+                prefix = text
+                for cmd in self.COMMANDS:
+                    if cmd.startswith(prefix):
+                        yield Completion(
+                            cmd,
+                            start_position=-len(prefix),
+                            display=cmd,
+                        )
+            elif parts[0] in ['/session', '/delete']:
+                # Complete session names
+                sessions_dir = self.workspace / ".forge" / "sessions"
+                if sessions_dir.exists():
+                    prefix = parts[-1]
+                    for session_file in sessions_dir.glob("*.json"):
+                        session_name = session_file.stem
+                        if session_name.startswith(prefix):
+                            yield Completion(
+                                session_name,
+                                start_position=-len(prefix),
+                                display=session_name,
+                            )
+            elif parts[0] == '/todo' and len(parts) == 2:
+                # Complete todo subcommands
+                subcommands = ['add', 'done', 'rm', 'clear']
+                prefix = parts[1]
+                for sub in subcommands:
+                    if sub.startswith(prefix):
+                        yield Completion(
+                            sub,
+                            start_position=-len(prefix),
+                            display=sub,
+                        )
+            elif parts[0] == '/mode':
+                # Complete mode names
+                modes = ['fast', 'normal']
+                prefix = parts[-1]
+                for mode in modes:
+                    if mode.startswith(prefix):
+                        yield Completion(
+                            mode,
+                            start_position=-len(prefix),
+                            display=mode,
+                        )
+            elif parts[0] == '/compact':
+                # Complete compact strategies
+                strategies = ['half', 'quarter', 'last2']
+                prefix = parts[-1]
+                for strat in strategies:
+                    if strat.startswith(prefix):
+                        yield Completion(
+                            strat,
+                            start_position=-len(prefix),
+                            display=strat,
+                        )
+            elif parts[0] == '/index':
+                # Complete index subcommands
+                subcommands = ['rebuild', 'tree']
+                prefix = parts[-1]
+                for sub in subcommands:
+                    if sub.startswith(prefix):
+                        yield Completion(
+                            sub,
+                            start_position=-len(prefix),
+                            display=sub,
+                        )
+        else:
+            # Complete file paths
+            # Get the last word (potential file path)
+            words = text.split()
+            if words:
+                last_word = words[-1]
+                # Check if it looks like a file path (contains / or \ or .)
+                if '/' in last_word or '\\' in last_word or '.' in last_word:
+                    # Try to complete as a path
+                    try:
+                        # Handle both Unix and Windows paths
+                        if '\\' in last_word:
+                            # Windows path
+                            parts = last_word.rsplit('\\', 1)
+                            dir_part = parts[0] if len(parts) > 1 else '.'
+                            prefix = parts[1] if len(parts) > 1 else last_word
+                            sep = '\\'
+                        else:
+                            # Unix path or relative
+                            parts = last_word.rsplit('/', 1)
+                            dir_part = parts[0] if len(parts) > 1 else '.'
+                            prefix = parts[1] if len(parts) > 1 else last_word
+                            sep = '/'
+                        
+                        # Resolve directory relative to workspace
+                        try:
+                            search_dir = (self.workspace / dir_part).resolve()
+                        except:
+                            search_dir = Path.cwd()
+                        
+                        if search_dir.exists() and search_dir.is_dir():
+                            for item in sorted(search_dir.iterdir()):
+                                if item.name.startswith(prefix):
+                                    display_name = item.name
+                                    if item.is_dir():
+                                        display_name += sep
+                                    yield Completion(
+                                        item.name,
+                                        start_position=-len(prefix),
+                                        display=display_name,
+                                    )
+                    except Exception:
+                        pass
+
+
+def create_prompt_session(history_file: Path, workspace: Path) -> "PromptSession":
     """Create a prompt session with multiline support.
     
     Keybindings:
     - Enter: Submit input
     - Ctrl+Enter: Insert newline (for multiline input)
     - Paste: Multiline paste works automatically
+    - Tab: Complete commands and file paths
     """
     if not HAS_PROMPT_TOOLKIT:
         return None
@@ -334,11 +494,18 @@ def create_prompt_session(history_file: Path) -> "PromptSession":
     # Create session with history
     history_file.parent.mkdir(parents=True, exist_ok=True)
     
+    # Create history instance first
+    history = SafeFileHistory(str(history_file))
+    
+    # Create completer with history
+    completer = HarnessCompleter(workspace, history)
+    
     return PromptSession(
-        history=SafeFileHistory(str(history_file)),
+        history=history,
         auto_suggest=AutoSuggestFromHistory(),
         key_bindings=bindings,
         multiline=False,  # Enter submits, Ctrl+Enter for newline
+        completer=completer,
     )
 
 
@@ -363,27 +530,9 @@ async def run_single(agent: ClineAgent, user_input: str, console: Console) -> st
     log.info("run_single DONE mode=%s elapsed=%.1fs result_len=%d",
              agent.reasoning_mode, elapsed, len(result or ""))
     
-    # Show final response
-    if result:
-        console.print()
-        console.print(Panel(
-            result,
-            title=f"[bold blue]{mode_tag}[/bold blue] Response",
-            border_style="blue",
-        ))
-    
-    # Show cost and context stats
+    # Show compact status line after response (Forge-style)
     cost = get_global_tracker().get_summary()
     stats = agent.get_context_stats()
-    breakdown = agent.get_token_breakdown()
-    
-    todo_line = ""
-    if stats.get('todos_total', 0) > 0:
-        todo_line = f"\nTodos: {stats['todos_completed']}/{stats['todos_total']} done, {stats['todos_active']} active"
-    
-    eviction_line = ""
-    if stats.get('evictions', 0) > 0:
-        eviction_line = f"\nEvictions: {stats['evictions']} context items evicted"
     
     # Format elapsed time
     if elapsed < 60:
@@ -393,17 +542,19 @@ async def run_single(agent: ClineAgent, user_input: str, console: Console) -> st
         secs = int(elapsed) % 60
         elapsed_str = f"{mins}m{secs:02d}s"
     
-    console.print(Panel(
-        f"API Calls: {cost.total_calls}  |  Elapsed: {elapsed_str}  |  Mode: {agent.reasoning_mode}\n"
-        f"Tokens: {cost.total_input_tokens:,} in / {cost.total_output_tokens:,} out\n"
-        f"Cost: ${cost.total_cost:.4f}\n"
-        f"---------------\n"
-        f"Context: {stats['tokens']:,} tokens ({stats['percent']:.0f}% of {stats['max_allowed']:,} limit)\n"
-        f"System: {breakdown['system']:,}t | Conv: {breakdown['conversation']:,}t | Messages: {stats['messages']}"
-        f"{todo_line}{eviction_line}",
-        title=f"[bold blue]{mode_tag}[/bold blue] Stats",
-        border_style="blue",
-    ))
+    ctx_k = stats['tokens'] // 1000
+    max_k = stats['max_allowed'] // 1000
+    pct = stats['percent']
+    
+    parts = [
+        f"{agent.config.model}",
+        f"ctx: {ctx_k}k/{max_k}k ({pct:.0f}%)",
+        f"{elapsed_str}",
+    ]
+    if cost.total_cost > 0:
+        parts.append(f"${cost.total_cost:.4f}")
+    
+    console.print(f"[dim]{' │ '.join(parts)}[/dim]")
     
     return result or ""
 
@@ -529,26 +680,34 @@ def main():
             cleanup_and_save()
             loop.close()
     else:
-        # Interactive mode
-        console.print("[bold blue]Harness[/bold blue] - [bold]Esc[/bold] interrupt | [bold]Ctrl+B[/bold] background | /help")
-        if HAS_PROMPT_TOOLKIT:
-            console.print("[dim]Ctrl+Enter for newline | Workspace: " + workspace + "[/dim]\n")
-        else:
-            console.print(f"[dim]Workspace: {workspace}[/dim]\n")
+        # Interactive mode — Forge-style startup banner
+        stats = agent.get_context_stats()
+        ws_short = os.path.basename(workspace) or workspace
+        banner_lines = (
+            f"  [dim]Model[/dim]         [bold]{config.model}[/bold]\n"
+            f"  [dim]Context[/dim]       [bold]{stats['max_allowed']:,}[/bold] [dim]tokens[/dim]\n"
+            f"  [dim]Workspace[/dim]     [cyan]{ws_short}[/cyan]\n"
+            f"  [dim]Session[/dim]       {current_session}"
+        )
+        console.print(Panel(
+            banner_lines,
+            title="[bold cyan]Harness[/bold cyan]",
+            subtitle="[dim]coding plan & analysis engine[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
+        console.print("[dim]Type your request, or /help for commands. Esc to interrupt.[/dim]\n")
         
         # Create prompt session for multiline input
         history_file = get_sessions_dir(workspace) / ".history"
-        prompt_session = create_prompt_session(history_file) if HAS_PROMPT_TOOLKIT else None
+        prompt_session = create_prompt_session(history_file, workspace) if HAS_PROMPT_TOOLKIT else None
         
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         
         while True:
             try:
-                # Show token count and reasoning mode in prompt
-                stats = agent.get_context_stats()
-                token_info = f" [{stats['tokens']//1000}k]" if stats['tokens'] > 1000 else ""
-                mode_tag = agent.reasoning_mode
-                prompt_text = f"\x1b[34m[{mode_tag}:{current_session}]{token_info}>\x1b[0m "
+                # Clean prompt — Forge-style
+                prompt_text = f"\x1b[36mharness>\x1b[0m "
                 
                 # Get input (multiline with prompt_toolkit, or simple input)
                 if prompt_session:
