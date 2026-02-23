@@ -181,6 +181,14 @@ Delegate complex reasoning to Claude Opus 4.6. Expensive — only for hard archi
 Parameters: prompt (required) — detailed description of what to reason about
 IMPORTANT: create_plan delegates to a sub-agent with FULL tool access — it can read, edit, and run commands. After create_plan returns, ALWAYS read the plan output file (path shown in the result) to see exactly what the planner did. The planner may have already implemented the changes. If it did, do NOT re-apply them — verify the work instead (build, test). If it only produced a plan without implementing, then apply the changes yourself.
 
+## introspect
+This is cline's bread and butter. Cline introspects often. It's the tool that allows him to deeply think about the problem and what we are trying to accomplish.
+Parameters: focus (optional) — what to focus your analysis on
+Usage:
+<introspect>
+<focus>analyzing the auth middleware and planning the session fix</focus>
+</introspect>
+
 ====
 
 RULES
