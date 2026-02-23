@@ -1285,10 +1285,20 @@ class ClineAgent:
                 full_reasoning = ""
                 _thinking_started = False
                 _thinking_line_start = True
+                _thinking_line_has_text = False
+                _tty = sys.stdout.isatty()
+                _ansi_dim = "\033[2m" if _tty else ""
+                _ansi_italic = "\033[3m" if _tty else ""
+                _ansi_reset = "\033[0m" if _tty else ""
+                _thinking_prefix = f"{_ansi_dim}│ {_ansi_reset}" if _tty else "  "
+                _thinking_header = (
+                    f"{_ansi_dim}{_ansi_italic}Thinking:{_ansi_reset}\n\n"
+                    if _tty else "Thinking:\n\n"
+                )
 
                 def on_reasoning(chunk: str):
                     """Display native reasoning stream (reasoning_content)."""
-                    nonlocal full_reasoning, _thinking_started, _thinking_line_start
+                    nonlocal full_reasoning, _thinking_started, _thinking_line_start, _thinking_line_has_text
                     if not chunk:
                         return
                     full_reasoning += chunk
@@ -1296,17 +1306,26 @@ class ClineAgent:
                         return
                     if not _thinking_started:
                         self.status.clear()
-                        sys.stdout.write("[thinking]\n  > ")
+                        sys.stdout.write(_thinking_header)
                         sys.stdout.flush()
                         _thinking_started = True
-                        _thinking_line_start = False
+                        _thinking_line_start = True
                     for c in chunk:
                         if _thinking_line_start:
-                            sys.stdout.write("  > ")
+                            # Skip leading blank lines so the block starts tight.
+                            if c == "\n" and not _thinking_line_has_text:
+                                continue
+                            sys.stdout.write(_thinking_prefix)
                             _thinking_line_start = False
-                        sys.stdout.write(c)
+                        if _tty and c != "\n":
+                            sys.stdout.write(f"{_ansi_dim}{c}{_ansi_reset}")
+                        else:
+                            sys.stdout.write(c)
+                        if c not in ("\n", "\r", "\t", " "):
+                            _thinking_line_has_text = True
                         if c == "\n":
                             _thinking_line_start = True
+                            _thinking_line_has_text = False
                     sys.stdout.flush()
 
                 # Stream the response - using raw mode (no JSON parsing)
@@ -1332,7 +1351,7 @@ class ClineAgent:
                 if _thinking_started:
                     if not _thinking_line_start:
                         sys.stdout.write("\n")
-                    sys.stdout.write("[/thinking]\n")
+                    sys.stdout.write("\n")
                     sys.stdout.flush()
                 self.status.clear()
                 if _sf_had_visible:

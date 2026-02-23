@@ -1309,10 +1309,11 @@ class TestNoActionRecovery:
             )
 
         rendered = stream.getvalue()
-        assert "[thinking]" in rendered
-        assert "  > first line" in rendered
-        assert "  > second line" in rendered
-        assert "[/thinking]" in rendered
+        assert "Thinking:" in rendered
+        assert "first line" in rendered
+        assert "second line" in rendered
+        assert "[thinking]" not in rendered
+        assert "[/thinking]" not in rendered
 
     def test_no_action_text_accepted_after_one_retry(self, monkeypatch):
         """Plain text (no tool call) should be accepted after 1 retry nudge,
