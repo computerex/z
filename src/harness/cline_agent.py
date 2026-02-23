@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from rich.console import Console
 from rich.markup import escape as rich_escape
+from rich.markdown import Markdown
 
 from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
@@ -1200,6 +1201,7 @@ class ClineAgent:
                 
                 full_content = ""
                 first_token = True
+                _defer_markdown_render = bool(sys.stdout.isatty())
                 
                 # ── XML stream filter ────────────────────────────────────
                 # Suppresses raw XML tool tags from the live terminal while
@@ -1279,6 +1281,8 @@ class ClineAgent:
                     if first_token:
                         self.status.clear()
                         first_token = False
+                    if _defer_markdown_render:
+                        return
                     for c in chunk:
                         _sf_char(c)
 
@@ -1460,6 +1464,13 @@ class ClineAgent:
                 if not tool_call:
                     # No tool call — model produced text. Reset reasoning counters.
                     self._consecutive_low_reasoning = 0
+
+                    # Pretty-render markdown in TTY mode after the full response
+                    # is available (avoids raw streamed markdown clutter).
+                    if _defer_markdown_render:
+                        display_text = strip_thinking_blocks(full_content).strip()
+                        if display_text:
+                            self.console.print(Markdown(display_text))
 
                     # No tool call — final response to user
                     self.messages.append(StreamingMessage(role="assistant", content=full_content))

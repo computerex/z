@@ -46,6 +46,10 @@ COMPACT_MARKER = "\u25c7"  # ◇
 # Maximum characters to embed per message (keeps embedding fast + focused).
 _EMBED_MAX_CHARS = 2000
 
+# Assistant messages above this size get excerpted (start/middle/end) and
+# stored for later retrieval, similar to compacted tool results.
+_LONG_ASSISTANT_COMPACT_CHARS = 3000
+
 
 # ---------------------------------------------------------------------------
 # SemanticScorer — lazy-loaded embedding model for relevance scoring
@@ -1122,6 +1126,38 @@ class SmartContextManager:
             return trace.format_notice(), summary
 
         if msg_type == "assistant_analysis":
+            if len(content) >= _LONG_ASSISTANT_COMPACT_CHARS:
+                result_id = None
+                try:
+                    result_id = self.result_storage.store_result(
+                        tool_name="assistant_response",
+                        content=content,
+                        message_index=message_index
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to store assistant response for retrieval: {e}")
+
+                excerpt = _sample_start_middle_end(content)
+                summary_line = next(
+                    (ln.strip() for ln in lines if ln.strip()),
+                    "long assistant response",
+                )
+                summary = summary_line[:120]
+
+                if result_id:
+                    notice = (
+                        f"[{COMPACT_MARKER} Assistant response (abbreviated): {summary}]\n"
+                        f"Full response stored as {result_id}. Use retrieve_tool_result to access.\n\n"
+                        f"{excerpt}"
+                    )
+                else:
+                    notice = (
+                        f"[{COMPACT_MARKER} Assistant response (abbreviated): {summary}]\n"
+                        f"(Result storage failed - full response not retrievable)\n\n"
+                        f"{excerpt}"
+                    )
+                return notice, summary
+
             # Keep just the first meaningful sentence.
             for line in lines:
                 stripped = line.strip()
@@ -1218,3 +1254,25 @@ def _normalize_path(path: str) -> str:
     # Strip trailing slashes
     p = p.rstrip("/")
     return p
+
+
+def _sample_start_middle_end(content: str, chunk_chars: int = 450) -> str:
+    """Build an abbreviated view using start/middle/end excerpts."""
+    text = content.strip()
+    if len(text) <= chunk_chars * 3 + 40:
+        return text
+
+    n = len(text)
+    start = text[:chunk_chars].rstrip()
+    mid_start = max(0, (n // 2) - (chunk_chars // 2))
+    middle = text[mid_start: mid_start + chunk_chars].strip()
+    end = text[-chunk_chars:].lstrip()
+
+    return (
+        "[Start excerpt]\n"
+        f"{start}\n\n"
+        "[Middle excerpt]\n"
+        f"{middle}\n\n"
+        "[End excerpt]\n"
+        f"{end}"
+    )
