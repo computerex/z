@@ -332,7 +332,7 @@ class ClineAgent:
         self,
         config: Config,
         console: Optional[Console] = None,
-        max_iterations: int = 30,
+        max_iterations: int = 500,
         providers: Optional[Dict[str, dict]] = None,
         claude_cli_config: Optional[dict] = None,
     ):
@@ -375,11 +375,6 @@ class ClineAgent:
         
         # Reasoning quality tracking
         self._consecutive_low_reasoning = 0
-
-        # Budget forcing: force deeper thinking when <thinking> blocks are too shallow
-        self._budget_force_count = 0
-        self._BUDGET_FORCE_MAX = 3         # max continuations per response
-        self._BUDGET_THINKING_MIN = 800    # min chars for a "real" thinking block
         
         # Introspect tool tracking: gentle nudge system (non-adversarial)
         # Instead of forcing thinking, we suggest using the introspect tool
@@ -395,7 +390,8 @@ class ClineAgent:
             console=self.console,
             workspace_path=self.workspace_path,
             context=self.context,
-            duplicate_detector=self._duplicate_detector
+            duplicate_detector=self._duplicate_detector,
+            context_manager=self.smart_context
         )
         # Set claude model for create_plan tool
         self.tool_handlers._claude_model = self.claude_cli_config.get("model")
@@ -1430,34 +1426,6 @@ class ClineAgent:
                 else:
                     log.debug("No tool call parsed from response (len=%d)", len(full_content))
                 
-                # Budget forcing: if the model produced a <thinking> block but
-                # it's too shallow, strip the tool call and force it to keep
-                # thinking by appending "Wait, " as a continuation prompt.
-                # (This actually works because it modifies the assistant output.)
-                if tool_call and self._budget_force_count < self._BUDGET_FORCE_MAX:
-                    thinking_match = re.search(r'<thinking>(.*?)</thinking>', full_content, re.DOTALL)
-                    if thinking_match:
-                        thinking_text = thinking_match.group(1).strip()
-                        if len(thinking_text) < self._BUDGET_THINKING_MIN:
-                            self._budget_force_count += 1
-                            truncated = full_content[:thinking_match.start()]
-                            truncated += f"<thinking>\n{thinking_text}\nWait, "
-                            self.console.print(f"[dim][!] Thinking too brief ({len(thinking_text)} chars) — budget forcing ({self._budget_force_count}/{self._BUDGET_FORCE_MAX})[/dim]")
-                            log.info("Budget forcing: thinking=%d chars, attempt=%d/%d",
-                                     len(thinking_text), self._budget_force_count, self._BUDGET_FORCE_MAX)
-                            self.messages.append(StreamingMessage(role="assistant", content=truncated))
-                            self.messages.append(StreamingMessage(
-                                role="user",
-                                content=(
-                                    "[SYSTEM: Your thinking was too brief. Keep going — trace through the technical details, "
-                                    "explore alternatives, question assumptions. "
-                                    "Longer reasoning = better outcomes. Then proceed with your tool call.]"
-                                ),
-                            ))
-                            continue
-                    # Thinking was sufficient or no thinking block — reset counter
-                    self._budget_force_count = 0
-
                 # Debug output - save full content for analysis
                 if os.environ.get("HARNESS_DEBUG"):
                     debug_file = os.path.join(self.workspace_path, ".harness_debug.txt")
