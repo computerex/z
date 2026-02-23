@@ -25,7 +25,6 @@ TOOL_USE_INDICATORS = [
     "> Listing:",      # list_files
     "> Searching:",    # search_files
     "> Todo:",         # manage_todos
-    "> Task complete", # attempt_completion
     "> Web Search:",   # web_search
     "> Analyzing",     # analyze_image
     "[read_file result]",      # tool result in conversation

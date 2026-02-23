@@ -289,6 +289,7 @@ class StreamingJSONClient:
         self,
         messages: List[StreamingMessage],
         on_content: Optional[Callable[[str], None]] = None,
+        on_reasoning: Optional[Callable[[str], None]] = None,
         max_retries: int = 5,
         check_interrupt: Optional[Callable[[], bool]] = None,
         enable_web_search: bool = False,
@@ -317,6 +318,14 @@ class StreamingJSONClient:
             "stream_options": {"include_usage": True},
         }
         
+        # ZAI native reasoning stream (Claude/Cursor-like visible thinking).
+        # Safe no-op for providers that ignore unknown fields.
+        if ("z.ai" in self.base_url.lower()
+                and os.environ.get("HARNESS_ENABLE_NATIVE_THINKING", "1") != "0"):
+            payload["thinking"] = {"type": "enabled"}
+            payload["tool_stream"] = True
+            payload["clear_thinking"] = False
+        
         # Add built-in web search tool if enabled
         if enable_web_search:
             payload["tools"] = [{
@@ -336,6 +345,7 @@ class StreamingJSONClient:
         for attempt in range(max_retries + 1):
             try:
                 full_content = ""
+                full_reasoning = ""
                 usage = {}
                 finish_reason = "stop"
                 interrupted = False
@@ -416,9 +426,15 @@ class StreamingJSONClient:
                             choice = choices[0]
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
+                            reasoning = delta.get("reasoning_content", "")
                             
                             if choice.get("finish_reason"):
                                 finish_reason = choice["finish_reason"]
+                            
+                            if reasoning:
+                                full_reasoning += reasoning
+                                if on_reasoning:
+                                    on_reasoning(reasoning)
                             
                             if content:
                                 full_content += content
@@ -450,11 +466,12 @@ class StreamingJSONClient:
                 
                 _req_elapsed = time.time() - _req_t0
                 _log.info("chat_stream_raw complete: finish=%s interrupted=%s "
-                          "content_len=%d elapsed=%.1fs usage=%s",
+                          "content_len=%d reasoning_len=%d elapsed=%.1fs usage=%s",
                           finish_reason, interrupted, len(full_content),
-                          _req_elapsed, usage)
+                          len(full_reasoning), _req_elapsed, usage)
                 return StreamingChatResponse(
                     content=full_content,
+                    thinking=full_reasoning or None,
                     raw_json=full_content,
                     usage=usage,
                     finish_reason=finish_reason,

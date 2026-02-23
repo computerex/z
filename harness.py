@@ -983,7 +983,7 @@ def main():
                             sys_content = agent.messages[0].content
                             expected_tools = [
                                 'read_file', 'write_to_file', 'replace_in_file',
-                                'execute_command', 'manage_todos', 'attempt_completion',
+                                'execute_command', 'manage_todos',
                                 'set_reasoning_mode', 'create_plan',
                             ]
                             tools_present = [t for t in expected_tools if t in sys_content]

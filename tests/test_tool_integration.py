@@ -9,6 +9,8 @@ and executes it. This is the critical gap that unit tests miss.
 """
 
 import asyncio
+import contextlib
+import io
 import sys
 import os
 import json
@@ -23,6 +25,7 @@ from harness.cline_agent import parse_xml_tool, parse_all_xml_tools, ParsedToolC
 from harness.config import Config
 from harness.todo_manager import TodoManager, TodoStatus
 from harness.smart_context import SmartContextManager
+from harness.streaming_client import StreamingChatResponse
 
 
 # ============================================================
@@ -152,18 +155,6 @@ class TestParseXmlTool:
         assert result.name == "web_search"
         assert result.parameters["query"] == "Python 3.12 asyncio changes"
         assert result.parameters["count"] == "5"
-
-    def test_parse_attempt_completion(self):
-        content = """<attempt_completion>
-<result>
-The authentication bug has been fixed. The null check now prevents
-the crash when tokens expire during refresh.
-</result>
-</attempt_completion>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "attempt_completion"
-        assert "authentication bug" in result.parameters["result"]
 
     def test_parse_list_context(self):
         content = """Let me check what's in my context.
@@ -620,6 +611,17 @@ class TestToolDispatch:
         result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
         assert "Already" in result
 
+    def test_dispatch_execute_command_missing_command_param(self):
+        """Malformed execute_command without <command> should be rejected."""
+        agent = self._make_agent()
+        tool = ParsedToolCall(
+            name="execute_command",
+            parameters={},
+        )
+        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
+        assert "Error: malformed <execute_command> call" in result
+        assert "missing required parameter(s): command" in result
+
 
 # ============================================================
 # End-to-End Mock Tests — Simulate full model output → parse → execute
@@ -896,7 +898,7 @@ class TestPromptIntegration:
             "read_file", "write_to_file", "replace_in_file",
             "execute_command", "list_files", "search_files",
             "web_search", "list_context", "remove_from_context",
-            "manage_todos", "attempt_completion",
+            "manage_todos",
             "set_reasoning_mode", "create_plan",
         ]
         for tool in required_tools:
@@ -924,7 +926,7 @@ class TestPromptIntegration:
             'check_background_process', 'stop_background_process', 
             'list_background_processes',
             'list_context', 'remove_from_context', 'analyze_image', 
-            'web_search', 'manage_todos', 'attempt_completion',
+            'web_search', 'manage_todos',
             'set_reasoning_mode', 'create_plan', 'update_agent_rules',
         }
         
@@ -1143,6 +1145,314 @@ Design a migration plan that:
         assert result.name == "create_plan"
         assert "refactor" in result.parameters["prompt"]
         assert "breaking changes" in result.parameters["prompt"]
+
+
+class TestMalformedToolIntentDetection:
+    """Ensure malformed function-style XML is recognized for recovery."""
+
+    def test_detects_invoke_function_name_parameter_style(self):
+        content = """<thinking>
+Need to run a command.
+</thinking>
+<invoke>
+<function_name>execute_command</function_name>
+<parameter name="command">dir /s /b gcCoreAPI.h</parameter>
+</invoke>"""
+        assert ClineAgent._looks_like_malformed_tool_intent(content) is True
+
+    def test_ignores_normal_text(self):
+        content = "I'll inspect the project and then report findings."
+        assert ClineAgent._looks_like_malformed_tool_intent(content) is False
+
+
+class TestNoActionRecovery:
+    """Ensure no-action assistant text does not terminate the loop immediately."""
+
+    def test_run_loop_retries_once_then_accepts_text(self, monkeypatch):
+        """When the model outputs text without a tool call, nudge it once
+        then accept the response (default retry max = 1)."""
+        responses = [
+            StreamingChatResponse(content="I'll first think through the approach."),
+            StreamingChatResponse(content="Still analyzing before any action."),
+        ]
+        state = {"calls": 0}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def chat_stream_raw(
+                self,
+                messages,
+                on_content=None,
+                on_reasoning=None,
+                check_interrupt=None,
+                enable_web_search=False,
+                status_line=None,
+            ):
+                idx = state["calls"]
+                state["calls"] += 1
+                resp = responses[idx]
+                if on_content and resp.content:
+                    on_content(resp.content)
+                return resp
+
+        monkeypatch.setattr("harness.cline_agent.StreamingJSONClient", _FakeClient)
+
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=5)
+        result = asyncio.get_event_loop().run_until_complete(
+            agent.run("Build the project and report blockers", enable_interrupt=False)
+        )
+
+        assert state["calls"] == 2, (
+            f"Expected 1 retry (2 calls), got {state['calls']}"
+        )
+        assert "analyzing" in result.lower()
+
+    def test_whitespace_reasoning_does_not_render_empty_thinking_block(self, monkeypatch):
+        responses = [
+            StreamingChatResponse(content="No actionable tool yet."),
+        ]
+        state = {"calls": 0}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def chat_stream_raw(
+                self,
+                messages,
+                on_content=None,
+                on_reasoning=None,
+                check_interrupt=None,
+                enable_web_search=False,
+                status_line=None,
+            ):
+                state["calls"] += 1
+                if on_reasoning:
+                    on_reasoning("   \n")
+                resp = responses[0]
+                if on_content and resp.content:
+                    on_content(resp.content)
+                return resp
+
+        monkeypatch.setattr("harness.cline_agent.StreamingJSONClient", _FakeClient)
+
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=1)
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            result = asyncio.get_event_loop().run_until_complete(
+                agent.run("Build and diagnose", enable_interrupt=False)
+            )
+
+        rendered = stream.getvalue()
+        assert state["calls"] == 1
+        assert result == "Max iterations reached."
+        assert "<thinking>" not in rendered
+        assert "</thinking>" not in rendered
+
+    def test_reasoning_stream_is_pretty_printed(self, monkeypatch):
+        responses = [
+            StreamingChatResponse(content="No tool yet."),
+        ]
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def chat_stream_raw(
+                self,
+                messages,
+                on_content=None,
+                on_reasoning=None,
+                check_interrupt=None,
+                enable_web_search=False,
+                status_line=None,
+            ):
+                if on_reasoning:
+                    on_reasoning("first line\nsecond line")
+                resp = responses[0]
+                if on_content and resp.content:
+                    on_content(resp.content)
+                return resp
+
+        monkeypatch.setattr("harness.cline_agent.StreamingJSONClient", _FakeClient)
+
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=1)
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            asyncio.get_event_loop().run_until_complete(
+                agent.run("Build and diagnose", enable_interrupt=False)
+            )
+
+        rendered = stream.getvalue()
+        assert "[thinking]" in rendered
+        assert "  > first line" in rendered
+        assert "  > second line" in rendered
+        assert "[/thinking]" in rendered
+
+    def test_no_action_text_accepted_after_one_retry(self, monkeypatch):
+        """Plain text (no tool call) should be accepted after 1 retry nudge,
+        not burn 4 API calls."""
+        state = {"calls": 0}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def chat_stream_raw(
+                self,
+                messages,
+                on_content=None,
+                on_reasoning=None,
+                check_interrupt=None,
+                enable_web_search=False,
+                status_line=None,
+            ):
+                state["calls"] += 1
+                if on_content:
+                    on_content(
+                        "Task completed! I fixed the auth middleware "
+                        "and added session validation."
+                    )
+                return StreamingChatResponse(
+                    content="Task completed! I fixed the auth middleware "
+                    "and added session validation."
+                )
+
+        monkeypatch.setattr("harness.cline_agent.StreamingJSONClient", _FakeClient)
+
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=5)
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            result = asyncio.get_event_loop().run_until_complete(
+                agent.run("Fix the auth bug", enable_interrupt=False)
+            )
+
+        assert state["calls"] == 2, (
+            f"Expected 1 retry (2 calls total), got {state['calls']}"
+        )
+        assert "auth middleware" in result
+
+    def test_response_extracted_from_reasoning_after_thinking_tag(self, monkeypatch):
+        """When the model puts its response after </thinking> in the reasoning
+        stream and content is empty, extract it as content."""
+        state = {"calls": 0}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def chat_stream_raw(
+                self,
+                messages,
+                on_content=None,
+                on_reasoning=None,
+                check_interrupt=None,
+                enable_web_search=False,
+                status_line=None,
+            ):
+                state["calls"] += 1
+                if on_reasoning:
+                    on_reasoning(
+                        "Let me analyze the situation.\n"
+                        "</thinking>\n\n"
+                        "The wakeword models are tiny (2-50 KB each), "
+                        "but Git LFS is uploading ALL model files. "
+                        "This is a one-time upload and future pushes "
+                        "will be much faster."
+                    )
+                # Content stream is empty — model put response in reasoning
+                return StreamingChatResponse(
+                    content="",
+                    thinking=(
+                        "Let me analyze the situation.\n"
+                        "</thinking>\n\n"
+                        "The wakeword models are tiny (2-50 KB each), "
+                        "but Git LFS is uploading ALL model files. "
+                        "This is a one-time upload and future pushes "
+                        "will be much faster."
+                    ),
+                )
+
+        monkeypatch.setattr("harness.cline_agent.StreamingJSONClient", _FakeClient)
+
+        config = Config(api_url="http://test.invalid", api_key="k", model="m")
+        agent = ClineAgent(config=config, max_iterations=3)
+
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            result = asyncio.get_event_loop().run_until_complete(
+                agent.run("Why is git LFS slow?", enable_interrupt=False)
+            )
+
+        assert state["calls"] <= 2, (
+            f"Should extract response from reasoning, not retry {state['calls']} times"
+        )
+        assert "wakeword" in result.lower() or "LFS" in result
+
+    def test_split_response_from_reasoning_static(self):
+        """Unit test for _split_response_from_reasoning."""
+        split = ClineAgent._split_response_from_reasoning
+
+        # Response after </thinking>
+        content, reasoning = split(
+            "Internal analysis here.\n</thinking>\n\nHere is the answer to your question about the build system.",
+            "",
+        )
+        assert "answer to your question" in content
+        assert "</thinking>" not in reasoning
+
+        # No marker — returns original
+        content, reasoning = split(
+            "Just internal thoughts, no response here.",
+            "original",
+        )
+        assert content == "original"
+
+        # Short text after marker — ignored
+        content, reasoning = split(
+            "Thinking.\n</thinking>\nOK",
+            "original",
+        )
+        assert content == "original"
 
 
 class TestCreatePlanContext:

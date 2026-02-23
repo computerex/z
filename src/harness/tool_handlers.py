@@ -1,6 +1,7 @@
 """Tool handlers for ClineAgent - manages all tool execution logic."""
 
 import asyncio
+import base64
 import os
 import platform
 import re
@@ -657,6 +658,8 @@ class ToolHandlers:
         command = params.get("command", "")
         background = params.get("background", "").lower() == "true"
         timeout_secs = 120  # Auto-background after this many seconds
+        if not command.strip():
+            return "Error: execute_command requires a non-empty <command> parameter."
         log.info("execute_command: cmd=%s bg=%s", log_truncate(command, 200), background)
         
         # Show command being executed
@@ -680,7 +683,7 @@ class ToolHandlers:
         # NOTE: create_subprocess_shell already invokes the platform shell
         # (cmd.exe on Windows, /bin/sh on Unix), so we must NOT wrap with
         # an extra "cmd /c" — that breaks commands containing double quotes.
-        wrapped = f'{command} > "{cmd_log_path}" 2>&1'
+        wrapped = self._wrap_shell_command(command, cmd_log_path)
 
         proc = await asyncio.create_subprocess_shell(
             wrapped,
@@ -796,6 +799,26 @@ class ToolHandlers:
     
     # Maximum lines to show live before collapsing (show first N, then summarize)
     _MAX_LIVE_DISPLAY = 10
+
+    def _wrap_shell_command(self, command: str, log_path: str) -> str:
+        """Build platform shell wrapper for a command with file redirection.
+        
+        On Windows, default to PowerShell execution for deterministic behavior
+        with PowerShell syntax (the system prompt advertises PowerShell).
+        Set HARNESS_WINDOWS_SHELL=cmd to force legacy cmd.exe behavior.
+        """
+        if platform.system() == "Windows":
+            win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
+            if win_shell != "cmd":
+                # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
+                encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
+                launcher = (
+                    "powershell -NoProfile -NonInteractive "
+                    "-ExecutionPolicy Bypass "
+                    f"-EncodedCommand {encoded}"
+                )
+                return f'{launcher} > "{log_path}" 2>&1'
+        return f'{command} > "{log_path}" 2>&1'
 
     def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:
         """Read new content from a log file starting at file_pos.
@@ -1012,6 +1035,8 @@ class ToolHandlers:
     async def _run_background_command(self, command: str) -> str:
         """Run a command in background with output redirected to a log file."""
         log.info("_run_background_command: cmd=%s", log_truncate(command, 120))
+        if not command.strip():
+            return "Error: execute_command requires a non-empty <command> parameter."
         
         proc_id = self._next_bg_id
         self._next_bg_id += 1
@@ -1021,7 +1046,7 @@ class ToolHandlers:
         Path(log_path).write_text("", encoding="utf-8")
 
         # Shell-level redirect to log file (no cmd /c wrapper — see execute_command)
-        wrapped = f'{command} > "{log_path}" 2>&1'
+        wrapped = self._wrap_shell_command(command, log_path)
         
         proc = await asyncio.create_subprocess_shell(
             wrapped,

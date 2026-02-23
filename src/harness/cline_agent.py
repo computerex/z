@@ -869,8 +869,6 @@ class ClineAgent:
                     last_action = "executing commands"
                 elif "<search_files>" in text:
                     last_action = "searching code"
-                elif "<attempt_completion>" in text:
-                    last_action = "completing the task"
                 else:
                     last_action = "responding"
                 break
@@ -1011,7 +1009,6 @@ class ClineAgent:
                 "has_execute_command": "execute_command" in sys_content,
                 "has_replace_in_file": "replace_in_file" in sys_content,
                 "has_manage_todos": "manage_todos" in sys_content,
-                "has_attempt_completion": "attempt_completion" in sys_content,
                 "has_TOOL_USE_section": "TOOL USE" in sys_content,
                 "has_RULES_section": "RULES" in sys_content,
                 "first_200": sys_content[:200],
@@ -1288,7 +1285,34 @@ class ClineAgent:
                         first_token = False
                     for c in chunk:
                         _sf_char(c)
-                
+
+                full_reasoning = ""
+                _thinking_started = False
+                _thinking_line_start = True
+
+                def on_reasoning(chunk: str):
+                    """Display native reasoning stream (reasoning_content)."""
+                    nonlocal full_reasoning, _thinking_started, _thinking_line_start
+                    if not chunk:
+                        return
+                    full_reasoning += chunk
+                    if not _thinking_started and not chunk.strip():
+                        return
+                    if not _thinking_started:
+                        self.status.clear()
+                        sys.stdout.write("[thinking]\n  > ")
+                        sys.stdout.flush()
+                        _thinking_started = True
+                        _thinking_line_start = False
+                    for c in chunk:
+                        if _thinking_line_start:
+                            sys.stdout.write("  > ")
+                            _thinking_line_start = False
+                        sys.stdout.write(c)
+                        if c == "\n":
+                            _thinking_line_start = True
+                    sys.stdout.flush()
+
                 # Stream the response - using raw mode (no JSON parsing)
                 # Web search disabled by default to avoid unnecessary searches
                 # Use /search command for explicit web searches
@@ -1298,16 +1322,22 @@ class ClineAgent:
                 response = await client.chat_stream_raw(
                     messages=self.messages,
                     on_content=on_chunk,
+                    on_reasoning=on_reasoning,
                     check_interrupt=is_interrupted,
                     enable_web_search=False,
                     status_line=self.status,
                 )
                 api_elapsed = time.time() - api_t0
-                log.info("API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d",
+                log.info("API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d reasoning_len=%d",
                          response.finish_reason, response.interrupted, api_elapsed,
-                         len(full_content))
-                
+                         len(full_content), len(full_reasoning))
+
                 _sf_flush()  # Flush any trailing buffered content
+                if _thinking_started:
+                    if not _thinking_line_start:
+                        sys.stdout.write("\n")
+                    sys.stdout.write("[/thinking]\n")
+                    sys.stdout.flush()
                 self.status.clear()
                 if _sf_had_visible:
                     print()  # Newline after visible stream content
@@ -1331,7 +1361,12 @@ class ClineAgent:
                     return "[Interrupted - press Enter to continue or type new request]"
                 
                 full_content = response.content or full_content
-                
+                full_reasoning = response.thinking or full_reasoning
+
+                # Wrap reasoning into full_content so the pipeline can see it
+                if full_reasoning.strip():
+                    full_content = f"<thinking>\n{full_reasoning}\n</thinking>\n{full_content}"
+
                 # Track usage - estimate if API didn't return it
                 if response.usage:
                     input_tokens = response.usage.get("prompt_tokens", 0)
@@ -1439,14 +1474,6 @@ class ClineAgent:
                     # No tool call — model produced text. Reset reasoning counters.
                     self._consecutive_low_reasoning = 0
 
-                    # Check for attempt_completion
-                    if "<attempt_completion>" in full_content:
-                        # Extract result
-                        match = re.search(r'<result>(.*?)</result>', full_content, re.DOTALL)
-                        result = match.group(1).strip() if match else full_content
-                        self.messages.append(StreamingMessage(role="assistant", content=full_content))
-                        return result
-
                     # No tool call — final response to user
                     self.messages.append(StreamingMessage(role="assistant", content=full_content))
                     return full_content
@@ -1500,7 +1527,7 @@ class ClineAgent:
                 tool_result = "\n\n".join(tool_results_combined)
 
                 # Track reasoning quality (lightweight — feeds into nudge)
-                _exempt_tools = {'manage_todos', 'attempt_completion', 'list_context', 'introspect'}
+                _exempt_tools = {'manage_todos', 'list_context', 'introspect'}
                 _first_checkable = next(
                     (tc for tc in all_tool_calls if tc.name not in _exempt_tools),
                     None,
@@ -1802,10 +1829,6 @@ class ClineAgent:
             elif tool.name == "introspect":
                 focus = tool.parameters.get("focus", "")
                 result = await self._execute_introspect(focus)
-                
-            elif tool.name == "attempt_completion":
-                self.console.print("  [dim]•[/dim] [green]Task complete[/green]")
-                result = "Task completed."
                 
             else:
                 result = f"Unknown tool: {tool.name}"

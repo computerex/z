@@ -92,8 +92,6 @@ TOOL_DEFS: List[ToolDef] = [
                     ToolParam("description"), ToolParam("status"),
                     ToolParam("parent_id"), ToolParam("notes"),
                     ToolParam("context_refs")]),
-    ToolDef("attempt_completion", category="agent",
-            params=[ToolParam("result", required=True)]),
     ToolDef("set_reasoning_mode", category="agent",
             params=[ToolParam("mode", required=True)]),
     ToolDef("create_plan",        category="agent",
@@ -128,6 +126,11 @@ def get_param_names() -> set:
 def get_complex_content_tools() -> set:
     """Return tool names that may contain nested XML in their content."""
     return COMPLEX_CONTENT_TOOLS
+
+
+def get_tool_def(name: str) -> Optional[ToolDef]:
+    """Return tool definition by name, or None if unknown."""
+    return TOOL_BY_NAME.get(name)
 
 
 # ── Observability: ToolMetrics ───────────────────────────────────
