@@ -265,6 +265,190 @@ class CompactionTrace:
 
 
 # ---------------------------------------------------------------------------
+# Tool result storage — for retrieving compacted tool results
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StoredToolResult:
+    """A stored tool result that can be retrieved after compaction."""
+    result_id: str
+    tool_name: str
+    original_content: str
+    timestamp: float
+    message_index: int
+    tokens: int
+
+
+class ToolResultStorage:
+    """Storage for tool results that have been compacted.
+    
+    Allows the agent to retrieve full tool results after they've been
+    abbreviated in the conversation context.
+    """
+    
+    # Maximum total bytes to store (100MB)
+    MAX_TOTAL_BYTES = 100 * 1024 * 1024
+    
+    # Maximum age for results (1 hour)
+    MAX_AGE_SECONDS = 3600
+    
+    def __init__(self, max_results: int = 100):
+        self._results: Dict[str, StoredToolResult] = {}
+        self._max_results = max_results
+        self._access_order: List[str] = []  # For LRU eviction
+        self._total_bytes = 0  # Track total bytes stored
+        self._counter = 0  # For unique result IDs
+    
+    def _evict_if_needed(self) -> None:
+        """Evict old results if we exceed limits."""
+        # Evict by count
+        while len(self._results) > self._max_results:
+            if not self._access_order:
+                break
+            rid = self._access_order.pop(0)
+            result = self._results.pop(rid, None)
+            if result:
+                self._total_bytes -= len(result.original_content.encode("utf-8", errors="replace"))
+        
+        # Evict by size
+        while self._total_bytes > self.MAX_TOTAL_BYTES and self._access_order:
+            rid = self._access_order.pop(0)
+            result = self._results.pop(rid, None)
+            if result:
+                self._total_bytes -= len(result.original_content.encode("utf-8", errors="replace"))
+    
+    def _cleanup_old_results(self) -> int:
+        """Clean up results older than MAX_AGE_SECONDS."""
+        now = time.time()
+        to_remove = [
+            rid for rid, result in self._results.items()
+            if now - result.timestamp > self.MAX_AGE_SECONDS
+        ]
+        if not to_remove:
+            return 0
+        
+        # Use set for O(1) lookup instead of O(n) list.remove()
+        to_remove_set = set(to_remove)
+        
+        # Filter access_order in O(n) instead of O(n²)
+        self._access_order = [rid for rid in self._access_order if rid not in to_remove_set]
+        
+        # Remove from results dict and update byte count
+        for rid in to_remove:
+            result = self._results.pop(rid, None)
+            if result:
+                self._total_bytes -= len(result.original_content.encode("utf-8", errors="replace"))
+        
+        return len(to_remove)
+    
+    def store_result(
+        self,
+        tool_name: str,
+        content: str,
+        message_index: int = -1
+    ) -> str:
+        """Store a tool result and return its result_id.
+        
+        Args:
+            tool_name: Name of the tool that produced this result
+            content: Full content of the tool result
+            message_index: Index of the message in the conversation (optional, not used after compaction)
+            
+        Returns:
+            result_id: Unique identifier for this stored result
+        """
+        # Validate content size
+        content_bytes = len(content.encode("utf-8", errors="replace"))
+        if content_bytes > 10 * 1024 * 1024:  # 10MB limit per result
+            raise ValueError(f"Tool result too large to store: {content_bytes:,} bytes")
+        
+        # Generate a unique result ID with counter to prevent collisions
+        content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:8]
+        self._counter += 1
+        result_id = f"res_{content_hash}_{self._counter}"
+        
+        result = StoredToolResult(
+            result_id=result_id,
+            tool_name=tool_name,
+            original_content=content,
+            timestamp=time.time(),
+            message_index=message_index,
+            tokens=estimate_tokens(content)
+        )
+        
+        self._results[result_id] = result
+        self._access_order.append(result_id)
+        self._total_bytes += content_bytes
+        
+        # Clean up old results and evict if needed
+        self._cleanup_old_results()
+        self._evict_if_needed()
+        
+        return result_id
+    
+    def get_result(self, result_id: str) -> Optional[StoredToolResult]:
+        """Retrieve a stored tool result by ID.
+        
+        Args:
+            result_id: The ID of the stored result (format: res_<hash>_<counter>)
+            
+        Returns:
+            StoredToolResult if found, None otherwise
+        """
+        # Validate result_id format to prevent security issues
+        if not result_id or not isinstance(result_id, str):
+            return None
+        # Expected format: res_<8_hex_chars>_<counter>
+        if not re.match(r'^res_[a-f0-9]{8}_\d+$', result_id):
+            return None
+        
+        result = self._results.get(result_id)
+        if result:
+            # Update access order for LRU
+            if result_id in self._access_order:
+                self._access_order.remove(result_id)
+            self._access_order.append(result_id)
+        return result
+    
+    def list_results(self, tool_name: Optional[str] = None) -> List[StoredToolResult]:
+        """List all stored results, optionally filtered by tool name.
+        
+        Args:
+            tool_name: If provided, only return results from this tool
+            
+        Returns:
+            List of stored results, ordered by most recently accessed
+        """
+        results = list(self._results.values())
+        if tool_name:
+            results = [r for r in results if r.tool_name == tool_name]
+        # Sort by access order (most recent first)
+        result_order = {rid: i for i, rid in enumerate(reversed(self._access_order))}
+        results.sort(key=lambda r: result_order.get(r.result_id, float('inf')))
+        return results
+    
+    def clear_old_results(self, max_age_seconds: float = 3600) -> int:
+        """Clear results older than max_age_seconds.
+        
+        Args:
+            max_age_seconds: Maximum age in seconds (default: 1 hour)
+            
+        Returns:
+            Number of results cleared
+        """
+        now = time.time()
+        to_remove = [
+            rid for rid, result in self._results.items()
+            if now - result.timestamp > max_age_seconds
+        ]
+        for rid in to_remove:
+            self._results.pop(rid, None)
+            if rid in self._access_order:
+                self._access_order.remove(rid)
+        return len(to_remove)
+
+
+# ---------------------------------------------------------------------------
 # SmartContextManager
 # ---------------------------------------------------------------------------
 
@@ -293,6 +477,9 @@ class SmartContextManager:
         self.compaction_traces: List[CompactionTrace] = []
         self._max_traces = 50
         self._scorer = SemanticScorer.get()
+        
+        # Storage for tool results that have been compacted
+        self.result_storage = ToolResultStorage(max_results=100)
 
         # Budget: target this fraction of max_tokens after compaction.
         # E.g. 0.75 means we try to get context down to 75% of the hard
@@ -376,7 +563,7 @@ class SmartContextManager:
             content = _get_content(msg)
             old_tokens = estimate_tokens(content)
 
-            notice, summary = self._compact_message(content, msg_type, source)
+            notice, summary = self._compact_message(content, msg_type, source, index)
             new_tokens = estimate_tokens(notice)
             freed = old_tokens - new_tokens
             if freed <= 0:
@@ -733,18 +920,28 @@ class SmartContextManager:
         )
 
         # --- 2. Regeneration cost (how easy to get this content back?) ---
+        # Increased costs for tool results to prevent aggressive spilling of recent work
         regen_costs = {
-            "file_read":          0.2,   # just re-read the file
-            "command_output":     0.10,  # cheap — re-run or read spill file
-            "search_result":      0.15,  # re-search is easy
+            "file_read":          0.3,   # re-read the file
+            "command_output":     0.5,   # may contain important output, harder to reproduce
+            "search_result":      0.45,  # search results are valuable, harder to re-run
             "assistant_analysis": 0.6,   # expensive — reasoning is non-deterministic
             "assistant_tool_call":0.5,   # contains action context
             "todo_result":        0.05,  # trivially regenerated
             "context_result":     0.05,  # trivially regenerated
-            "other_tool_result":  0.25,
+            "other_tool_result":  0.4,
             "other":              0.4,
         }
         regen_cost = regen_costs.get(msg_type, 0.4)
+        
+        # --- 2.5: Fresh tool result protection ---
+        # Don't compact very recent tool results (last 2 messages)
+        # These are likely still being actively used by the model
+        if msg_type in ("command_output", "search_result", "other_tool_result"):
+            # If this is one of the last 2 non-protected messages, boost its score significantly
+            messages_from_end = total - index
+            if messages_from_end <= 2 and index > max(PROTECTED_INDICES):
+                regen_cost = min(1.0, regen_cost + 0.4)  # Boost to protect recent results
 
         # --- 3. Size pressure: larger messages are better targets ---
         size_pressure = min(0.15, tokens / 20_000)
@@ -813,9 +1010,15 @@ class SmartContextManager:
     # ------------------------------------------------------------------
 
     def _compact_message(
-        self, content: str, msg_type: str, source: str,
+        self, content: str, msg_type: str, source: str, message_index: int = -1,
     ) -> Tuple[str, str]:
         """Create a compact replacement.
+
+        Args:
+            content: The original message content
+            msg_type: Type of message (command_output, search_result, etc.)
+            source: Source identifier (file path, command, etc.)
+            message_index: Index of the message in the conversation (for result storage)
 
         Returns ``(notice_text, one_line_summary)``.
         """
@@ -838,16 +1041,58 @@ class SmartContextManager:
                     summary += f" … {sig[-1][:40]}"
             else:
                 summary = f"{line_count} lines of output"
-            trace = CompactionTrace("command_output", source, summary)
-            return trace.format_notice(), summary
+            
+            # Store full result before compacting (with error handling)
+            result_id = None
+            try:
+                result_id = self.result_storage.store_result(
+                    tool_name="execute_command",
+                    content=content,
+                    message_index=message_index
+                )
+            except Exception as e:
+                log.warning(f"Failed to store command output for retrieval: {e}")
+            
+            if result_id:
+                notice = (
+                    f"[{COMPACT_MARKER} Command output: {summary}]\n"
+                    f"Full result stored as {result_id}. Use retrieve_tool_result to access."
+                )
+            else:
+                notice = (
+                    f"[{COMPACT_MARKER} Command output: {summary}]\n"
+                    f"(Result storage failed - re-run command to see full output)"
+                )
+            return notice, summary
 
         if msg_type == "search_result":
             match_count = sum(
                 1 for l in lines if ":" in l and re.search(r":\d+:", l)
             )
             summary = f"{match_count} matches"
-            trace = CompactionTrace("search_result", source, summary)
-            return trace.format_notice(), summary
+            
+            # Store full result before compacting (with error handling)
+            result_id = None
+            try:
+                result_id = self.result_storage.store_result(
+                    tool_name="search",
+                    content=content,
+                    message_index=message_index
+                )
+            except Exception as e:
+                log.warning(f"Failed to store search results for retrieval: {e}")
+            
+            if result_id:
+                notice = (
+                    f"[{COMPACT_MARKER} Search results: {summary}]\n"
+                    f"Full result stored as {result_id}. Use retrieve_tool_result to access."
+                )
+            else:
+                notice = (
+                    f"[{COMPACT_MARKER} Search results: {summary}]\n"
+                    f"(Result storage failed - re-run search to see full results)"
+                )
+            return notice, summary
 
         if msg_type == "assistant_tool_call":
             # Keep the XML tool call, compress the reasoning before it.
@@ -894,6 +1139,35 @@ class SmartContextManager:
             summary = f"{msg_type} output"
             trace = CompactionTrace(msg_type, source, summary)
             return trace.format_notice(), summary
+
+        if msg_type == "other_tool_result":
+            # Extract tool name from content (format: [tool_name result])
+            tool_match = re.match(r'\[(\w+) result', content)
+            tool_name = tool_match.group(1) if tool_match else source
+            
+            # Store full result before compacting (with error handling)
+            result_id = None
+            try:
+                result_id = self.result_storage.store_result(
+                    tool_name=tool_name,
+                    content=content,
+                    message_index=message_index
+                )
+            except Exception as e:
+                log.warning(f"Failed to store tool result for {tool_name}: {e}")
+            
+            summary = lines[0][:80] if lines else f"{tool_name} result"
+            if result_id:
+                notice = (
+                    f"[{COMPACT_MARKER} {tool_name}: {summary}]\n"
+                    f"Full result stored as {result_id}. Use retrieve_tool_result to access."
+                )
+            else:
+                notice = (
+                    f"[{COMPACT_MARKER} {tool_name}: {summary}]\n"
+                    f"(Result storage failed - re-run to see full output)"
+                )
+            return notice, summary
 
         # Generic fallback
         summary = lines[0][:100] if lines else "content"
