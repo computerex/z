@@ -796,7 +796,7 @@ class SmartContextManager:
         if role == "assistant":
             has_tool_xml = bool(re.search(
                 r'<(?:read_file|write_to_file|replace_in_file|execute_command'
-                r'|search_files|list_files|manage_todos|attempt_completion'
+                r'|search_files|list_files|manage_todos'
                 r'|list_context|remove_from_context|analyze_image|web_search'
                 r'|check_background_process|stop_background_process'
                 r'|list_background_processes|introspect)\b',
@@ -853,7 +853,7 @@ class SmartContextManager:
             # Keep the XML tool call, compress the reasoning before it.
             xml_match = re.search(
                 r'(<(?:read_file|write_to_file|replace_in_file|execute_command'
-                r'|search_files|list_files|manage_todos|attempt_completion'
+                r'|search_files|list_files|manage_todos'
                 r'|list_context|remove_from_context|analyze_image|web_search'
                 r'|check_background_process|stop_background_process'
                 r'|list_background_processes)\b.*)',
