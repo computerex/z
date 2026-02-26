@@ -403,6 +403,32 @@ def _provider_family_for_url(api_url: str) -> str:
     return "openai_compat"
 
 
+def _detect_provider_label(api_url: str) -> str:
+    """Return a human-readable provider name based on the API URL."""
+    u = (api_url or "").lower()
+    if "api.z.ai" in u:
+        if "/coding/" in u:
+            return "Z.AI Coding"
+        return "Z.AI"
+    if "minimax" in u:
+        return "MiniMax"
+    if "api.anthropic.com" in u:
+        return "Anthropic"
+    if "openrouter.ai" in u:
+        return "OpenRouter"
+    if "api.openai.com" in u:
+        return "OpenAI"
+    if "api.deepseek.com" in u:
+        return "DeepSeek"
+    if "api.groq.com" in u:
+        return "Groq"
+    if "api.together" in u:
+        return "Together AI"
+    if "api.mistral.ai" in u:
+        return "Mistral"
+    return "Custom"
+
+
 def _fetch_models_openai_compatible(api_url: str, api_key: str) -> List[str]:
     """Fetch model IDs from OpenAI/OpenRouter/OpenAI-compatible /models endpoint."""
     url = api_url.rstrip("/") + "/models"
@@ -793,8 +819,12 @@ def run_model_switch_wizard(
     return ""
 
 
-def _choose_provider_preset_interactive(current_api_url: str, current_model: str) -> tuple[str, str, str]:
-    """Prompt user for provider preset and return (label, api_url, default_model)."""
+def _choose_provider_preset_interactive(current_api_url: str, current_model: str) -> tuple[str, str, str, str]:
+    """Prompt user for provider preset.
+
+    Returns (preset_key, label, api_url, default_model).
+    preset_key is the PROVIDER_PRESETS key (e.g. "zai-coding") or "custom".
+    """
     presets = [
         ("1", "zai-coding"),
         ("2", "zai-standard"),
@@ -805,27 +835,25 @@ def _choose_provider_preset_interactive(current_api_url: str, current_model: str
         ("7", "custom"),
     ]
     con = Console()
-    con.print("\n  Select provider:\n")
+    con.print("\n  [bold]Select provider:[/bold]\n")
     for num, key in presets:
         if key == "custom":
-            con.print("  [cyan][7][/cyan] Custom URL")
+            con.print(f"  [cyan][{num}][/cyan] Custom URL")
         else:
             label, url, model = PROVIDER_PRESETS[key]
-            con.print(f"  [cyan][{num}][/cyan] {label}  [dim]{model}[/dim]")
+            con.print(f"  [cyan][{num}][/cyan] [bold]{label}[/bold]  [dim]{model}  ·  {url}[/dim]")
     con.print()
     while True:
-        choice = input("Enter choice [1-7]: ").strip() or "6"
+        choice = input("  Enter choice [1-7]: ").strip() or "6"
         selected = dict(presets).get(choice)
         if not selected:
-            print("Please enter 1-7.")
+            print("  Please enter 1-7.")
             continue
         if selected == "custom":
-            api_url = input(f"API URL [{current_api_url or 'https://api.example.com/v1/'}]: ").strip() or current_api_url or "https://api.example.com/v1/"
-            label = "Custom"
-            default_model = current_model or "gpt-4o"
-            return label, api_url.rstrip("/") + "/", default_model
+            api_url = input(f"  API URL [{current_api_url or 'https://api.example.com/v1/'}]: ").strip() or current_api_url or "https://api.example.com/v1/"
+            return "custom", "Custom", api_url.rstrip("/") + "/", current_model or "gpt-4o"
         label, api_url, default_model = PROVIDER_PRESETS[selected]
-        return label, api_url, default_model
+        return selected, label, api_url, default_model
 
 
 def run_in_app_config_wizard(
@@ -846,10 +874,13 @@ def run_in_app_config_wizard(
         scope = "active"
     scope_key = scope.lower()
     if any(ch.isspace() for ch in scope):
-        return "Usage: /config setup [active|<profile_name>] (no spaces in profile name)"
+        return "Usage: /providers setup [active|<profile_name>] (no spaces in profile name)"
+
+    is_active = scope_key == "active"
+    is_new_profile = not is_active and scope not in providers
 
     target_existing = (
-        providers.get(scope, {}) if scope_key != "active" else {
+        providers.get(scope, {}) if not is_active else {
             "api_url": agent.config.api_url,
             "api_key": agent.config.api_key,
             "model": agent.config.model,
@@ -860,66 +891,81 @@ def run_in_app_config_wizard(
     current_url = target_existing.get("api_url", "")
     current_model = target_existing.get("model", "")
 
-    console.print(f"\n  [bold]Config: {scope}[/bold] [dim](Enter to keep current values)[/dim]\n")
-    label, api_url, preset_model = _choose_provider_preset_interactive(current_url, current_model)
+    console.print(f"\n  [bold]{'Configure active provider' if is_active else f'Provider profile: {scope}'}[/bold] [dim](Enter to keep current values)[/dim]")
+    preset_key, label, api_url, preset_model = _choose_provider_preset_interactive(current_url, current_model)
+
+    # Auto-suggest a profile name for new profiles based on the preset chosen
+    if is_new_profile and scope == "default" and preset_key != "custom":
+        suggested_name = preset_key
+        entered = input(f"  Profile name [{suggested_name}]: ").strip()
+        scope = entered or suggested_name
+        # Validate: warn if the profile name conflicts with a different provider
+        if scope in providers:
+            existing_url = providers[scope].get("api_url", "")
+            if existing_url and existing_url != api_url:
+                overwrite = input(f"  Profile '{scope}' already exists ({_detect_provider_label(existing_url)}). Overwrite? [y/N]: ").strip().lower()
+                if overwrite not in ("y", "yes"):
+                    return "Cancelled."
+
     api_key_current = target_existing.get("api_key", "")
     model_current = target_existing.get("model", "") or preset_model
     max_tokens_current = int(target_existing.get("max_tokens", getattr(agent.config, "max_tokens", 128000)) or 128000)
     temp_current = float(target_existing.get("temperature", getattr(agent.config, "temperature", 0.7)) or 0.7)
 
-    api_key = input(f"API key [{('set' if api_key_current else 'not set')}]: ").strip() or api_key_current
+    api_key = input(f"  API key [{'***' + api_key_current[-4:] if len(api_key_current) > 4 else ('set' if api_key_current else 'not set')}]: ").strip() or api_key_current
     if not api_key:
         return "Cancelled: API key is required."
+
     model = model_current
-    fetch_default = "Y"
     family = _provider_family_for_url(api_url)
     if family in ("anthropic", "openai", "openrouter", "openai_compat"):
-        fetch_now = input(f"Fetch available models from provider now? [{fetch_default}/n]: ").strip().lower()
+        fetch_now = input(f"  Fetch available models? [Y/n]: ").strip().lower()
         if fetch_now in ("", "y", "yes"):
             try:
                 model_ids = _fetch_provider_model_ids(api_url, api_key)
                 if model_ids:
                     model = _interactive_model_picker(model_current, model_ids)
                 else:
-                    console.print("  [dim]No models returned \u2014 using manual entry[/dim]")
+                    console.print("  [dim]No models returned — using manual entry[/dim]")
             except Exception as e:
                 console.print(f"  [yellow]\u26a0 Model fetch failed: {rich_escape(str(e))}[/yellow]")
     if not model:
-        model = input(f"Model [{model_current or preset_model}]: ").strip() or model_current or preset_model
+        model = input(f"  Model [{model_current or preset_model}]: ").strip() or model_current or preset_model
     else:
-        manual_override = input(f"Model [{model}] (Enter to keep, or type override): ").strip()
+        manual_override = input(f"  Model [{model}] (Enter to keep, or type to change): ").strip()
         if manual_override:
             model = manual_override
-    max_tokens_in = input(f"Max tokens [{max_tokens_current}]: ").strip()
-    temp_in = input(f"Temperature [{temp_current}]: ").strip()
+
+    max_tokens_in = input(f"  Max tokens [{max_tokens_current}]: ").strip()
+    temp_in = input(f"  Temperature [{temp_current}]: ").strip()
     try:
         max_tokens = int(max_tokens_in) if max_tokens_in else max_tokens_current
         temperature = float(temp_in) if temp_in else temp_current
     except ValueError:
         return "Cancelled: invalid numeric value for max_tokens or temperature."
 
-    if scope_key == "active":
-        save_scope = input("Save active config to [1] workspace (.z/.z.json) or [2] global (~/.z.json)? [1/2]: ").strip() or "1"
-        config_data = {
-            "api_url": api_url,
-            "api_key": api_key,
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
+    detected = _detect_provider_label(api_url)
+    config_data = {
+        "api_url": api_url,
+        "api_key": api_key,
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    if is_active:
+        save_scope = input("  Save to [1] workspace or [2] global? [1/2]: ").strip() or "1"
         config_path = (Path.home() / ".z.json") if save_scope == "2" else (Path(workspace) / ".z" / ".z.json")
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
 
-        # Update current runtime config in-place
         agent.config.api_url = api_url
         agent.config.api_key = api_key
         agent.config.model = model
         agent.config.max_tokens = max_tokens
         agent.config.temperature = temperature
-        # Keep handlers synced in case a prior mode-switch replaced config object.
         agent.tool_handlers.config = agent.config
-        return f"Saved active config to {config_path} ({label}, {model})"
+        return f"\u2713 Active config saved \u2014 {detected} / {model}"
 
     models_path = Path(workspace) / ".z" / "models.json"
     models_path.parent.mkdir(parents=True, exist_ok=True)
@@ -930,17 +976,11 @@ def run_in_app_config_wizard(
         except Exception:
             data = {}
     data.setdefault("providers", {})
-    data["providers"][scope] = {
-        "api_url": api_url,
-        "api_key": api_key,
-        "model": model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
+    data["providers"][scope] = config_data
     models_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     providers[scope] = data["providers"][scope]
     agent.providers = providers
-    return f"Saved provider profile '{scope}' to {models_path} ({label}, {model})"
+    return f"\u2713 Saved profile [bold]{scope}[/bold] \u2014 {detected} / {model}"
 
 
 def _infer_active_provider_profile(agent: ClineAgent, providers: Dict[str, dict]) -> Optional[str]:
@@ -970,19 +1010,9 @@ def run_provider_manager(
 
     if sub in ("list", "ls"):
         if not providers:
-            return "No provider profiles saved yet. Use /provider setup <name>."
+            return "No provider profiles saved yet. Use /providers setup."
         active_name = _infer_active_provider_profile(agent, providers)
-        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
-        tbl.add_column(width=2)
-        tbl.add_column("name", style="bold", min_width=12)
-        tbl.add_column("model")
-        tbl.add_column("url", style="dim")
-        for name in sorted(providers.keys()):
-            p = providers[name]
-            marker = "[cyan]\u25cf[/cyan]" if name == active_name else " "
-            tbl.add_row(marker, name, p.get("model", ""), p.get("api_url", ""))
-        console.print()
-        console.print(Panel(tbl, title="[bold]Providers[/bold]", border_style="dim", padding=(1, 2)))
+        _render_providers_table(console, providers, active_name, show_numbers=False)
         console.print()
         return ""
 
@@ -992,11 +1022,19 @@ def run_provider_manager(
 
     if sub == "use":
         if len(parts) < 2:
-            return "Usage: /provider use <profile_name>"
+            return "Usage: /providers use <profile_name>"
         profile = parts[1]
+        # Support numeric shorthand: /providers use 1
+        if profile.isdigit():
+            names = sorted(providers.keys())
+            idx = int(profile)
+            if 1 <= idx <= len(names):
+                profile = names[idx - 1]
+            else:
+                return f"No provider at index {idx}. Use /providers to see the list."
         p = providers.get(profile)
         if not p:
-            return f"Provider profile '{profile}' not found. Use /provider list."
+            return f"Provider profile '{profile}' not found. Use /providers to see the list."
         agent.config.api_url = p.get("api_url", agent.config.api_url)
         agent.config.api_key = p.get("api_key", agent.config.api_key)
         agent.config.model = p.get("model", agent.config.model)
@@ -1018,11 +1056,12 @@ def run_provider_manager(
             "max_tokens": agent.config.max_tokens,
             "temperature": agent.config.temperature,
         })
-        return f"\u2713 Using [bold]{profile}[/bold] ({agent.config.model})"
+        detected = _detect_provider_label(agent.config.api_url)
+        return f"\u2713 Switched to [bold]{profile}[/bold] — {detected} / {agent.config.model}"
 
     if sub in ("remove", "rm", "delete"):
         if len(parts) < 2:
-            return "Usage: /provider remove <profile_name>"
+            return "Usage: /providers remove <profile_name>"
         profile = parts[1]
         if profile not in providers:
             return f"Provider profile '{profile}' not found."
@@ -1048,7 +1087,36 @@ def run_provider_manager(
             return f"Current provider profile: {active_name}"
         return "Current provider is active config (not matching a saved profile)."
 
-    return "Usage: /provider [list|current|setup <name>|use <name>|remove <name>]"
+    return "Usage: /providers [list|current|setup <name>|use <name|#>|remove <name>]"
+
+
+def _render_providers_table(console: Console, providers: Dict[str, dict], active_name: Optional[str], show_numbers: bool = True) -> None:
+    """Render a clear providers table showing profile name, detected provider, model, and URL."""
+    if not providers:
+        console.print("\n  [dim]No providers configured yet.[/dim]")
+        return
+    tbl = Table(show_header=True, box=None, padding=(0, 2), pad_edge=False)
+    tbl.add_column("", width=2)
+    if show_numbers:
+        tbl.add_column("#", style="dim", width=3)
+    tbl.add_column("Profile", style="bold", min_width=10)
+    tbl.add_column("Provider", min_width=12)
+    tbl.add_column("Model", style="cyan")
+    tbl.add_column("URL", style="dim")
+    names = sorted(providers.keys())
+    for i, name in enumerate(names, 1):
+        p = providers[name]
+        marker = "[cyan]\u25cf[/cyan]" if name == active_name else " "
+        detected = _detect_provider_label(p.get("api_url", ""))
+        model = p.get("model", "")
+        url = p.get("api_url", "")
+        row = [marker]
+        if show_numbers:
+            row.append(f"[{i}]")
+        row.extend([name, detected, model, url])
+        tbl.add_row(*row)
+    console.print()
+    console.print(Panel(tbl, title="[bold]Providers[/bold]", border_style="dim", padding=(1, 2)))
 
 
 def run_providers_hub(
@@ -1065,7 +1133,6 @@ def run_providers_hub(
     """
     parts = [p for p in cmd_arg.split() if p.strip()]
     if parts:
-        # Support numeric shorthand for "use" based on current sorted list.
         if len(parts) == 1 and parts[0].isdigit():
             names = sorted(providers.keys())
             idx = int(parts[0])
@@ -1074,27 +1141,11 @@ def run_providers_hub(
         return run_provider_manager(workspace, console, agent, providers, cmd_arg)
 
     active_name = _infer_active_provider_profile(agent, providers)
-    if providers:
-        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
-        tbl.add_column(width=2)
-        tbl.add_column("num", style="dim", width=3)
-        tbl.add_column("name", style="bold", min_width=12)
-        tbl.add_column("model")
-        tbl.add_column("url", style="dim")
-        names = sorted(providers.keys())
-        for i, name in enumerate(names, 1):
-            p = providers[name]
-            marker = "[cyan]\u25cf[/cyan]" if name == active_name else " "
-            model = p.get("model", "")
-            url = p.get("api_url", "")
-            tbl.add_row(marker, f"[{i}]", name, model, url)
-        console.print()
-        console.print(Panel(tbl, title="[bold]Providers[/bold]", border_style="dim", padding=(1, 2)))
-    else:
-        console.print("\n  [dim]No providers configured yet.[/dim]")
+    _render_providers_table(console, providers, active_name, show_numbers=True)
 
-    console.print("  [dim][white]/providers setup <name>[/white]  Configure a provider[/dim]")
-    console.print("  [dim][white]/providers use <name>[/white]    Switch to a provider (or use number)[/dim]")
+    console.print()
+    console.print("  [dim][white]/providers setup[/white]         Add or edit a provider[/dim]")
+    console.print("  [dim][white]/providers use <name|#>[/white]  Switch to a provider[/dim]")
     console.print("  [dim][white]/providers remove <name>[/white] Remove a provider[/dim]")
     console.print()
     return ""
@@ -1133,13 +1184,11 @@ def run_provider_picker_ui(
     values: List[tuple[str, str]] = []
     for name in sorted(providers.keys()):
         p = providers[name]
-        label = f"{name}"
+        detected = _detect_provider_label(p.get("api_url", ""))
         model = p.get("model", "")
-        url = p.get("api_url", "")
+        label = f"{name}  |  {detected}"
         if model:
             label += f"  |  {model}"
-        if url:
-            label += f"  |  {url}"
         values.append((name, label))
     picked = _ui_choose_from_list(
         title="Select Provider",
