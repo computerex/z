@@ -337,6 +337,18 @@ class StreamingJSONClient:
                 blocks = [dict(b) for b in msg.provider_blocks]
             else:
                 blocks = self._to_anthropic_text_blocks(msg.content)
+            # Recompute prompt-caching breakpoints per request. Replayed assistant
+            # provider blocks may carry old cache_control markers that can push us
+            # over Anthropic's 4-marker request limit.
+            cleaned_blocks: List[Dict[str, Any]] = []
+            for b in blocks:
+                if isinstance(b, dict) and "cache_control" in b:
+                    nb = dict(b)
+                    nb.pop("cache_control", None)
+                    cleaned_blocks.append(nb)
+                else:
+                    cleaned_blocks.append(b)
+            blocks = cleaned_blocks
             if msg.role == "system":
                 system_blocks.extend(blocks)
                 continue
@@ -348,8 +360,13 @@ class StreamingJSONClient:
             cache_ctl: Dict[str, Any] = {"type": "ephemeral"}
             if ttl in ("1h", "1hr", "1hour"):
                 cache_ctl["ttl"] = "1h"
+            cache_markers_used = 0
+            cache_markers_max = 4
 
             def _mark_last_cacheable(blocks: List[Dict[str, Any]]) -> bool:
+                nonlocal cache_markers_used
+                if cache_markers_used >= cache_markers_max:
+                    return False
                 # Anthropic cache breakpoints go on content blocks. Avoid marking
                 # thinking/redacted_thinking blocks when replaying prior assistant turns.
                 for i in range(len(blocks) - 1, -1, -1):
@@ -362,6 +379,7 @@ class StreamingJSONClient:
                     if b.get("type") == "text" and not str(b.get("text", "")).strip():
                         continue
                     blocks[i] = {**b, "cache_control": dict(cache_ctl)}
+                    cache_markers_used += 1
                     return True
                 return False
 
