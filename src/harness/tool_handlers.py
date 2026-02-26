@@ -107,7 +107,8 @@ class ToolHandlers:
         console: Console,
         workspace_path: str,
         context,
-        duplicate_detector
+        duplicate_detector,
+        context_manager=None
     ):
         """Initialize tool handlers with required dependencies.
         
@@ -117,12 +118,14 @@ class ToolHandlers:
             workspace_path: Path to workspace directory
             context: ContextContainer for managing loaded content
             duplicate_detector: DuplicateDetector for tracking file reads
+            context_manager: SmartContextManager for accessing stored tool results
         """
         self.config = config
         self.console = console
         self.workspace_path = workspace_path
         self.context = context
         self._duplicate_detector = duplicate_detector
+        self._context_manager = context_manager
         
         # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
         self._background_procs: Dict[int, dict] = {}
@@ -436,6 +439,58 @@ class ToolHandlers:
         if was_overwrite:
             return f"Successfully wrote to {path}\nNote: This file already existed. For future edits to existing files, please use replace_in_file instead of write_to_file."
         return f"Successfully wrote to {path}"
+
+    async def replace_between_anchors(self, params: Dict[str, str]) -> str:
+        """Replace content between two exact anchors, preserving the anchors.
+
+        Designed for cases where `replace_in_file` is brittle, especially when
+        the file contains SEARCH/REPLACE delimiters like `=======` literally.
+        """
+        path = self._resolve_path(params.get("path", ""))
+        start_anchor = params.get("start_anchor", "")
+        end_anchor = params.get("end_anchor", "")
+        replacement = params.get("replacement", "")
+        log.info(
+            "replace_between_anchors: path=%s start_len=%d end_len=%d repl_len=%d",
+            path, len(start_anchor), len(end_anchor), len(replacement)
+        )
+
+        if not path.exists():
+            return f"Error: File not found: {path}"
+        if not start_anchor:
+            return "Error: start_anchor is required."
+        if not end_anchor:
+            return "Error: end_anchor is required."
+
+        content = path.read_text(encoding="utf-8", errors="replace")
+
+        start_count = content.count(start_anchor)
+        end_count = content.count(end_anchor)
+        if start_count == 0:
+            return "Error: start_anchor not found in file."
+        if end_count == 0:
+            return "Error: end_anchor not found in file."
+        if start_count > 1:
+            return f"Error: start_anchor matched {start_count} times. Use a more specific anchor."
+        if end_count > 1:
+            return f"Error: end_anchor matched {end_count} times. Use a more specific anchor."
+
+        start_idx = content.find(start_anchor)
+        end_idx = content.find(end_anchor)
+        if end_idx <= start_idx:
+            return "Error: end_anchor occurs before start_anchor."
+
+        body_start = start_idx + len(start_anchor)
+        old_segment = content[body_start:end_idx]
+        new_content = content[:body_start] + replacement + content[end_idx:]
+        path.write_text(new_content, encoding="utf-8")
+
+        old_lines = old_segment.count("\n") + (1 if old_segment else 0)
+        new_lines = replacement.count("\n") + (1 if replacement else 0)
+        return (
+            f"Successfully replaced content between anchors in {path}\n"
+            f"Anchors preserved. Replaced ~{old_lines} line(s) with ~{new_lines} line(s)."
+        )
     
     async def replace_in_file(self, params: Dict[str, str]) -> str:
         """Replace sections of content in an existing file.
@@ -1487,3 +1542,49 @@ class ToolHandlers:
             import traceback
             tb = traceback.format_exc()
             return f"Error searching web: {type(e).__name__}: {e}\n{tb}"
+    
+    async def retrieve_tool_result(self, params: Dict[str, str]) -> str:
+        """Retrieve the full content of a previously compacted tool result.
+        
+        When tool results are compacted to save context space, they're stored
+        with a unique ID. Use this tool to retrieve the full result when needed.
+        
+        Args:
+            result_id: The ID of the stored result (e.g., res_abc123_456)
+            
+        Returns:
+            The full tool result content, or an error message if not found
+        """
+        result_id = params.get("result_id", "").strip()
+        if not result_id:
+            return "Error: result_id is required. Example: res_abc123_456"
+        
+        # Check if context_manager is available
+        if not self._context_manager:
+            return "Error: Context manager not available for result retrieval"
+        
+        # Retrieve the stored result
+        stored = self._context_manager.result_storage.get_result(result_id)
+        if not stored:
+            return (
+                f"Error: Result {result_id} not found. "
+                f"It may have been evicted due to age or memory limits."
+            )
+        
+        # Format the result with metadata
+        age_seconds = time.time() - stored.timestamp
+        age_str = f"{age_seconds:.0f}s" if age_seconds < 60 else f"{age_seconds/60:.0f}m"
+        
+        result = (
+            f"[Retrieved tool result: {stored.tool_name}]\n"
+            f"Result ID: {result_id}\n"
+            f"Age: {age_str} ago\n"
+            f"Size: {stored.tokens:,} tokens (~{len(stored.original_content):,} chars)\n"
+            f"{'='*60}\n"
+            f"{stored.original_content}"
+        )
+        
+        log.info("retrieve_tool_result: result_id=%s tool=%s tokens=%d age=%s",
+                 result_id, stored.tool_name, stored.tokens, age_str)
+        
+        return result

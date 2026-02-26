@@ -9,7 +9,7 @@ import json
 import datetime
 import html
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from rich.console import Console
 from rich.markup import escape as rich_escape
@@ -34,6 +34,48 @@ from .tool_registry import get_tool_names, get_complex_content_tools, get_metric
 from .logger import get_logger, log_exception, truncate as log_truncate
 
 log = get_logger("agent")
+
+def _normalize_display_text(text: str) -> str:
+    """Decode common escaped sequences for prettier terminal rendering.
+
+    Some providers occasionally return JSON-style escaped text (e.g. ``\\u2501``
+    or ``\\n``) in the assistant message body. Decode it for display only.
+    Keep this heuristic conservative to avoid mangling legitimate code samples.
+    """
+    if not text:
+        return text
+
+    has_unicode_escapes = bool(re.search(r"\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}", text))
+    many_line_escapes = text.count("\\n") >= 3 and "\n" not in text
+    if not (has_unicode_escapes or many_line_escapes):
+        return text
+
+    # Some providers double-escape JSON strings (e.g. "\\u2192" instead of
+    # "\u2192"). Collapse common escape prefixes once before decoding.
+    out = text
+    out = out.replace("\\\\u", "\\u").replace("\\\\U", "\\U")
+    out = out.replace("\\\\n", "\\n").replace("\\\\r", "\\r").replace("\\\\t", "\\t")
+    out = out.replace("\\\\x", "\\x")
+
+    def _u_replace(m: re.Match[str]) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+
+    def _U_replace(m: re.Match[str]) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return m.group(0)
+
+    out = re.sub(r"\\u([0-9a-fA-F]{4})", _u_replace, out)
+    out = re.sub(r"\\U([0-9a-fA-F]{8})", _U_replace, out)
+    out = re.sub(r"\\x([0-9a-fA-F]{2})", _u_replace, out)
+    # Decode common control escapes when the payload appears escape-heavy.
+    out = out.replace("\\r\\n", "\n").replace("\\n", "\n")
+    out = out.replace("\\t", "\t")
+    return out
 
 
 @dataclass
@@ -176,7 +218,7 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         return shorthand_matches[0][1]
     
     # Tools that may have nested XML examples in their content
-    complex_content_tools = {'write_to_file', 'replace_in_file'}
+    complex_content_tools = set(get_complex_content_tools())
     
     # Find ALL tool matches across ALL tool types, track by end position
     all_matches = []  # (end_pos, tool_name, match)
@@ -238,8 +280,9 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
                     'search_term', 'count', 'recursive', 'id', 'lines', 'question',
                     'action', 'title', 'status', 'parent_id', 'notes', 'context_refs',
                     'start_line', 'end_line', 'offset', 'limit',
-                    'prompt', 'mode', 'rule', 'category']
-    complex_params = ['content', 'diff']
+                    'prompt', 'mode', 'rule', 'category', 'start_anchor', 'end_anchor',
+                    'result_id']
+    complex_params = ['content', 'diff', 'replacement']
     
     # For tools with complex content (write_to_file, replace_in_file),
     # extract the content/diff FIRST, then only search for other params
@@ -586,6 +629,7 @@ class ClineAgent:
                 duration_ms=0,
                 tool_calls=0,
                 finish_reason=response.finish_reason,
+                extra_usage=response.usage if getattr(response, "usage", None) else None,
             )
             
             # Check if output is deep enough
@@ -749,6 +793,26 @@ class ClineAgent:
                         result.append(sanitize_string(item) if isinstance(item, str) else item)
                 return result
             return content
+
+        def sanitize_provider_blocks(blocks):
+            if not isinstance(blocks, list):
+                return None
+            out = []
+            for b in blocks:
+                if isinstance(b, dict):
+                    clean = {}
+                    for k, v in b.items():
+                        if isinstance(v, str):
+                            clean[k] = sanitize_string(v)
+                        elif isinstance(v, dict):
+                            clean[k] = {
+                                kk: sanitize_string(vv) if isinstance(vv, str) else vv
+                                for kk, vv in v.items()
+                            }
+                        else:
+                            clean[k] = v
+                    out.append(clean)
+            return out or None
         
         # Serialize context items
         context_items = []
@@ -764,7 +828,15 @@ class ClineAgent:
         
         data = {
             "workspace": self.workspace_path,
-            "messages": [{"role": m.role, "content": sanitize_content(m.content)} for m in self.messages],
+            "messages": [
+                {
+                    "role": m.role,
+                    "content": sanitize_content(m.content),
+                    **({"provider_blocks": sanitize_provider_blocks(getattr(m, "provider_blocks", None))}
+                       if getattr(m, "provider_blocks", None) else {}),
+                }
+                for m in self.messages
+            ],
             "context": context_items,
             "context_next_id": self.context._next_id,
             "todos": self.todo_manager.to_dict(),
@@ -784,7 +856,14 @@ class ClineAgent:
         import json
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
-            self.messages = [StreamingMessage(role=m["role"], content=m["content"]) for m in data["messages"]]
+            self.messages = [
+                StreamingMessage(
+                    role=m["role"],
+                    content=m["content"],
+                    provider_blocks=m.get("provider_blocks"),
+                )
+                for m in data["messages"]
+            ]
             
             # CRITICAL: Verify system prompt integrity after load
             # If messages[0] is not a system prompt, inject a fresh one
@@ -1060,11 +1139,20 @@ class ClineAgent:
         after = estimate_messages_tokens(self.messages)
         return before - after
     
-    async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
-        """Run the agent with streaming output."""
+    async def run_message(
+        self,
+        user_content: Union[str, List[Dict[str, Any]]],
+        enable_interrupt: bool = True,
+        user_label: Optional[str] = None,
+    ) -> str:
+        """Run the agent with a user message (text or multimodal content)."""
+        if isinstance(user_content, str):
+            log_input = user_content
+        else:
+            log_input = user_label or "[multimodal message]"
         log.info("agent.run START reasoning_mode=%s interrupt=%s msg_count=%d input=%s",
                  self.reasoning_mode, enable_interrupt, len(self.messages),
-                 log_truncate(user_input, 150))
+                 log_truncate(log_input, 150))
         
         # Initialize system prompt if first run
         if not self._initialized:
@@ -1075,11 +1163,15 @@ class ClineAgent:
             log.debug("System prompt initialised (%d chars)", len(self.messages[0].content))
         
         # Add user message
-        self.messages.append(StreamingMessage(role="user", content=user_input))
+        self.messages.append(StreamingMessage(role="user", content=user_content))
         
         # Capture original request for todo grounding (first real user message)
-        if not self.todo_manager.original_request and not user_input.startswith("["):
-            self.todo_manager.set_original_request(user_input[:500])
+        if (
+            isinstance(user_content, str)
+            and not self.todo_manager.original_request
+            and not user_content.startswith("[")
+        ):
+            self.todo_manager.set_original_request(user_content[:500])
         
         # Start keyboard monitoring for escape key
         if enable_interrupt and sys.stdin.isatty():
@@ -1097,6 +1189,10 @@ class ClineAgent:
             self.status.clear()
             if enable_interrupt:
                 stop_monitoring()
+
+    async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
+        """Run the agent with a plain text user request."""
+        return await self.run_message(user_input, enable_interrupt=enable_interrupt)
     
     async def _run_loop(self) -> str:
         """Main agent loop."""
@@ -1406,6 +1502,7 @@ class ClineAgent:
                     duration_ms=0,
                     tool_calls=0,
                     finish_reason=response.finish_reason,
+                    extra_usage=response.usage if getattr(response, "usage", None) else None,
                 )
                 log.debug("Usage: in=%d out=%d finish_reason=%s",
                           input_tokens, output_tokens, response.finish_reason)
@@ -1422,7 +1519,11 @@ class ClineAgent:
                                 iteration + 1, len(full_content))
                     self.console.print("[dim][!] Output truncated mid-tool-call — asking model to continue[/dim]")
                     # Save the partial response and ask the model to finish
-                    self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                    self.messages.append(StreamingMessage(
+                        role="assistant",
+                        content=full_content,
+                        provider_blocks=getattr(response, "provider_content_blocks", None),
+                    ))
                     self.messages.append(StreamingMessage(
                         role="user",
                         content=(
@@ -1469,11 +1570,16 @@ class ClineAgent:
                     # is available (avoids raw streamed markdown clutter).
                     if _defer_markdown_render:
                         display_text = strip_thinking_blocks(full_content).strip()
+                        display_text = _normalize_display_text(display_text)
                         if display_text:
                             self.console.print(Markdown(display_text))
 
                     # No tool call — final response to user
-                    self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                    self.messages.append(StreamingMessage(
+                        role="assistant",
+                        content=full_content,
+                        provider_blocks=getattr(response, "provider_content_blocks", None),
+                    ))
                     return full_content
                 
                 # Execute tool(s) — if multiple calls found, run them all
@@ -1491,7 +1597,11 @@ class ClineAgent:
                     # Check for interrupt between tool calls
                     if is_interrupted():
                         self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
-                        self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                        self.messages.append(StreamingMessage(
+                            role="assistant",
+                            content=full_content,
+                            provider_blocks=getattr(response, "provider_content_blocks", None),
+                        ))
                         return "[Interrupted - session preserved. Type to continue or start new request]"
                     
                     # Spill each individual result BEFORE combining, so that
@@ -1559,7 +1669,11 @@ class ClineAgent:
                             (f"{len(all_tool_calls)} tools", _result_snippet))
                 
                 # Add to history
-                self.messages.append(StreamingMessage(role="assistant", content=full_content))
+                self.messages.append(StreamingMessage(
+                    role="assistant",
+                    content=full_content,
+                    provider_blocks=getattr(response, "provider_content_blocks", None),
+                ))
                 
                 # Build tool result message
                 header_parts = []
@@ -1745,6 +1859,14 @@ class ClineAgent:
                 else:
                     # Success — reset failure counter
                     self._edit_failures.pop(norm_path, None)
+
+            elif tool.name == "replace_between_anchors":
+                path = tool.parameters.get("path", "")
+                self.console.print(f"  [dim]•[/dim] [yellow]Rewrote section[/yellow] [dim]{rich_escape(path)}[/dim]")
+                result = await self.tool_handlers.replace_between_anchors(tool.parameters)
+                if not result.startswith("Error:"):
+                    norm_path = str(self.tool_handlers._resolve_path(path))
+                    self._edit_failures.pop(norm_path, None)
                 
             elif tool.name == "execute_command":
                 result = await self.tool_handlers.execute_command(tool.parameters)
@@ -1799,6 +1921,10 @@ class ClineAgent:
                 result = self.context.summary()
                 n_items = len(self.context.list_items())
                 self.console.print(f"  [dim]•[/dim] [blue]Listed context[/blue] [dim]({n_items} items, {self.context.total_size():,} chars)[/dim]")
+
+            elif tool.name == "retrieve_tool_result":
+                self.console.print(f"  [dim]•[/dim] [cyan]Retrieving stored result[/cyan]")
+                result = await self.tool_handlers.retrieve_tool_result(tool.parameters)
                 
             elif tool.name == "remove_from_context":
                 item_id = tool.parameters.get("id", "")

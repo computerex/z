@@ -14,11 +14,16 @@ except Exception:
     pass  # May fail on some systems
 
 import asyncio
+import base64
 import hashlib
 import time
+import json
+import mimetypes
+import re
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, Any, Callable
+import httpx
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
@@ -33,6 +38,11 @@ from rich.markup import escape as rich_escape
 
 log = get_logger("main")
 
+try:
+    from anthropic import Anthropic  # type: ignore
+except Exception:
+    Anthropic = None
+
 # Multiline input support
 try:
     from prompt_toolkit import PromptSession
@@ -43,7 +53,13 @@ try:
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.formatted_text import ANSI
     from prompt_toolkit.document import Document
+    from prompt_toolkit.shortcuts import radiolist_dialog, input_dialog
+    try:
+        from prompt_toolkit.application import run_in_terminal as pt_run_in_terminal
+    except Exception:
+        pt_run_in_terminal = None
     HAS_PROMPT_TOOLKIT = True
+    HAS_PT_DIALOGS = True
     
     class SafeFileHistory(FileHistory):
         """FileHistory that handles unicode surrogates gracefully."""
@@ -53,6 +69,7 @@ try:
             super().store_string(safe_string)
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
+    HAS_PT_DIALOGS = False
     SafeFileHistory = None
 
 # Clipboard image support
@@ -110,7 +127,13 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
     print("      - https://api.z.ai/api/paas/v4/\n")
     print("  [3] MiniMax")
     print("      - https://api.minimax.io/v1/\n")
-    print("  [4] Custom OpenAI-compatible API")
+    print("  [4] Anthropic")
+    print("      - https://api.anthropic.com/v1/\n")
+    print("  [5] OpenRouter")
+    print("      - https://openrouter.ai/api/v1/\n")
+    print("  [6] OpenAI")
+    print("      - https://api.openai.com/v1/\n")
+    print("  [7] Custom OpenAI-compatible API")
     print("      - Enter your own URL\n")
     
     while True:
@@ -131,6 +154,21 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
             default_model = "MiniMax-M2.1"
             break
         elif choice == "4":
+            base_url = "https://api.anthropic.com/v1/"
+            provider = "Anthropic"
+            default_model = "claude-3-5-sonnet-latest"
+            break
+        elif choice == "5":
+            base_url = "https://openrouter.ai/api/v1/"
+            provider = "OpenRouter"
+            default_model = "anthropic/claude-3.5-sonnet"
+            break
+        elif choice == "6":
+            base_url = "https://api.openai.com/v1/"
+            provider = "OpenAI"
+            default_model = "gpt-4o"
+            break
+        elif choice == "7":
             base_url = input("Enter API base URL: ").strip()
             if not base_url:
                 print("URL is required.")
@@ -139,7 +177,7 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
             default_model = input("Enter default model name: ").strip() or "gpt-4"
             break
         else:
-            print("Please enter 1, 2, 3, or 4.")
+            print("Please enter 1, 2, 3, 4, 5, 6, or 7.")
     
     print(f"\nUsing {provider}: {base_url}")
     
@@ -236,6 +274,57 @@ def get_clipboard_image() -> tuple[Path | None, str]:
         return None, f"Error getting clipboard: {e}"
 
 
+CLIPBOARD_IMAGE_MARKER_RE = re.compile(r"\[\[clipboard_image:(.+?)\]\]")
+
+
+def _supports_multimodal_input(api_url: str, model: str) -> bool:
+    """Best-effort heuristic for vision-capable chat models/providers."""
+    u = (api_url or "").lower()
+    m = (model or "").lower()
+    if "anthropic.com" in u and m.startswith("claude"):
+        return True
+    vision_markers = (
+        "gpt-4o", "gpt-4.1", "o4", "vision", "claude", "glm-4.6v",
+        "gemini", "llava", "qwen-vl"
+    )
+    return any(tok in m for tok in vision_markers)
+
+
+def _image_path_to_data_uri(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    mime = mime or "image/png"
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{data}"
+
+
+def _extract_clipboard_image_markers(text: str) -> tuple[str, List[Path]]:
+    """Extract image markers inserted by Ctrl+V and return cleaned text + paths."""
+    paths: List[Path] = []
+
+    def _repl(match: re.Match) -> str:
+        raw = match.group(1).strip()
+        p = Path(raw)
+        paths.append(p)
+        return ""
+
+    cleaned = CLIPBOARD_IMAGE_MARKER_RE.sub(_repl, text)
+    # Normalize extra blank lines after marker removal
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, paths
+
+
+def _build_multimodal_user_content(text: str, image_paths: List[Path]) -> List[Dict[str, Any]]:
+    blocks: List[Dict[str, Any]] = []
+    prompt_text = text.strip() if text and text.strip() else "Please analyze the pasted image."
+    blocks.append({"type": "text", "text": prompt_text})
+    for p in image_paths:
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": _image_path_to_data_uri(p)}
+        })
+    return blocks
+
+
 def get_sessions_dir(workspace: str) -> Path:
     """Get sessions directory for a workspace."""
     harness_dir = Path(__file__).parent
@@ -288,6 +377,810 @@ def load_claude_cli_config(workspace: str) -> dict:
     return data.get("claude_cli", {})
 
 
+PROVIDER_PRESETS = {
+    "zai-coding": ("Z.AI Coding", "https://api.z.ai/api/coding/paas/v4/", "glm-4.7"),
+    "zai-standard": ("Z.AI Standard", "https://api.z.ai/api/paas/v4/", "glm-4.7"),
+    "minimax": ("MiniMax", "https://api.minimax.io/v1/", "MiniMax-M2.1"),
+    "anthropic": ("Anthropic", "https://api.anthropic.com/v1/", "claude-3-5-sonnet-latest"),
+    "openrouter": ("OpenRouter", "https://openrouter.ai/api/v1/", "anthropic/claude-3.5-sonnet"),
+    "openai": ("OpenAI", "https://api.openai.com/v1/", "gpt-4o"),
+}
+_MODEL_FETCH_CACHE: Dict[str, tuple[float, List[str]]] = {}
+_MODEL_FETCH_CACHE_TTL_SECS = 300
+_LAST_MODEL_SEARCH_RESULTS: List[Dict[str, Any]] = []
+_LAST_MODEL_SEARCH_QUERY: str = ""
+
+
+def _provider_family_for_url(api_url: str) -> str:
+    u = (api_url or "").lower()
+    if "api.anthropic.com" in u:
+        return "anthropic"
+    if "openrouter.ai" in u:
+        return "openrouter"
+    if "api.openai.com" in u:
+        return "openai"
+    return "openai_compat"
+
+
+def _fetch_models_openai_compatible(api_url: str, api_key: str) -> List[str]:
+    """Fetch model IDs from OpenAI/OpenRouter/OpenAI-compatible /models endpoint."""
+    url = api_url.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if "openrouter.ai" in api_url.lower():
+        headers["HTTP-Referer"] = "https://cline.bot"
+        headers["X-Title"] = "Cline"
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    ids = []
+    for item in data.get("data", []):
+        mid = item.get("id")
+        if isinstance(mid, str) and mid.strip():
+            ids.append(mid.strip())
+    return sorted(set(ids), key=str.lower)
+
+
+def _fetch_models_anthropic(api_url: str, api_key: str) -> List[str]:
+    """Fetch Anthropic model IDs using the Anthropic SDK."""
+    if Anthropic is None:
+        raise RuntimeError("Anthropic SDK not installed. Install dependencies first.")
+    kwargs = {"api_key": api_key}
+    if api_url:
+        base = api_url.rstrip("/")
+        if base.lower().endswith("/v1"):
+            base = base[:-3]
+        kwargs["base_url"] = base
+    client = Anthropic(**kwargs)
+    page = client.models.list()
+    ids: List[str] = []
+
+    def _extract(page_obj):
+        # SDK may return iterable pages or objects with .data
+        if hasattr(page_obj, "data"):
+            for item in getattr(page_obj, "data") or []:
+                mid = getattr(item, "id", None)
+                if isinstance(mid, str) and mid.strip():
+                    ids.append(mid.strip())
+        else:
+            try:
+                for item in page_obj:
+                    mid = getattr(item, "id", None)
+                    if isinstance(mid, str) and mid.strip():
+                        ids.append(mid.strip())
+            except TypeError:
+                pass
+
+    _extract(page)
+    # Best-effort pagination support if SDK exposes has_next_page/get_next_page
+    try:
+        while True:
+            has_next = getattr(page, "has_next_page", False)
+            if callable(has_next):
+                has_next = has_next()
+            if not has_next:
+                break
+            page = page.get_next_page()
+            _extract(page)
+    except Exception:
+        pass
+    return sorted(set(ids), key=str.lower)
+
+
+def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
+    family = _provider_family_for_url(api_url)
+    if family == "anthropic":
+        return _fetch_models_anthropic(api_url, api_key)
+    if family in ("openai", "openrouter", "openai_compat"):
+        return _fetch_models_openai_compatible(api_url, api_key)
+    return []
+
+
+def _cache_key_for_models(api_url: str, api_key: str) -> str:
+    key_hash = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:12]
+    return f"{api_url.rstrip('/').lower()}|{key_hash}"
+
+
+def _fetch_provider_model_ids_cached(api_url: str, api_key: str, refresh: bool = False) -> List[str]:
+    cache_key = _cache_key_for_models(api_url, api_key)
+    now = time.time()
+    if not refresh and cache_key in _MODEL_FETCH_CACHE:
+        ts, ids = _MODEL_FETCH_CACHE[cache_key]
+        if now - ts <= _MODEL_FETCH_CACHE_TTL_SECS:
+            return ids
+    ids = _fetch_provider_model_ids(api_url, api_key)
+    _MODEL_FETCH_CACHE[cache_key] = (now, ids)
+    return ids
+
+
+def _interactive_model_picker(current_model: str, model_ids: List[str]) -> str:
+    """Interactive selector for model IDs with optional filtering."""
+    if not model_ids:
+        return current_model
+
+    models = model_ids[:]
+    while True:
+        print(f"\nFetched {len(models):,} model(s).")
+        if len(models) > 40:
+            flt = input("Filter models by substring (blank = no filter): ").strip().lower()
+            if flt:
+                filtered = [m for m in models if flt in m.lower()]
+                if filtered:
+                    models = filtered
+                else:
+                    print("No matches for that filter.")
+                    continue
+
+        shown = models[:40]
+        print()
+        for i, mid in enumerate(shown, 1):
+            print(f"  [{i:2d}] {mid}")
+        if len(models) > len(shown):
+            print(f"  ... ({len(models) - len(shown)} more not shown)")
+        prompt = f"Choose model number, type custom model id, or Enter to keep [{current_model}]: "
+        choice = input(prompt).strip()
+        if not choice:
+            return current_model
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(shown):
+                return shown[idx - 1]
+            print("Invalid number.")
+            continue
+        # exact or custom free text
+        return choice
+
+
+def _apply_selected_provider_model(
+    workspace: str,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+    profile: str,
+    cfg: Dict[str, Any],
+    chosen_model: str,
+) -> str:
+    """Apply selected provider+model as active config and persist."""
+    agent.config.api_url = cfg.get("api_url", agent.config.api_url)
+    agent.config.api_key = cfg.get("api_key", agent.config.api_key)
+    agent.config.model = chosen_model
+    if "max_tokens" in cfg:
+        try:
+            agent.config.max_tokens = int(cfg["max_tokens"])
+        except Exception:
+            pass
+    if "temperature" in cfg:
+        try:
+            agent.config.temperature = float(cfg["temperature"])
+        except Exception:
+            pass
+    agent.tool_handlers.config = agent.config
+
+    if profile in providers:
+        providers[profile]["model"] = chosen_model
+        _save_provider_profile_fields(workspace, providers, profile, {"model": chosen_model})
+    cfg_path = _save_active_config_fields(workspace, {
+        "api_url": agent.config.api_url,
+        "api_key": agent.config.api_key,
+        "model": agent.config.model,
+        "max_tokens": agent.config.max_tokens,
+        "temperature": agent.config.temperature,
+    })
+    return f"Using {chosen_model} from provider '{profile}' (saved active config to {cfg_path})"
+
+
+def _build_searchable_providers(agent: ClineAgent, providers: Dict[str, dict]) -> tuple[List[tuple[str, dict]], Optional[str]]:
+    searchable: List[tuple[str, dict]] = []
+    for name in sorted(providers.keys()):
+        cfg = dict(providers.get(name, {}))
+        if cfg.get("api_url") and cfg.get("api_key"):
+            searchable.append((name, cfg))
+    active_name = _infer_active_provider_profile(agent, providers)
+    if not active_name and agent.config.api_url and agent.config.api_key:
+        searchable.insert(0, ("active", {
+            "api_url": agent.config.api_url,
+            "api_key": agent.config.api_key,
+            "model": agent.config.model,
+            "max_tokens": agent.config.max_tokens,
+            "temperature": agent.config.temperature,
+        }))
+    return searchable, active_name
+
+
+def _provider_display_name(profile: str, cfg: Dict[str, Any]) -> str:
+    """Human-friendly provider label for search results."""
+    if profile != "active":
+        return profile
+    fam = _provider_family_for_url(str(cfg.get("api_url", "")))
+    return f"active/{fam}"
+
+
+def _save_active_config_fields(workspace: str, updates: dict) -> Path:
+    cfg_path = Path(workspace) / ".z" / ".z.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            data = {}
+    data.update(updates)
+    cfg_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return cfg_path
+
+
+def _save_provider_profile_fields(workspace: str, providers: Dict[str, dict], profile: str, updates: dict) -> Path:
+    models_path = Path(workspace) / ".z" / "models.json"
+    models_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if models_path.exists():
+        try:
+            data = json.loads(models_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            data = {}
+    data.setdefault("providers", {})
+    profile_cfg = dict(data["providers"].get(profile, {}))
+    profile_cfg.update(updates)
+    data["providers"][profile] = profile_cfg
+    models_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    providers[profile] = profile_cfg
+    return models_path
+
+
+def run_model_switch_wizard(
+    workspace: str,
+    console: Console,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+    cmd_arg: str = "",
+) -> str:
+    """Cross-provider model switcher (no nested prompts).
+
+    Usage:
+      /model search <query>  -> search models across all configured providers
+      /model <query>         -> shorthand for search
+      /model use <n>         -> use result #n from last search
+      /model refresh <query> -> refresh model lists, then search
+      /model list            -> list current provider models only
+    """
+    global _LAST_MODEL_SEARCH_RESULTS, _LAST_MODEL_SEARCH_QUERY
+    parts = [p for p in cmd_arg.split() if p.strip()]
+    verb = parts[0].lower() if parts else ""
+
+    if verb == "use":
+        if len(parts) < 2 or not parts[1].isdigit():
+            return "Usage: /model use <number> (use a result number from the last /model search)"
+        idx = int(parts[1])
+        if idx < 1 or idx > len(_LAST_MODEL_SEARCH_RESULTS):
+            return "Invalid selection. Run /model <query> first."
+        row = _LAST_MODEL_SEARCH_RESULTS[idx - 1]
+        return _apply_selected_provider_model(
+            workspace, agent, providers,
+            row["profile"], dict(row["cfg"]), row["model_id"]
+        )
+
+    if verb == "list":
+        api_url = agent.config.api_url
+        api_key = agent.config.api_key
+        if not api_url or not api_key:
+            return "No active provider configured."
+        try:
+            console.print(f"[dim]Fetching models from current provider...[/dim]")
+            mids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=False)
+        except Exception as e:
+            return f"Model fetch failed: {e}"
+        shown = mids[:100]
+        console.print(f"[dim]Current provider models ({len(mids)}):[/dim]")
+        for m in shown:
+            marker = "*" if m == agent.config.model else " "
+            console.print(f"[dim] {marker} {m}[/dim]")
+        if len(mids) > len(shown):
+                console.print(f"[dim]... and {len(mids) - len(shown)} more[/dim]")
+        return "Listed current provider models."
+
+    refresh = (verb == "refresh")
+    if verb in ("search", "refresh"):
+        query = " ".join(parts[1:]).strip()
+    else:
+        query = " ".join(parts).strip()
+
+    if not query:
+        if _LAST_MODEL_SEARCH_RESULTS:
+            console.print(f"[dim]Last model search ({len(_LAST_MODEL_SEARCH_RESULTS)} results) query='{_LAST_MODEL_SEARCH_QUERY}'[/dim]")
+            for i, row in enumerate(_LAST_MODEL_SEARCH_RESULTS[:20], 1):
+                mark = "*" if row["model_id"] == agent.config.model and row["cfg"].get("api_url") == agent.config.api_url else " "
+                display_provider = row.get("provider_display") or row["profile"]
+                console.print(f"[dim] {mark}[{i:2d}] {row['model_id']}  [{display_provider}] [/dim]")
+            console.print("[dim]Use /model use <n> or /model <query>[/dim]")
+            return "Listed last model search results."
+        return "Usage: /model <query> (search across configured providers), then /model use <n>"
+
+    searchable, active_name = _build_searchable_providers(agent, providers)
+    if not searchable:
+        return "No configured providers. Use /providers setup <name> first."
+    if len(searchable) == 1:
+        only_name, only_cfg = searchable[0]
+        console.print(
+            f"[dim]Searching only one configured provider: {_provider_display_name(only_name, only_cfg)}. "
+            "Add more via /providers setup <name> to compare across providers.[/dim]"
+        )
+
+    aggregate: List[tuple[str, str, str, dict]] = []  # (profile, provider_display, model_id, cfg)
+    failures: List[str] = []
+    for profile, cfg in searchable:
+        api_url = cfg.get("api_url", "")
+        api_key = cfg.get("api_key", "")
+        provider_display = _provider_display_name(profile, cfg)
+        if not api_url or not api_key:
+            continue
+        try:
+            console.print(f"[dim]Fetching models: {provider_display}[/dim]")
+            mids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=refresh)
+            for mid in mids:
+                aggregate.append((profile, provider_display, mid, cfg))
+        except Exception as e:
+            failures.append(f"{provider_display}: {e}")
+
+    if failures:
+        for f in failures[:5]:
+            console.print(f"[yellow]{rich_escape(f)}[/yellow]")
+        if not aggregate:
+            return "Model fetch failed for all providers."
+
+    if not aggregate:
+        return "No models found from configured providers."
+    q = query.lower().strip()
+    matches = [row for row in aggregate if (q in row[2].lower() or q in row[1].lower() or q in row[0].lower())]
+    if not matches:
+        return f"No models matched '{query}'."
+
+    # Deduplicate by (profile, model) while preserving order.
+    seen = set()
+    deduped = []
+    for row in matches:
+        k = (row[0], row[2])
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(row)
+    matches = deduped
+
+    # Sort exact/startswith hits first for model id.
+    if q:
+        matches.sort(key=lambda r: (
+            0 if r[2].lower() == q else 1,
+            0 if r[2].lower().startswith(q) else 1,
+            0 if q in r[2].lower() else 1,
+            r[0].lower(),
+            r[2].lower(),
+        ))
+
+    shown = matches[:60]
+    _LAST_MODEL_SEARCH_QUERY = query
+    _LAST_MODEL_SEARCH_RESULTS = [
+        {"profile": profile, "provider_display": provider_display, "model_id": mid, "cfg": dict(cfg)}
+        for (profile, provider_display, mid, cfg) in shown
+    ]
+
+    console.print(f"[bold cyan]Model search results[/bold cyan] [dim]for '{query}' ({len(matches)} match(es), showing {len(shown)})[/dim]")
+    for i, (profile, provider_display, mid, cfg) in enumerate(shown, 1):
+        active_mark = "*" if ((profile == active_name or profile == "active") and mid == agent.config.model) else " "
+        provider_label = f"{provider_display}".ljust(18)
+        console.print(
+            f" {active_mark}[{i:2d}] [bold]{mid}[/bold]  "
+            f"[cyan]{provider_label}[/cyan]"
+        )
+
+    # QoL: if query resolves cleanly, switch immediately (provider + model).
+    exact_matches = [row for row in matches if row[2].lower() == q]
+    if len(exact_matches) == 1:
+        profile, _provider_display, chosen_model, cfg = exact_matches[0]
+        return _apply_selected_provider_model(workspace, agent, providers, profile, dict(cfg), chosen_model)
+    if len(matches) == 1:
+        profile, _provider_display, chosen_model, cfg = matches[0]
+        return _apply_selected_provider_model(workspace, agent, providers, profile, dict(cfg), chosen_model)
+
+    console.print("[dim]Use /model use <n> to switch to a result (provider + model).[/dim]")
+    return "Model search complete."
+
+
+def _choose_provider_preset_interactive(current_api_url: str, current_model: str) -> tuple[str, str, str]:
+    """Prompt user for provider preset and return (label, api_url, default_model)."""
+    presets = [
+        ("1", "zai-coding"),
+        ("2", "zai-standard"),
+        ("3", "minimax"),
+        ("4", "anthropic"),
+        ("5", "openrouter"),
+        ("6", "openai"),
+        ("7", "custom"),
+    ]
+    print("\nSelect provider preset:\n")
+    for num, key in presets:
+        if key == "custom":
+            print("  [7] Custom URL")
+        else:
+            label, url, model = PROVIDER_PRESETS[key]
+            print(f"  [{num}] {label}")
+            print(f"      - {url}")
+            print(f"      - default model: {model}\n")
+    while True:
+        choice = input("Enter choice [1-7]: ").strip() or "6"
+        selected = dict(presets).get(choice)
+        if not selected:
+            print("Please enter 1-7.")
+            continue
+        if selected == "custom":
+            api_url = input(f"API URL [{current_api_url or 'https://api.example.com/v1/'}]: ").strip() or current_api_url or "https://api.example.com/v1/"
+            label = "Custom"
+            default_model = current_model or "gpt-4o"
+            return label, api_url.rstrip("/") + "/", default_model
+        label, api_url, default_model = PROVIDER_PRESETS[selected]
+        return label, api_url, default_model
+
+
+def run_in_app_config_wizard(
+    workspace: str,
+    console: Console,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+    scope_arg: str = "",
+) -> str:
+    """Interactive config editor inside the app.
+
+    scope_arg:
+      - "" / "active" -> saves .z/.z.json and updates current agent config
+      - any other name -> saves a provider profile in .z/models.json
+    """
+    scope = (scope_arg or "active").strip()
+    if not scope:
+        scope = "active"
+    scope_key = scope.lower()
+    if any(ch.isspace() for ch in scope):
+        return "Usage: /config setup [active|<profile_name>] (no spaces in profile name)"
+
+    target_existing = (
+        providers.get(scope, {}) if scope_key != "active" else {
+            "api_url": agent.config.api_url,
+            "api_key": agent.config.api_key,
+            "model": agent.config.model,
+            "max_tokens": agent.config.max_tokens,
+            "temperature": agent.config.temperature,
+        }
+    )
+    current_url = target_existing.get("api_url", "")
+    current_model = target_existing.get("model", "")
+
+    console.print(f"[dim]Config wizard ({scope}) — press Enter to keep current values.[/dim]")
+    label, api_url, preset_model = _choose_provider_preset_interactive(current_url, current_model)
+    api_key_current = target_existing.get("api_key", "")
+    model_current = target_existing.get("model", "") or preset_model
+    max_tokens_current = int(target_existing.get("max_tokens", getattr(agent.config, "max_tokens", 128000)) or 128000)
+    temp_current = float(target_existing.get("temperature", getattr(agent.config, "temperature", 0.7)) or 0.7)
+
+    api_key = input(f"API key [{('set' if api_key_current else 'not set')}]: ").strip() or api_key_current
+    if not api_key:
+        return "Cancelled: API key is required."
+    model = model_current
+    fetch_default = "Y"
+    family = _provider_family_for_url(api_url)
+    if family in ("anthropic", "openai", "openrouter", "openai_compat"):
+        fetch_now = input(f"Fetch available models from provider now? [{fetch_default}/n]: ").strip().lower()
+        if fetch_now in ("", "y", "yes"):
+            try:
+                model_ids = _fetch_provider_model_ids(api_url, api_key)
+                if model_ids:
+                    model = _interactive_model_picker(model_current, model_ids)
+                else:
+                    console.print("[dim]No models returned by provider; using manual model entry.[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]Model fetch failed: {rich_escape(str(e))}[/yellow]")
+    if not model:
+        model = input(f"Model [{model_current or preset_model}]: ").strip() or model_current or preset_model
+    else:
+        manual_override = input(f"Model [{model}] (Enter to keep, or type override): ").strip()
+        if manual_override:
+            model = manual_override
+    max_tokens_in = input(f"Max tokens [{max_tokens_current}]: ").strip()
+    temp_in = input(f"Temperature [{temp_current}]: ").strip()
+    try:
+        max_tokens = int(max_tokens_in) if max_tokens_in else max_tokens_current
+        temperature = float(temp_in) if temp_in else temp_current
+    except ValueError:
+        return "Cancelled: invalid numeric value for max_tokens or temperature."
+
+    if scope_key == "active":
+        save_scope = input("Save active config to [1] workspace (.z/.z.json) or [2] global (~/.z.json)? [1/2]: ").strip() or "1"
+        config_data = {
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        config_path = (Path.home() / ".z.json") if save_scope == "2" else (Path(workspace) / ".z" / ".z.json")
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+
+        # Update current runtime config in-place
+        agent.config.api_url = api_url
+        agent.config.api_key = api_key
+        agent.config.model = model
+        agent.config.max_tokens = max_tokens
+        agent.config.temperature = temperature
+        # Keep handlers synced in case a prior mode-switch replaced config object.
+        agent.tool_handlers.config = agent.config
+        return f"Saved active config to {config_path} ({label}, {model})"
+
+    models_path = Path(workspace) / ".z" / "models.json"
+    models_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if models_path.exists():
+        try:
+            data = json.loads(models_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            data = {}
+    data.setdefault("providers", {})
+    data["providers"][scope] = {
+        "api_url": api_url,
+        "api_key": api_key,
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    models_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    providers[scope] = data["providers"][scope]
+    agent.providers = providers
+    return f"Saved provider profile '{scope}' to {models_path} ({label}, {model})"
+
+
+def _infer_active_provider_profile(agent: ClineAgent, providers: Dict[str, dict]) -> Optional[str]:
+    for name, p in providers.items():
+        if (
+            p.get("api_url") == agent.config.api_url
+            and p.get("api_key") == agent.config.api_key
+            and p.get("model") == agent.config.model
+        ):
+            return name
+    for name, p in providers.items():
+        if p.get("api_url") == agent.config.api_url and p.get("api_key") == agent.config.api_key:
+            return name
+    return None
+
+
+def run_provider_manager(
+    workspace: str,
+    console: Console,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+    cmd_arg: str = "",
+) -> str:
+    """Manage saved provider profiles with a simple UX."""
+    parts = [p for p in cmd_arg.split() if p.strip()]
+    sub = (parts[0].lower() if parts else "list")
+
+    if sub in ("list", "ls"):
+        if not providers:
+            return "No provider profiles saved yet. Use /provider setup <name>."
+        active_name = _infer_active_provider_profile(agent, providers)
+        console.print("[dim]Provider profiles:[/dim]")
+        for name in sorted(providers.keys()):
+            p = providers[name]
+            marker = "*" if name == active_name else " "
+            url = p.get("api_url", "")
+            model = p.get("model", "")
+            console.print(f"[dim] {marker} {name:14s} {model}[/dim]")
+            console.print(f"[dim]    {url}[/dim]")
+        return "Listed provider profiles."
+
+    if sub == "setup":
+        profile = parts[1] if len(parts) > 1 else "default"
+        return run_in_app_config_wizard(workspace, console, agent, providers, profile)
+
+    if sub == "use":
+        if len(parts) < 2:
+            return "Usage: /provider use <profile_name>"
+        profile = parts[1]
+        p = providers.get(profile)
+        if not p:
+            return f"Provider profile '{profile}' not found. Use /provider list."
+        agent.config.api_url = p.get("api_url", agent.config.api_url)
+        agent.config.api_key = p.get("api_key", agent.config.api_key)
+        agent.config.model = p.get("model", agent.config.model)
+        if "max_tokens" in p:
+            try:
+                agent.config.max_tokens = int(p["max_tokens"])
+            except Exception:
+                pass
+        if "temperature" in p:
+            try:
+                agent.config.temperature = float(p["temperature"])
+            except Exception:
+                pass
+        agent.tool_handlers.config = agent.config
+        _save_active_config_fields(workspace, {
+            "api_url": agent.config.api_url,
+            "api_key": agent.config.api_key,
+            "model": agent.config.model,
+            "max_tokens": agent.config.max_tokens,
+            "temperature": agent.config.temperature,
+        })
+        return f"Using provider profile '{profile}' ({agent.config.model})"
+
+    if sub in ("remove", "rm", "delete"):
+        if len(parts) < 2:
+            return "Usage: /provider remove <profile_name>"
+        profile = parts[1]
+        if profile not in providers:
+            return f"Provider profile '{profile}' not found."
+        models_path = Path(workspace) / ".z" / "models.json"
+        data = {}
+        if models_path.exists():
+            try:
+                data = json.loads(models_path.read_text(encoding="utf-8-sig"))
+            except Exception:
+                data = {}
+        data.setdefault("providers", {})
+        data["providers"].pop(profile, None)
+        models_path.parent.mkdir(parents=True, exist_ok=True)
+        models_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        providers.pop(profile, None)
+        if getattr(agent, "providers", None) is not None:
+            agent.providers = providers
+        return f"Removed provider profile '{profile}'."
+
+    if sub in ("current", "show"):
+        active_name = _infer_active_provider_profile(agent, providers)
+        if active_name:
+            return f"Current provider profile: {active_name}"
+        return "Current provider is active config (not matching a saved profile)."
+
+    return "Usage: /provider [list|current|setup <name>|use <name>|remove <name>]"
+
+
+def run_providers_hub(
+    workspace: str,
+    console: Console,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+    cmd_arg: str = "",
+) -> str:
+    """Simple provider UX hub.
+
+    `/providers` with no args shows configured providers and offers a quick action.
+    Supports `/providers setup/use/remove/list/current ...` as aliases.
+    """
+    parts = [p for p in cmd_arg.split() if p.strip()]
+    if parts:
+        # Support numeric shorthand for "use" based on current sorted list.
+        if len(parts) == 1 and parts[0].isdigit():
+            names = sorted(providers.keys())
+            idx = int(parts[0])
+            if 1 <= idx <= len(names):
+                return run_provider_manager(workspace, console, agent, providers, f"use {names[idx - 1]}")
+        return run_provider_manager(workspace, console, agent, providers, cmd_arg)
+
+    active_name = _infer_active_provider_profile(agent, providers)
+    console.print("[dim]Providers:[/dim]")
+    if providers:
+        names = sorted(providers.keys())
+        for i, name in enumerate(names, 1):
+            p = providers[name]
+            marker = "*" if name == active_name else " "
+            model = p.get("model", "(no model)")
+            url = p.get("api_url", "")
+            console.print(f"[dim] {marker}[{i}] {name:14s} {model}[/dim]")
+            if url:
+                console.print(f"[dim]      {url}[/dim]")
+    else:
+        console.print("[dim]  (none configured yet)[/dim]")
+
+    console.print("[dim]Examples:[/dim]")
+    console.print("[dim]  /providers setup anthropic   (configure/override a provider)[/dim]")
+    console.print("[dim]  /providers setup openai[/dim]")
+    console.print("[dim]  /providers setup openrouter[/dim]")
+    console.print("[dim]  /providers use anthropic     (or /providers 1)[/dim]")
+    console.print("[dim]  /providers remove anthropic[/dim]")
+    return "Listed providers."
+
+
+def _ui_choose_from_list(
+    title: str,
+    text: str,
+    values: List[tuple[str, str]],
+) -> Optional[str]:
+    """Prompt-toolkit radio-list dialog picker (returns selected value)."""
+    if not (HAS_PROMPT_TOOLKIT and HAS_PT_DIALOGS):
+        return None
+    try:
+        return radiolist_dialog(
+            title=title,
+            text=text,
+            values=values,
+            ok_text="Select",
+            cancel_text="Cancel",
+        ).run()
+    except Exception:
+        return None
+
+
+def run_provider_picker_ui(
+    workspace: str,
+    console: Console,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+) -> str:
+    """Interactive provider picker UI (no command memorization needed)."""
+    if not providers:
+        return "No provider profiles yet. Use /provider setup <name> once, then use F2/F3."
+    active = _infer_active_provider_profile(agent, providers)
+    values: List[tuple[str, str]] = []
+    for name in sorted(providers.keys()):
+        p = providers[name]
+        label = f"{name}"
+        model = p.get("model", "")
+        url = p.get("api_url", "")
+        if model:
+            label += f"  |  {model}"
+        if url:
+            label += f"  |  {url}"
+        values.append((name, label))
+    picked = _ui_choose_from_list(
+        title="Select Provider",
+        text="Choose a saved provider profile to use now.",
+        values=values,
+    )
+    if not picked:
+        return "Provider selection cancelled."
+    return run_provider_manager(workspace, console, agent, providers, f"use {picked}")
+
+
+def run_model_picker_ui(
+    workspace: str,
+    console: Console,
+    agent: ClineAgent,
+    providers: Dict[str, dict],
+    refresh: bool = False,
+) -> str:
+    """Interactive model picker UI for the current provider."""
+    api_url = agent.config.api_url
+    api_key = agent.config.api_key
+    current_model = agent.config.model
+    if not api_url or not api_key:
+        return "No active provider configured. Use /provider setup <name> then /provider use <name>."
+    try:
+        model_ids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=refresh)
+    except Exception as e:
+        return f"Model fetch failed: {e}"
+    if not model_ids:
+        return "Provider returned no models."
+
+    display_ids = model_ids
+    if len(model_ids) > 200 and HAS_PROMPT_TOOLKIT and HAS_PT_DIALOGS:
+        flt = input_dialog(
+            title="Filter Models",
+            text=f"{len(model_ids)} models found. Enter a search substring (optional):",
+        ).run()
+        if flt:
+            filtered = [m for m in model_ids if flt.lower() in m.lower()]
+            if filtered:
+                display_ids = filtered
+            else:
+                return f"No models matched filter '{flt}'."
+    # Keep dialog usable
+    shown = display_ids[:200]
+    if len(shown) == 0:
+        return "No models available."
+    values = [(mid, mid) for mid in shown]
+    picked = _ui_choose_from_list(
+        title="Select Model",
+        text=f"Current: {current_model}\nShowing {len(shown)} of {len(display_ids)} model(s)",
+        values=values,
+    )
+    if not picked:
+        return "Model selection cancelled."
+    return run_model_switch_wizard(workspace, console, agent, providers, picked)
+
+
 def list_sessions(workspace: str) -> list[tuple[str, datetime, int]]:
     """List all sessions for a workspace. Returns [(name, modified_time, message_count), ...]"""
     import json
@@ -314,8 +1207,8 @@ class HarnessCompleter(Completer):
     
     COMMANDS = [
         '/sessions', '/session', '/delete', '/clear', '/save',
-        '/history', '/bg', '/mode', '/ctx', '/tokens', '/compact',
-        '/todo', '/smart', '/dump', '/config', '/iter', '/clip',
+        '/history', '/bg', '/ctx', '/tokens', '/compact', '/cost', '/maxctx',
+        '/todo', '/smart', '/dump', '/config', '/providers', '/model', '/iter', '/clip',
         '/index', '/log', '/help', '/?', '/exit', '/quit', '/q',
     ]
     
@@ -434,17 +1327,6 @@ class HarnessCompleter(Completer):
                             start_position=-len(prefix),
                             display=sub,
                         )
-            elif parts[0] == '/mode':
-                # Complete mode names
-                modes = ['fast', 'normal']
-                prefix = parts[-1]
-                for mode in modes:
-                    if mode.startswith(prefix):
-                        yield Completion(
-                            mode,
-                            start_position=-len(prefix),
-                            display=mode,
-                        )
             elif parts[0] == '/compact':
                 # Complete compact strategies
                 strategies = ['half', 'quarter', 'last2']
@@ -512,7 +1394,13 @@ class HarnessCompleter(Completer):
                         pass
 
 
-def create_prompt_session(history_file: Path, workspace: Path) -> "PromptSession":
+def create_prompt_session(
+    history_file: Path,
+    workspace: Path,
+    on_paste_image_marker: Optional[Callable[[], Optional[str]]] = None,
+    on_open_provider_picker: Optional[Callable[[], None]] = None,
+    on_open_model_picker: Optional[Callable[[], None]] = None,
+) -> "PromptSession":
     """Create a prompt session with multiline support.
     
     Keybindings:
@@ -536,6 +1424,38 @@ def create_prompt_session(history_file: Path, workspace: Path) -> "PromptSession
     def _(event):
         """Ctrl+Enter: insert newline."""
         event.current_buffer.insert_text('\n')
+
+    @bindings.add('c-v')
+    def _(event):
+        """Ctrl+V: paste clipboard image marker when available."""
+        if on_paste_image_marker:
+            try:
+                marker = on_paste_image_marker()
+            except Exception:
+                marker = None
+            if marker:
+                event.current_buffer.insert_text(marker)
+                return
+        # Fallback: let users still get a visible character rather than no-op.
+        event.current_buffer.insert_text('\x16')
+
+    @bindings.add('f2')
+    def _(event):
+        """F2: open provider picker UI."""
+        if on_open_provider_picker:
+            if pt_run_in_terminal:
+                pt_run_in_terminal(on_open_provider_picker)
+            else:
+                on_open_provider_picker()
+
+    @bindings.add('f3')
+    def _(event):
+        """F3: open model picker UI."""
+        if on_open_model_picker:
+            if pt_run_in_terminal:
+                pt_run_in_terminal(on_open_model_picker)
+            else:
+                on_open_model_picker()
     
     # Create session with history
     history_file.parent.mkdir(parents=True, exist_ok=True)
@@ -555,13 +1475,75 @@ def create_prompt_session(history_file: Path, workspace: Path) -> "PromptSession
     )
 
 
-async def run_single(agent: ClineAgent, user_input: str, console: Console) -> str:
+def _render_cost_report(console: Console) -> None:
+    tracker = get_global_tracker()
+    summary = tracker.get_summary()
+    console.print("[dim]Session API cost:[/dim]")
+    console.print(f"[dim]  Calls: {summary.total_calls}[/dim]")
+    console.print(
+        f"[dim]  Tokens: {summary.total_input_tokens:,} in / "
+        f"{summary.total_output_tokens:,} out ({summary.total_tokens:,} total)[/dim]"
+    )
+    console.print(
+        f"[dim]  Cost: ${summary.total_input_cost:.4f} in / "
+        f"${summary.total_output_cost:.4f} out (${summary.total_cost:.4f} total)[/dim]"
+    )
+    if summary.extra_usage_totals:
+        for key in (
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "prompt_cached_tokens",
+            "completion_reasoning_tokens",
+            "reasoning_tokens",
+        ):
+            if key in summary.extra_usage_totals:
+                console.print(f"[dim]  {key}: {summary.extra_usage_totals[key]:,}[/dim]")
+
+    by_model = tracker.get_cost_by_model()
+    if by_model:
+        console.print("[dim]By model:[/dim]")
+        for model, row in sorted(by_model.items(), key=lambda kv: kv[1]["total_cost"], reverse=True):
+            console.print(
+                f"[dim]  {model}: {int(row['calls'])} call(s), "
+                f"{int(row['input_tokens']):,} in / {int(row['output_tokens']):,} out, "
+                f"${row['total_cost']:.4f}[/dim]"
+            )
+
+
+def _parse_token_limit_input(raw: str) -> Optional[int]:
+    s = (raw or "").strip().lower().replace(",", "")
+    if not s:
+        return None
+    mult = 1
+    if s.endswith("k"):
+        mult = 1000
+        s = s[:-1]
+    elif s.endswith("m"):
+        mult = 1_000_000
+        s = s[:-1]
+    try:
+        val = int(float(s) * mult)
+    except ValueError:
+        return None
+    return val if val > 0 else None
+
+
+async def run_single(
+    agent: ClineAgent,
+    user_input: Union[str, List[Dict[str, Any]]],
+    console: Console,
+    user_label: Optional[str] = None,
+) -> str:
     """Run a single user request."""
     start_time = time.time()
     log.debug("run_single START mode=%s input=%s",
-              agent.reasoning_mode, truncate(user_input, 120))
+              agent.reasoning_mode,
+              truncate(user_label or (user_input if isinstance(user_input, str) else "[multimodal]"), 120))
     try:
-        result = await agent.run(user_input)
+        if isinstance(user_input, str):
+            result = await agent.run(user_input)
+        else:
+            result = await agent.run_message(user_input, user_label=user_label or "[multimodal]")
     except asyncio.CancelledError:
         log.warning("run_single cancelled after %.1fs", time.time() - start_time)
         console.print("\n[yellow][STOP] Cancelled[/yellow]")
@@ -661,16 +1643,20 @@ def main():
     if not providers:
         log.warning("No providers found in .z/models.json — falling back to default config")
     
-    # Determine starting config — use 'normal' provider if available, else fall back to .z.json
-    if "normal" in providers:
-        p = providers["normal"]
+    # Determine starting config from the active config file (.z/.z.json or ~/.z.json).
+    # Provider profiles are available via /provider use and /provider setup.
+    config = Config.from_json(workspace=Path(workspace))
+    if (not config.api_url or not config.api_key) and providers:
+        first_name = sorted(providers.keys())[0]
+        p = providers[first_name]
         config = Config.from_json(workspace=Path(workspace), overrides={
-            "api_url": p["api_url"],
-            "api_key": p["api_key"],
-            "model": p["model"],
+            "api_url": p.get("api_url", ""),
+            "api_key": p.get("api_key", ""),
+            "model": p.get("model", config.model),
+            "max_tokens": p.get("max_tokens", config.max_tokens),
+            "temperature": p.get("temperature", config.temperature),
         })
-    else:
-        config = Config.from_json(workspace=Path(workspace))
+        log.info("No active config found; bootstrapping from provider profile '%s'", first_name)
     config.validate()
     log.info("Config loaded: api_url=%s model=%s max_tokens=%d providers=%s",
              config.api_url, config.model, config.max_tokens, list(providers.keys()))
@@ -742,11 +1728,32 @@ def main():
             border_style="cyan",
             padding=(1, 2),
         ))
-        console.print("[dim]Type your request, !cmd for shell, or /help for commands. Esc to interrupt.[/dim]\n")
+        console.print("[dim]Type your request, !cmd for shell, /help for commands. Esc to interrupt.[/dim]\n")
         
         # Create prompt session for multiline input
+        def _prompt_paste_image_marker() -> Optional[str]:
+            img_path, error = get_clipboard_image()
+            if error or not img_path:
+                return None
+            return f" [[clipboard_image:{img_path}]] "
+
+        def _open_provider_picker_ui() -> None:
+            console.print("[dim]Use /providers[/dim]")
+
+        def _open_model_picker_ui() -> None:
+            console.print("[dim]Use /model[/dim]")
+
         history_file = get_sessions_dir(workspace) / ".history"
-        prompt_session = create_prompt_session(history_file, workspace) if HAS_PROMPT_TOOLKIT else None
+        prompt_session = (
+            create_prompt_session(
+                history_file,
+                Path(workspace),
+                on_paste_image_marker=_prompt_paste_image_marker,
+                                on_open_provider_picker=_open_provider_picker_ui,
+                                on_open_model_picker=_open_model_picker_ui,
+            )
+            if HAS_PROMPT_TOOLKIT else None
+        )
         
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         
@@ -865,6 +1872,10 @@ def main():
                     elif cmd == '/history':
                         console.print(f"[dim]Messages: {len(agent.messages)}[/dim]")
                         continue
+
+                    elif cmd == '/cost':
+                        _render_cost_report(console)
+                        continue
                     
                     elif cmd == '/bg':
                         procs = agent.list_background_procs()
@@ -878,16 +1889,7 @@ def main():
                         continue
                     
                     elif cmd == '/mode':
-                        if not cmd_arg:
-                            console.print(f"[dim]Current reasoning mode: {agent.reasoning_mode}[/dim]")
-                            console.print(f"[dim]Available: {', '.join(providers.keys())}[/dim]")
-                        else:
-                            mode = cmd_arg.strip().lower()
-                            if mode in providers:
-                                result = agent._handle_set_reasoning_mode({"mode": mode})
-                                console.print(f"[dim]{result}[/dim]")
-                            else:
-                                console.print(f"[dim]Unknown mode '{mode}'. Available: {', '.join(providers.keys())}[/dim]")
+                        console.print("[dim]/mode is deprecated. Use /providers and /model instead.[/dim]")
                         continue
                     
                     elif cmd == '/ctx':
@@ -983,8 +1985,7 @@ def main():
                             sys_content = agent.messages[0].content
                             expected_tools = [
                                 'read_file', 'write_to_file', 'replace_in_file',
-                                'execute_command', 'manage_todos',
-                                'set_reasoning_mode', 'create_plan',
+                                'execute_command', 'manage_todos', 'create_plan',
                             ]
                             tools_present = [t for t in expected_tools if t in sys_content]
                             tools_missing = [t for t in expected_tools if t not in sys_content]
@@ -997,13 +1998,70 @@ def main():
                         continue
                     
                     elif cmd == '/config':
+                        subparts = cmd_arg.split()
+                        if subparts and subparts[0].lower() == "setup":
+                            scope = subparts[1].lower() if len(subparts) > 1 else "active"
+                            try:
+                                result = run_in_app_config_wizard(workspace, console, agent, providers, scope)
+                                console.print(f"[dim]{result}[/dim]")
+                            except KeyboardInterrupt:
+                                console.print("\n[dim]Config wizard cancelled.[/dim]")
+                            continue
+
                         key_preview = agent.config.api_key[:8] + "..." if agent.config.api_key else "(not set)"
                         console.print(f"[dim]API URL: {agent.config.api_url}[/dim]")
                         console.print(f"[dim]Model:   {agent.config.model}[/dim]")
                         console.print(f"[dim]API Key: {key_preview}[/dim]")
                         console.print(f"[dim]Max tokens: {agent.config.max_tokens:,}[/dim]")
-                        console.print(f"[dim]Reasoning mode: {agent.reasoning_mode}[/dim]")
+                        console.print(f"[dim]Temp: {agent.config.temperature}[/dim]")
                         console.print(f"[dim]Max iterations: {agent.max_iterations}[/dim]")
+                        if providers:
+                            console.print(f"[dim]Saved provider profiles: {', '.join(sorted(providers.keys()))}[/dim]")
+                        console.print("[dim]Use /providers to manage saved providers and /model to search models.[/dim]")
+                        continue
+
+                    elif cmd in ('/provider', '/providers'):
+                        try:
+                            if cmd == '/providers':
+                                result = run_providers_hub(workspace, console, agent, providers, cmd_arg)
+                            else:
+                                result = run_provider_manager(workspace, console, agent, providers, cmd_arg)
+                            console.print(f"[dim]{result}[/dim]")
+                        except KeyboardInterrupt:
+                            console.print("\n[dim]Provider command cancelled.[/dim]")
+                        continue
+
+                    elif cmd == '/model':
+                        try:
+                            result = run_model_switch_wizard(workspace, console, agent, providers, cmd_arg)
+                            console.print(f"[dim]{result}[/dim]")
+                        except KeyboardInterrupt:
+                            console.print("\n[dim]Model selection cancelled.[/dim]")
+                        continue
+
+                    elif cmd == '/maxctx':
+                        if not cmd_arg.strip():
+                            console.print(f"[dim]Max tokens (active request cap): {agent.config.max_tokens:,}[/dim]")
+                            console.print("[dim]Usage: /maxctx <tokens>   examples: /maxctx 8000, /maxctx 32k[/dim]")
+                            continue
+                        parsed = _parse_token_limit_input(cmd_arg)
+                        if not parsed:
+                            console.print("[dim]Invalid value. Examples: /maxctx 8000, /maxctx 32k, /maxctx 0.5m[/dim]")
+                            continue
+                        # Keep a sane floor to avoid accidental tiny limits.
+                        if parsed < 256:
+                            console.print("[dim]Minimum allowed is 256 tokens.[/dim]")
+                            continue
+                        agent.config.max_tokens = parsed
+                        agent.tool_handlers.config = agent.config
+                        _save_active_config_fields(workspace, {"max_tokens": parsed})
+                        active_profile = _infer_active_provider_profile(agent, providers)
+                        if active_profile and active_profile in providers:
+                            _save_provider_profile_fields(workspace, providers, active_profile, {"max_tokens": parsed})
+                            providers[active_profile]["max_tokens"] = parsed
+                            console.print(f"[dim]Max tokens set to {parsed:,} (saved to active config and provider '{active_profile}')[/dim]")
+                        else:
+                            console.print(f"[dim]Max tokens set to {parsed:,} (saved to active config)[/dim]")
                         continue
                     
                     elif cmd == '/iter':
@@ -1076,9 +2134,14 @@ def main():
   /compact [strat]   - Remove older messages (half/quarter/last2)
   /tokens            - Show token breakdown  
   /config            - Show current API configuration
-  /mode [fast|normal] - Show or switch reasoning mode
+  /config setup [name] - Quick setup (active config or saved provider profile)
+  /providers         - Provider manager (list + configure/override + use)
+  /providers [args]  - Providers: list/use/setup/remove/current
+  /model [query]     - Search and pick models across all configured providers
+  /model list        - List models for current provider
+  /maxctx [tokens]   - Show/set max token cap (e.g. 8k, 32k)
   /iter [n]          - Show or set max iterations
-  /clip [question]   - Analyze image from clipboard
+  /clip [question]   - Analyze image from clipboard (fallback helper)
   /todo              - Show todo list
   /todo add <title>  - Add a todo
   /todo done <id>    - Mark todo as completed
@@ -1088,6 +2151,7 @@ def main():
   /dump              - Dump full model context to JSON file
   /save              - Save current session
   /history           - Show message count
+  /cost              - Show session API usage/cost totals
   /bg                - List background processes
   /ctx               - Show context container
   /index [rebuild|tree] - Show project map, rebuild index, or show file tree
@@ -1107,7 +2171,8 @@ Input:
   Ctrl+Enter         - Insert newline (multiline input)
   Enter              - Submit input
   Up/Down            - Browse history
-  Paste              - Multiline paste supported"""
+  Paste              - Multiline paste supported
+  Ctrl+V             - Paste clipboard image into your message (multimodal when supported)"""
                         help_text += "[/dim]"
                         console.print(help_text)
                         continue
@@ -1116,9 +2181,34 @@ Input:
                         console.print("[dim]Type /help for commands[/dim]")
                         continue
                 
-                log.info("User input [mode=%s]: %s", agent.reasoning_mode, truncate(user_input, 200))
+                multimodal_content: Optional[List[Dict[str, Any]]] = None
+                multimodal_label: Optional[str] = None
+                original_user_input_for_cleanup = user_input
+                if isinstance(user_input, str) and "[[clipboard_image:" in user_input:
+                    text_part, image_paths = _extract_clipboard_image_markers(user_input)
+                    image_paths = [p for p in image_paths if p.exists()]
+                    if image_paths:
+                        if _supports_multimodal_input(agent.config.api_url, agent.config.model):
+                            multimodal_content = _build_multimodal_user_content(text_part, image_paths)
+                            multimodal_label = text_part or f"[pasted {len(image_paths)} image(s)]"
+                            console.print(f"[dim]Attached {len(image_paths)} pasted image(s) to your message.[/dim]")
+                        else:
+                            fallback_q = text_part or "Describe this image in detail."
+                            user_input = f"Analyze this image: {image_paths[0]}\n\nQuestion: {fallback_q}"
+                            console.print("[dim]Current model may not support images directly; using /clip-style fallback.[/dim]")
+                    else:
+                        user_input, _ = _extract_clipboard_image_markers(user_input)
+
+                log.info("User input [mode=%s]: %s", agent.reasoning_mode, truncate(multimodal_label or user_input, 200))
                 try:
-                    result = loop.run_until_complete(run_single(agent, user_input, console))
+                    result = loop.run_until_complete(
+                        run_single(
+                            agent,
+                            multimodal_content if multimodal_content is not None else user_input,
+                            console,
+                            user_label=multimodal_label,
+                        )
+                    )
                     log.info("run_single completed, result_len=%d", len(result or ""))
                     # Show live todo panel if there are any todos
                     agent.todo_manager.print_todo_panel(console)
@@ -1132,6 +2222,14 @@ Input:
                 
                 # Auto-save session after each exchange
                 agent.save_session(str(session_path))
+                if isinstance(original_user_input_for_cleanup, str) and "[[clipboard_image:" in original_user_input_for_cleanup:
+                    _, _tmp_paths = _extract_clipboard_image_markers(original_user_input_for_cleanup)
+                    for _p in _tmp_paths:
+                        try:
+                            if "harness_clipboard" in str(_p).lower():
+                                _p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
                 print()  # Blank line between requests
                 
             except KeyboardInterrupt:

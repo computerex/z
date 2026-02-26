@@ -2,7 +2,7 @@
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any
 from datetime import datetime
 import json
 
@@ -38,6 +38,7 @@ class APICall:
     duration_ms: float
     tool_calls: int = 0
     finish_reason: str = ""
+    extra_usage: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
@@ -53,6 +54,7 @@ class APICall:
             "duration_ms": self.duration_ms,
             "tool_calls": self.tool_calls,
             "finish_reason": self.finish_reason,
+            "extra_usage": self.extra_usage,
         }
 
 
@@ -69,6 +71,7 @@ class CostSummary:
     total_cost: float = 0.0
     total_duration_ms: float = 0.0
     total_tool_calls: int = 0
+    extra_usage_totals: Dict[str, int] = field(default_factory=dict)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
@@ -82,6 +85,7 @@ class CostSummary:
             "total_cost": round(self.total_cost, 6),
             "total_duration_ms": round(self.total_duration_ms, 2),
             "total_tool_calls": self.total_tool_calls,
+            "extra_usage_totals": dict(self.extra_usage_totals),
             "avg_tokens_per_call": round(self.total_tokens / max(1, self.total_calls), 1),
             "avg_cost_per_call": round(self.total_cost / max(1, self.total_calls), 6),
         }
@@ -141,6 +145,7 @@ class CostTracker:
         duration_ms: float,
         tool_calls: int = 0,
         finish_reason: str = "",
+        extra_usage: Optional[Dict[str, Any]] = None,
     ) -> APICall:
         """Record an API call."""
         pricing = self.get_pricing(model)
@@ -161,6 +166,7 @@ class CostTracker:
             duration_ms=duration_ms,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
+            extra_usage=dict(extra_usage or {}),
         )
         
         self.calls.append(call)
@@ -186,8 +192,37 @@ class CostTracker:
             summary.total_cost += call.total_cost
             summary.total_duration_ms += call.duration_ms
             summary.total_tool_calls += call.tool_calls
-        
+            for k, v in (call.extra_usage or {}).items():
+                if k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    continue
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    summary.extra_usage_totals[k] = int(summary.extra_usage_totals.get(k, 0)) + int(v)
+
         return summary
+
+    def get_cost_by_model(self) -> Dict[str, Dict[str, float]]:
+        """Aggregate usage/cost by model for the current session."""
+        out: Dict[str, Dict[str, float]] = {}
+        for call in self.calls:
+            row = out.setdefault(call.model, {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "input_cost": 0.0,
+                "output_cost": 0.0,
+                "total_cost": 0.0,
+            })
+            row["calls"] += 1
+            row["input_tokens"] += call.input_tokens
+            row["output_tokens"] += call.output_tokens
+            row["total_tokens"] += call.total_tokens
+            row["input_cost"] += call.input_cost
+            row["output_cost"] += call.output_cost
+            row["total_cost"] += call.total_cost
+        return out
     
     def get_last_call(self) -> Optional[APICall]:
         """Get the most recent API call."""
