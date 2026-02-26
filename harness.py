@@ -34,7 +34,10 @@ from harness.cost_tracker import get_global_tracker, reset_global_tracker
 from harness.logger import init_logging, get_logger, log_exception, truncate
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 from rich.markup import escape as rich_escape
+from rich import box
 
 log = get_logger("main")
 
@@ -115,26 +118,24 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
         return
     
     # Interactive mode
-    print("\n" + "="*60)
-    print("  LLM Harness Setup")
-    print("="*60 + "\n")
-    
-    # Choose provider
-    print("Select your LLM provider:\n")
-    print("  [1] Z.AI Coding Plan (recommended)")
-    print("      - https://api.z.ai/api/coding/paas/v4/\n")
-    print("  [2] Z.AI Standard API")
-    print("      - https://api.z.ai/api/paas/v4/\n")
-    print("  [3] MiniMax")
-    print("      - https://api.minimax.io/v1/\n")
-    print("  [4] Anthropic")
-    print("      - https://api.anthropic.com/v1/\n")
-    print("  [5] OpenRouter")
-    print("      - https://openrouter.ai/api/v1/\n")
-    print("  [6] OpenAI")
-    print("      - https://api.openai.com/v1/\n")
-    print("  [7] Custom OpenAI-compatible API")
-    print("      - Enter your own URL\n")
+    con = Console()
+    con.print()
+    con.print(Panel(
+        "[bold]Welcome to Harness[/bold]\n\n[dim]Let's configure your LLM provider.[/dim]",
+        border_style="bright_blue",
+        padding=(1, 3),
+        width=50,
+    ))
+    con.print()
+    con.print("  Select your LLM provider:\n")
+    con.print("  [cyan][1][/cyan] Z.AI Coding Plan [dim](recommended)[/dim]")
+    con.print("  [cyan][2][/cyan] Z.AI Standard API")
+    con.print("  [cyan][3][/cyan] MiniMax")
+    con.print("  [cyan][4][/cyan] Anthropic")
+    con.print("  [cyan][5][/cyan] OpenRouter")
+    con.print("  [cyan][6][/cyan] OpenAI")
+    con.print("  [cyan][7][/cyan] Custom OpenAI-compatible API")
+    con.print()
     
     while True:
         choice = input("Enter choice [1/2/3/4]: ").strip()
@@ -179,10 +180,8 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
         else:
             print("Please enter 1, 2, 3, 4, 5, 6, or 7.")
     
-    print(f"\nUsing {provider}: {base_url}")
-    
-    # Get API key
-    print("\nEnter your API key:\n")
+    con.print(f"\n  [green]\u2713[/green] Using [bold]{provider}[/bold]")
+    con.print(f"    [dim]{base_url}[/dim]\n")
     
     api_key = ""
     while not api_key:
@@ -201,10 +200,10 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
         "model": model,
     }
     
-    # Choose where to save
-    print("\nWhere to save configuration?\n")
-    print("  [1] Global (~/.z.json) - applies to all projects")
-    print("  [2] Workspace (.z/.z.json) - this project only\n")
+    con.print("\n  Where to save configuration?\n")
+    con.print("  [cyan][1][/cyan] Global [dim](~/.z.json \u2014 all projects)[/dim]")
+    con.print("  [cyan][2][/cyan] Workspace [dim](.z/.z.json \u2014 this project only)[/dim]")
+    con.print()
     
     save_choice = input("Enter choice [1/2] (default: 1): ").strip() or "1"
     
@@ -223,15 +222,17 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
     # Write config
     config_path.write_text(json.dumps(config_data, indent=2))
     
-    print(f"\n" + "="*60)
-    print("  Setup Complete!")
-    print("="*60)
-    print(f"\nConfiguration saved to: {config_path}")
-    print(f"  Location: {location}")
-    print(f"  Provider: {provider}")
-    print(f"  Model:    {model}")
-    print(f"  Key:      {api_key[:10]}...")
-    print(f"\nRun 'python harness.py' to start.\n")
+    tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+    tbl.add_column("label", style="dim", width=10, justify="right")
+    tbl.add_column("value")
+    tbl.add_row("Saved to", str(config_path))
+    tbl.add_row("Location", location)
+    tbl.add_row("Provider", provider)
+    tbl.add_row("Model", model)
+    tbl.add_row("Key", api_key[:10] + "...")
+    con.print()
+    con.print(Panel(tbl, title="[bold green] Setup Complete [/bold green]", border_style="green", padding=(1, 2)))
+    con.print("\n  [dim]Run [white]python harness.py[/white] to start.[/dim]\n")
 
 
 def get_clipboard_image() -> tuple[Path | None, str]:
@@ -500,15 +501,15 @@ def _interactive_model_picker(current_model: str, model_ids: List[str]) -> str:
 
     models = model_ids[:]
     while True:
-        print(f"\nFetched {len(models):,} model(s).")
+        print(f"\n  Fetched {len(models):,} model(s).")
         if len(models) > 40:
-            flt = input("Filter models by substring (blank = no filter): ").strip().lower()
+            flt = input("  Filter by substring (blank = skip): ").strip().lower()
             if flt:
                 filtered = [m for m in models if flt in m.lower()]
                 if filtered:
                     models = filtered
                 else:
-                    print("No matches for that filter.")
+                    print("  No matches for that filter.")
                     continue
 
         shown = models[:40]
@@ -516,8 +517,8 @@ def _interactive_model_picker(current_model: str, model_ids: List[str]) -> str:
         for i, mid in enumerate(shown, 1):
             print(f"  [{i:2d}] {mid}")
         if len(models) > len(shown):
-            print(f"  ... ({len(models) - len(shown)} more not shown)")
-        prompt = f"Choose model number, type custom model id, or Enter to keep [{current_model}]: "
+            print(f"  ... ({len(models) - len(shown)} more)")
+        prompt = f"\n  Choose number, type model id, or Enter to keep [{current_model}]: "
         choice = input(prompt).strip()
         if not choice:
             return current_model
@@ -565,7 +566,7 @@ def _apply_selected_provider_model(
         "max_tokens": agent.config.max_tokens,
         "temperature": agent.config.temperature,
     })
-    return f"Using {chosen_model} from provider '{profile}' (saved active config to {cfg_path})"
+    return f"\u2713 Switched to [bold]{chosen_model}[/bold] via {profile}"
 
 
 def _build_searchable_providers(agent: ClineAgent, providers: Dict[str, dict]) -> tuple[List[tuple[str, dict]], Optional[str]]:
@@ -664,18 +665,19 @@ def run_model_switch_wizard(
         if not api_url or not api_key:
             return "No active provider configured."
         try:
-            console.print(f"[dim]Fetching models from current provider...[/dim]")
+            console.print("  [dim]Fetching models...[/dim]")
             mids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=False)
         except Exception as e:
             return f"Model fetch failed: {e}"
         shown = mids[:100]
-        console.print(f"[dim]Current provider models ({len(mids)}):[/dim]")
+        console.print(f"\n  [bold]Models[/bold] [dim]({len(mids)} total)[/dim]\n")
         for m in shown:
-            marker = "*" if m == agent.config.model else " "
-            console.print(f"[dim] {marker} {m}[/dim]")
+            marker = "[cyan]\u25cf[/cyan]" if m == agent.config.model else " "
+            console.print(f"  {marker} {m}")
         if len(mids) > len(shown):
-                console.print(f"[dim]... and {len(mids) - len(shown)} more[/dim]")
-        return "Listed current provider models."
+            console.print(f"  [dim]... and {len(mids) - len(shown)} more[/dim]")
+        console.print()
+        return ""
 
     refresh = (verb == "refresh")
     if verb in ("search", "refresh"):
@@ -685,14 +687,20 @@ def run_model_switch_wizard(
 
     if not query:
         if _LAST_MODEL_SEARCH_RESULTS:
-            console.print(f"[dim]Last model search ({len(_LAST_MODEL_SEARCH_RESULTS)} results) query='{_LAST_MODEL_SEARCH_QUERY}'[/dim]")
+            console.print(f"\n  [bold]Last Search[/bold] [dim]'{_LAST_MODEL_SEARCH_QUERY}' \u2014 {len(_LAST_MODEL_SEARCH_RESULTS)} results[/dim]\n")
+            tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
+            tbl.add_column(width=2)
+            tbl.add_column("num", style="dim", width=4)
+            tbl.add_column("model", style="bold")
+            tbl.add_column("provider", style="cyan")
             for i, row in enumerate(_LAST_MODEL_SEARCH_RESULTS[:20], 1):
-                mark = "*" if row["model_id"] == agent.config.model and row["cfg"].get("api_url") == agent.config.api_url else " "
+                mark = "[cyan]\u25cf[/cyan]" if row["model_id"] == agent.config.model and row["cfg"].get("api_url") == agent.config.api_url else " "
                 display_provider = row.get("provider_display") or row["profile"]
-                console.print(f"[dim] {mark}[{i:2d}] {row['model_id']}  [{display_provider}] [/dim]")
-            console.print("[dim]Use /model use <n> or /model <query>[/dim]")
-            return "Listed last model search results."
-        return "Usage: /model <query> (search across configured providers), then /model use <n>"
+                tbl.add_row(mark, f"[{i}]", row["model_id"], display_provider)
+            console.print(tbl)
+            console.print(f"\n  [dim]Use [white]/model use <n>[/white] or [white]/model <query>[/white][/dim]\n")
+            return ""
+        return "Usage: /model <query> to search, then /model use <n>"
 
     searchable, active_name = _build_searchable_providers(agent, providers)
     if not searchable:
@@ -713,7 +721,7 @@ def run_model_switch_wizard(
         if not api_url or not api_key:
             continue
         try:
-            console.print(f"[dim]Fetching models: {provider_display}[/dim]")
+            console.print(f"  [dim]Fetching: {provider_display}...[/dim]")
             mids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=refresh)
             for mid in mids:
                 aggregate.append((profile, provider_display, mid, cfg))
@@ -722,7 +730,7 @@ def run_model_switch_wizard(
 
     if failures:
         for f in failures[:5]:
-            console.print(f"[yellow]{rich_escape(f)}[/yellow]")
+            console.print(f"  [yellow]\u26a0 {rich_escape(f)}[/yellow]")
         if not aggregate:
             return "Model fetch failed for all providers."
 
@@ -761,14 +769,16 @@ def run_model_switch_wizard(
         for (profile, provider_display, mid, cfg) in shown
     ]
 
-    console.print(f"[bold cyan]Model search results[/bold cyan] [dim]for '{query}' ({len(matches)} match(es), showing {len(shown)})[/dim]")
+    console.print(f"\n  [bold]Model Search[/bold] [dim]'{query}' \u2014 {len(matches)} match(es), showing {len(shown)}[/dim]\n")
+    tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
+    tbl.add_column(width=2)
+    tbl.add_column("num", style="dim", width=4)
+    tbl.add_column("model", style="bold")
+    tbl.add_column("provider", style="cyan")
     for i, (profile, provider_display, mid, cfg) in enumerate(shown, 1):
-        active_mark = "*" if ((profile == active_name or profile == "active") and mid == agent.config.model) else " "
-        provider_label = f"{provider_display}".ljust(18)
-        console.print(
-            f" {active_mark}[{i:2d}] [bold]{mid}[/bold]  "
-            f"[cyan]{provider_label}[/cyan]"
-        )
+        active_mark = "[cyan]\u25cf[/cyan]" if ((profile == active_name or profile == "active") and mid == agent.config.model) else " "
+        tbl.add_row(active_mark, f"[{i}]", mid, provider_display)
+    console.print(tbl)
 
     # QoL: if query resolves cleanly, switch immediately (provider + model).
     exact_matches = [row for row in matches if row[2].lower() == q]
@@ -779,8 +789,8 @@ def run_model_switch_wizard(
         profile, _provider_display, chosen_model, cfg = matches[0]
         return _apply_selected_provider_model(workspace, agent, providers, profile, dict(cfg), chosen_model)
 
-    console.print("[dim]Use /model use <n> to switch to a result (provider + model).[/dim]")
-    return "Model search complete."
+    console.print("\n  [dim]Use [white]/model use <n>[/white] to switch to a result.[/dim]\n")
+    return ""
 
 
 def _choose_provider_preset_interactive(current_api_url: str, current_model: str) -> tuple[str, str, str]:
@@ -794,15 +804,15 @@ def _choose_provider_preset_interactive(current_api_url: str, current_model: str
         ("6", "openai"),
         ("7", "custom"),
     ]
-    print("\nSelect provider preset:\n")
+    con = Console()
+    con.print("\n  Select provider:\n")
     for num, key in presets:
         if key == "custom":
-            print("  [7] Custom URL")
+            con.print("  [cyan][7][/cyan] Custom URL")
         else:
             label, url, model = PROVIDER_PRESETS[key]
-            print(f"  [{num}] {label}")
-            print(f"      - {url}")
-            print(f"      - default model: {model}\n")
+            con.print(f"  [cyan][{num}][/cyan] {label}  [dim]{model}[/dim]")
+    con.print()
     while True:
         choice = input("Enter choice [1-7]: ").strip() or "6"
         selected = dict(presets).get(choice)
@@ -850,7 +860,7 @@ def run_in_app_config_wizard(
     current_url = target_existing.get("api_url", "")
     current_model = target_existing.get("model", "")
 
-    console.print(f"[dim]Config wizard ({scope}) — press Enter to keep current values.[/dim]")
+    console.print(f"\n  [bold]Config: {scope}[/bold] [dim](Enter to keep current values)[/dim]\n")
     label, api_url, preset_model = _choose_provider_preset_interactive(current_url, current_model)
     api_key_current = target_existing.get("api_key", "")
     model_current = target_existing.get("model", "") or preset_model
@@ -871,9 +881,9 @@ def run_in_app_config_wizard(
                 if model_ids:
                     model = _interactive_model_picker(model_current, model_ids)
                 else:
-                    console.print("[dim]No models returned by provider; using manual model entry.[/dim]")
+                    console.print("  [dim]No models returned \u2014 using manual entry[/dim]")
             except Exception as e:
-                console.print(f"[yellow]Model fetch failed: {rich_escape(str(e))}[/yellow]")
+                console.print(f"  [yellow]\u26a0 Model fetch failed: {rich_escape(str(e))}[/yellow]")
     if not model:
         model = input(f"Model [{model_current or preset_model}]: ").strip() or model_current or preset_model
     else:
@@ -962,15 +972,19 @@ def run_provider_manager(
         if not providers:
             return "No provider profiles saved yet. Use /provider setup <name>."
         active_name = _infer_active_provider_profile(agent, providers)
-        console.print("[dim]Provider profiles:[/dim]")
+        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+        tbl.add_column(width=2)
+        tbl.add_column("name", style="bold", min_width=12)
+        tbl.add_column("model")
+        tbl.add_column("url", style="dim")
         for name in sorted(providers.keys()):
             p = providers[name]
-            marker = "*" if name == active_name else " "
-            url = p.get("api_url", "")
-            model = p.get("model", "")
-            console.print(f"[dim] {marker} {name:14s} {model}[/dim]")
-            console.print(f"[dim]    {url}[/dim]")
-        return "Listed provider profiles."
+            marker = "[cyan]\u25cf[/cyan]" if name == active_name else " "
+            tbl.add_row(marker, name, p.get("model", ""), p.get("api_url", ""))
+        console.print()
+        console.print(Panel(tbl, title="[bold]Providers[/bold]", border_style="dim", padding=(1, 2)))
+        console.print()
+        return ""
 
     if sub == "setup":
         profile = parts[1] if len(parts) > 1 else "default"
@@ -1004,7 +1018,7 @@ def run_provider_manager(
             "max_tokens": agent.config.max_tokens,
             "temperature": agent.config.temperature,
         })
-        return f"Using provider profile '{profile}' ({agent.config.model})"
+        return f"\u2713 Using [bold]{profile}[/bold] ({agent.config.model})"
 
     if sub in ("remove", "rm", "delete"):
         if len(parts) < 2:
@@ -1060,27 +1074,30 @@ def run_providers_hub(
         return run_provider_manager(workspace, console, agent, providers, cmd_arg)
 
     active_name = _infer_active_provider_profile(agent, providers)
-    console.print("[dim]Providers:[/dim]")
     if providers:
+        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+        tbl.add_column(width=2)
+        tbl.add_column("num", style="dim", width=3)
+        tbl.add_column("name", style="bold", min_width=12)
+        tbl.add_column("model")
+        tbl.add_column("url", style="dim")
         names = sorted(providers.keys())
         for i, name in enumerate(names, 1):
             p = providers[name]
-            marker = "*" if name == active_name else " "
-            model = p.get("model", "(no model)")
+            marker = "[cyan]\u25cf[/cyan]" if name == active_name else " "
+            model = p.get("model", "")
             url = p.get("api_url", "")
-            console.print(f"[dim] {marker}[{i}] {name:14s} {model}[/dim]")
-            if url:
-                console.print(f"[dim]      {url}[/dim]")
+            tbl.add_row(marker, f"[{i}]", name, model, url)
+        console.print()
+        console.print(Panel(tbl, title="[bold]Providers[/bold]", border_style="dim", padding=(1, 2)))
     else:
-        console.print("[dim]  (none configured yet)[/dim]")
+        console.print("\n  [dim]No providers configured yet.[/dim]")
 
-    console.print("[dim]Examples:[/dim]")
-    console.print("[dim]  /providers setup anthropic   (configure/override a provider)[/dim]")
-    console.print("[dim]  /providers setup openai[/dim]")
-    console.print("[dim]  /providers setup openrouter[/dim]")
-    console.print("[dim]  /providers use anthropic     (or /providers 1)[/dim]")
-    console.print("[dim]  /providers remove anthropic[/dim]")
-    return "Listed providers."
+    console.print("  [dim][white]/providers setup <name>[/white]  Configure a provider[/dim]")
+    console.print("  [dim][white]/providers use <name>[/white]    Switch to a provider (or use number)[/dim]")
+    console.print("  [dim][white]/providers remove <name>[/white] Remove a provider[/dim]")
+    console.print()
+    return ""
 
 
 def _ui_choose_from_list(
@@ -1478,17 +1495,17 @@ def create_prompt_session(
 def _render_cost_report(console: Console) -> None:
     tracker = get_global_tracker()
     summary = tracker.get_summary()
-    console.print("[dim]Session API cost:[/dim]")
-    console.print(f"[dim]  Calls: {summary.total_calls}[/dim]")
-    console.print(
-        f"[dim]  Tokens: {summary.total_input_tokens:,} in / "
-        f"{summary.total_output_tokens:,} out ({summary.total_tokens:,} total)[/dim]"
-    )
-    console.print(
-        f"[dim]  Cost: ${summary.total_input_cost:.4f} in / "
-        f"${summary.total_output_cost:.4f} out (${summary.total_cost:.4f} total)[/dim]"
-    )
+
+    tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+    tbl.add_column("label", style="dim", width=15, justify="right")
+    tbl.add_column("value")
+    tbl.add_row("API Calls", str(summary.total_calls))
+    tbl.add_row("Input", f"{summary.total_input_tokens:,} tokens  [dim]${summary.total_input_cost:.4f}[/dim]")
+    tbl.add_row("Output", f"{summary.total_output_tokens:,} tokens  [dim]${summary.total_output_cost:.4f}[/dim]")
+    tbl.add_row("Total", f"[bold]{summary.total_tokens:,} tokens  ${summary.total_cost:.4f}[/bold]")
+
     if summary.extra_usage_totals:
+        tbl.add_row("", "")
         for key in (
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
@@ -1497,17 +1514,28 @@ def _render_cost_report(console: Console) -> None:
             "reasoning_tokens",
         ):
             if key in summary.extra_usage_totals:
-                console.print(f"[dim]  {key}: {summary.extra_usage_totals[key]:,}[/dim]")
+                label = key.replace("_", " ").replace("tokens", "").strip()
+                tbl.add_row(label, f"{summary.extra_usage_totals[key]:,}")
+
+    console.print()
+    console.print(Panel(tbl, title="[bold]Session Costs[/bold]", border_style="dim", padding=(1, 2), width=52))
 
     by_model = tracker.get_cost_by_model()
-    if by_model:
-        console.print("[dim]By model:[/dim]")
+    if by_model and len(by_model) > 1:
+        mtbl = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
+        mtbl.add_column("Model", style="cyan")
+        mtbl.add_column("Calls", justify="right")
+        mtbl.add_column("Tokens", justify="right")
+        mtbl.add_column("Cost", justify="right", style="bold")
         for model, row in sorted(by_model.items(), key=lambda kv: kv[1]["total_cost"], reverse=True):
-            console.print(
-                f"[dim]  {model}: {int(row['calls'])} call(s), "
-                f"{int(row['input_tokens']):,} in / {int(row['output_tokens']):,} out, "
-                f"${row['total_cost']:.4f}[/dim]"
+            mtbl.add_row(
+                model,
+                str(int(row["calls"])),
+                f"{int(row['total_tokens']):,}",
+                f"${row['total_cost']:.4f}",
             )
+        console.print(mtbl)
+    console.print()
 
 
 def _parse_token_limit_input(raw: str) -> Optional[int]:
@@ -1546,11 +1574,11 @@ async def run_single(
             result = await agent.run_message(user_input, user_label=user_label or "[multimodal]")
     except asyncio.CancelledError:
         log.warning("run_single cancelled after %.1fs", time.time() - start_time)
-        console.print("\n[yellow][STOP] Cancelled[/yellow]")
+        console.print("\n  [yellow]Cancelled[/yellow]")
         result = "[Interrupted]"
     except KeyboardInterrupt:
         log.warning("run_single KeyboardInterrupt after %.1fs", time.time() - start_time)
-        console.print("\n[yellow][STOP] Interrupted[/yellow]")
+        console.print("\n  [yellow]Interrupted[/yellow]")
         result = "[Interrupted]"
     
     elapsed = time.time() - start_time
@@ -1558,11 +1586,9 @@ async def run_single(
     log.info("run_single DONE mode=%s elapsed=%.1fs result_len=%d",
              agent.reasoning_mode, elapsed, len(result or ""))
     
-    # Show compact status line after response (Forge-style)
     cost = get_global_tracker().get_summary()
     stats = agent.get_context_stats()
     
-    # Format elapsed time
     if elapsed < 60:
         elapsed_str = f"{elapsed:.1f}s"
     else:
@@ -1574,15 +1600,20 @@ async def run_single(
     max_k = stats['max_allowed'] // 1000
     pct = stats['percent']
     
-    parts = [
-        f"{agent.config.model}",
-        f"ctx: {ctx_k}k/{max_k}k ({pct:.0f}%)",
-        f"{elapsed_str}",
-    ]
-    if cost.total_cost > 0:
-        parts.append(f"${cost.total_cost:.4f}")
+    bar_width = 10
+    filled = int(bar_width * pct / 100)
+    bar_color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
     
-    console.print(f"[dim]{' │ '.join(parts)}[/dim]")
+    status = Text("  ")
+    status.append(agent.config.model, style="bold dim")
+    status.append("  ", style="dim")
+    status.append("\u2501" * filled, style=bar_color)
+    status.append("\u2500" * (bar_width - filled), style="dim")
+    status.append(f" {ctx_k}k/{max_k}k", style="dim")
+    status.append(f"  {elapsed_str}", style="dim")
+    if cost.total_cost > 0:
+        status.append(f"  ${cost.total_cost:.4f}", style="dim")
+    console.print(status)
     
     return result or ""
 
@@ -1618,15 +1649,21 @@ def main():
     else:
         workspace = os.path.abspath(args.workspace)
     
-    # List sessions mode
     if args.list:
         sessions = list_sessions(workspace)
+        con = Console()
         if not sessions:
-            print("No sessions found.")
+            con.print("  [dim]No sessions found.[/dim]")
         else:
-            print(f"Sessions for {workspace}:\n")
+            tbl = Table(show_header=True, box=box.SIMPLE_HEAD, padding=(0, 2))
+            tbl.add_column("Session", style="bold")
+            tbl.add_column("Messages", justify="right")
+            tbl.add_column("Modified", style="dim")
             for name, mtime, count in sessions:
-                print(f"  {name:20s}  {mtime:%Y-%m-%d %H:%M}  ({count} msgs)")
+                tbl.add_row(name, str(count), f"{mtime:%Y-%m-%d %H:%M}")
+            con.print()
+            con.print(tbl)
+            con.print()
         return
     
     os.chdir(workspace)
@@ -1685,10 +1722,10 @@ def main():
             msg_count = len(agent.messages) - 1  # minus system prompt
             log.info("Resumed session '%s' (%d messages) from %s",
                      current_session, msg_count, session_path)
-            console.print(f"[dim]Resumed session '{current_session}' ({msg_count} messages)[/dim]")
+            console.print(f"  [dim]Resumed [white]{current_session}[/white] ({msg_count} messages)[/dim]")
     else:
         log.info("New session '%s'", current_session)
-        console.print(f"[dim]New session '{current_session}'[/dim]")
+        console.print(f"  [dim]New session [white]{current_session}[/white][/dim]")
 
     def save_session():
         log.debug("Saving session")
@@ -1712,23 +1749,29 @@ def main():
             cleanup_and_save()
             loop.close()
     else:
-        # Interactive mode — Forge-style startup banner
+        # Interactive mode — clean startup banner
         stats = agent.get_context_stats()
         ws_short = os.path.basename(workspace) or workspace
-        banner_lines = (
-            f"  [dim]Model[/dim]         [bold]{config.model}[/bold]\n"
-            f"  [dim]Context[/dim]       [bold]{stats['max_allowed']:,}[/bold] [dim]tokens[/dim]\n"
-            f"  [dim]Workspace[/dim]     [cyan]{ws_short}[/cyan]\n"
-            f"  [dim]Session[/dim]       {current_session}"
-        )
+        banner_table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
+        banner_table.add_column(style="dim", width=11, justify="right")
+        banner_table.add_column()
+        banner_table.add_row("model", f"[bold]{config.model}[/bold]")
+        banner_table.add_row("context", f"[bold]{stats['max_allowed']:,}[/bold] [dim]tokens[/dim]")
+        banner_table.add_row("workspace", f"[cyan]{ws_short}[/cyan]")
+        banner_table.add_row("session", current_session)
+        console.print()
         console.print(Panel(
-            banner_lines,
-            title="[bold cyan]Harness[/bold cyan]",
-            subtitle="[dim]coding plan & analysis engine[/dim]",
-            border_style="cyan",
-            padding=(1, 2),
+            banner_table,
+            title="[bold bright_blue] harness [/bold bright_blue]",
+            border_style="bright_blue",
+            padding=(1, 3),
+            width=50,
         ))
-        console.print("[dim]Type your request, !cmd for shell, /help for commands. Esc to interrupt.[/dim]\n")
+        console.print(
+            "  [dim]Type a message to chat."
+            " [white]/help[/white] for commands,"
+            " [white]!cmd[/white] for shell.[/dim]\n"
+        )
         
         # Create prompt session for multiline input
         def _prompt_paste_image_marker() -> Optional[str]:
@@ -1738,10 +1781,10 @@ def main():
             return f" [[clipboard_image:{img_path}]] "
 
         def _open_provider_picker_ui() -> None:
-            console.print("[dim]Use /providers[/dim]")
+            console.print("  [dim]Use /providers[/dim]")
 
         def _open_model_picker_ui() -> None:
-            console.print("[dim]Use /model[/dim]")
+            console.print("  [dim]Use /model[/dim]")
 
         history_file = get_sessions_dir(workspace) / ".history"
         prompt_session = (
@@ -1759,8 +1802,7 @@ def main():
         
         while True:
             try:
-                # Clean prompt — Forge-style
-                prompt_text = f"\x1b[36mharness>\x1b[0m "
+                prompt_text = "\x1b[38;5;75mharness\x1b[0m \x1b[38;5;243m\u276f\x1b[0m "
                 
                 # Get input (multiline with prompt_toolkit, or simple input)
                 if prompt_session:
@@ -1771,7 +1813,7 @@ def main():
                         if now - last_interrupt_time < 2.0:
                             raise
                         last_interrupt_time = now
-                        console.print("\n[dim]Ctrl+C again to exit[/dim]")
+                        console.print("\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]")
                         continue
                 else:
                     try:
@@ -1781,7 +1823,7 @@ def main():
                         if now - last_interrupt_time < 2.0:
                             raise
                         last_interrupt_time = now
-                        console.print("\n[dim]Ctrl+C again to exit[/dim]")
+                        console.print("\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]")
                         continue
                 
                 if not user_input:
@@ -1791,14 +1833,14 @@ def main():
                 if user_input.startswith("!"):
                     shell_cmd = user_input[1:].strip()
                     if shell_cmd:
-                        console.print(f"[dim]Executing: {shell_cmd}[/dim]")
+                        console.print(f"  [dim]\u25b6 {rich_escape(shell_cmd)}[/dim]")
                         try:
                             result = loop.run_until_complete(
                                 agent.tool_handlers.execute_command({"command": shell_cmd})
                             )
                             console.print(result)
                         except Exception as e:
-                            console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
+                            console.print(f"  [red]\u2717 {rich_escape(str(e))}[/red]")
                     continue
                 
                 # Handle commands
@@ -1809,68 +1851,73 @@ def main():
                     
                     if cmd in ('/exit', '/quit', '/q'):
                         cleanup_and_save()
-                        console.print("[dim]Session saved.[/dim]")
+                        console.print("  [dim]Session saved. Goodbye![/dim]")
                         break
                     
                     elif cmd == '/sessions':
                         sessions = list_sessions(workspace)
                         if not sessions:
-                            console.print("[dim]No sessions.[/dim]")
+                            console.print("  [dim]No sessions yet.[/dim]")
                         else:
-                            console.print("[dim]Sessions:[/dim]")
+                            tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+                            tbl.add_column(width=2)
+                            tbl.add_column("name", style="bold")
+                            tbl.add_column("msgs", justify="right", style="dim")
+                            tbl.add_column("modified", style="dim")
                             for name, mtime, count in sessions:
-                                marker = "*" if name == current_session else " "
-                                console.print(f"[dim] {marker} {name:20s} ({count} msgs)[/dim]")
+                                marker = "[cyan]\u25cf[/cyan]" if name == current_session else " "
+                                tbl.add_row(marker, name, f"{count} msgs", f"{mtime:%b %d, %H:%M}")
+                            console.print()
+                            console.print(Panel(tbl, title="[bold]Sessions[/bold]", border_style="dim", padding=(1, 2)))
+                            console.print()
                         continue
                     
                     elif cmd == '/session':
                         if not cmd_arg:
-                            console.print(f"[dim]Current: {current_session}[/dim]")
+                            console.print(f"  [dim]Current session:[/dim] [bold]{current_session}[/bold]")
                             continue
-                        # Save current session first
                         agent.save_session(str(session_path))
-                        # Switch to new session
                         new_name = cmd_arg.strip()
                         current_session = new_name
                         session_path = get_session_path(workspace, current_session)
                         if session_path.exists():
                             agent.load_session(str(session_path))
                             msg_count = len(agent.messages) - 1
-                            console.print(f"[dim]Switched to '{current_session}' ({msg_count} msgs)[/dim]")
+                            console.print(f"  [green]\u2713[/green] Switched to [bold]{current_session}[/bold] [dim]({msg_count} messages)[/dim]")
                         else:
                             agent.clear_history()
-                            console.print(f"[dim]Created new session '{current_session}'[/dim]")
+                            console.print(f"  [green]\u2713[/green] Created new session [bold]{current_session}[/bold]")
                         continue
                     
                     elif cmd == '/clear':
                         agent.clear_history()
                         reset_global_tracker()
-                        console.print("[dim]History cleared.[/dim]")
+                        console.print("  [green]\u2713[/green] History cleared")
                         continue
                     
                     elif cmd == '/save':
                         agent.save_session(str(session_path))
-                        console.print(f"[dim]Saved '{current_session}'[/dim]")
+                        console.print(f"  [green]\u2713[/green] Session [bold]{current_session}[/bold] saved")
                         continue
                     
                     elif cmd == '/delete':
                         if not cmd_arg:
-                            console.print("[dim]Usage: /delete <session_name>[/dim]")
+                            console.print("  [dim]Usage: /delete <session_name>[/dim]")
                             continue
                         target = cmd_arg.strip()
                         if target == current_session:
-                            console.print("[dim]Cannot delete active session.[/dim]")
+                            console.print("  [yellow]\u26a0[/yellow] Cannot delete the active session")
                             continue
                         target_path = get_session_path(workspace, target)
                         if target_path.exists():
                             target_path.unlink()
-                            console.print(f"[dim]Deleted '{target}'[/dim]")
+                            console.print(f"  [green]\u2713[/green] Deleted session [bold]{target}[/bold]")
                         else:
-                            console.print(f"[dim]Session '{target}' not found.[/dim]")
+                            console.print(f"  [dim]Session '{target}' not found[/dim]")
                         continue
                     
                     elif cmd == '/history':
-                        console.print(f"[dim]Messages: {len(agent.messages)}[/dim]")
+                        console.print(f"  [dim]{len(agent.messages)} messages in conversation[/dim]")
                         continue
 
                     elif cmd == '/cost':
@@ -1880,38 +1927,70 @@ def main():
                     elif cmd == '/bg':
                         procs = agent.list_background_procs()
                         if not procs:
-                            console.print("[dim]No background processes.[/dim]")
+                            console.print("  [dim]No background processes running[/dim]")
                         else:
-                            console.print("[dim]Background processes:[/dim]")
+                            tbl = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
+                            tbl.add_column("ID", style="bold")
+                            tbl.add_column("PID", style="dim")
+                            tbl.add_column("Status")
+                            tbl.add_column("Time", justify="right")
+                            tbl.add_column("Command", style="dim")
                             for p in procs:
                                 elapsed_min = p['elapsed'] / 60
-                                console.print(f"[dim]  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}[/dim]")
+                                status_style = "green" if p['status'] == "running" else "yellow"
+                                tbl.add_row(
+                                    str(p['id']),
+                                    str(p['pid']),
+                                    f"[{status_style}]{p['status']}[/{status_style}]",
+                                    f"{elapsed_min:.1f}m",
+                                    p['command'][:50],
+                                )
+                            console.print()
+                            console.print(Panel(tbl, title="[bold]Background Processes[/bold]", border_style="dim", padding=(0, 1)))
+                            console.print()
                         continue
                     
                     elif cmd == '/mode':
-                        console.print("[dim]/mode is deprecated. Use /providers and /model instead.[/dim]")
+                        console.print("  [dim]/mode is deprecated. Use [white]/providers[/white] and [white]/model[/white] instead.[/dim]")
                         continue
                     
                     elif cmd == '/ctx':
                         stats = agent.get_context_stats()
-                        console.print(f"[dim]Context: {stats['tokens']:,} tokens ({stats['percent']:.0f}% of {stats['max_allowed']:,} limit)[/dim]")
-                        console.print(f"[dim]Messages: {stats['messages']} | Context items: {stats['context_items']}[/dim]")
-                        console.print(f"[dim]{agent.context.summary()}[/dim]")
+                        pct = stats['percent']
+                        bar_width = 24
+                        filled = int(bar_width * pct / 100)
+                        bar_color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
+                        bar = Text()
+                        bar.append("\u2501" * filled, style=bar_color)
+                        bar.append("\u2500" * (bar_width - filled), style="dim")
+                        console.print()
+                        console.print("  [bold]Context Usage[/bold]")
+                        ctx_line = Text("  ")
+                        ctx_line.append_text(bar)
+                        ctx_line.append(f"  {stats['tokens']:,} / {stats['max_allowed']:,} tokens ({pct:.0f}%)", style="dim")
+                        console.print(ctx_line)
+                        console.print(f"  [dim]{stats['messages']} messages \u00b7 {stats['context_items']} context items[/dim]")
+                        console.print()
                         continue
                     
                     elif cmd == '/tokens':
                         breakdown = agent.get_token_breakdown()
-                        console.print(f"[dim]Token breakdown:[/dim]")
-                        console.print(f"[dim]  System prompt: {breakdown['system']:,} tokens[/dim]")
-                        console.print(f"[dim]  Conversation:  {breakdown['conversation']:,} tokens ({breakdown['message_count']} messages)[/dim]")
-                        console.print(f"[dim]  Total:         {breakdown['total']:,} tokens[/dim]")
+                        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+                        tbl.add_column("label", style="dim", width=14, justify="right")
+                        tbl.add_column("value")
+                        tbl.add_row("System", f"{breakdown['system']:,} tokens")
+                        tbl.add_row("Conversation", f"{breakdown['conversation']:,} tokens [dim]({breakdown['message_count']} msgs)[/dim]")
+                        tbl.add_row("Total", f"[bold]{breakdown['total']:,} tokens[/bold]")
+                        console.print()
+                        console.print(Panel(tbl, title="[bold]Token Breakdown[/bold]", border_style="dim", padding=(1, 2)))
                         if breakdown['largest_messages']:
-                            console.print(f"[dim]  Largest messages:[/dim]")
+                            console.print("  [dim]Largest messages:[/dim]")
                             for msg in breakdown['largest_messages']:
                                 role = msg['role']
                                 tokens = msg['tokens']
-                                preview = msg['preview'][:60] + '...' if len(msg['preview']) > 60 else msg['preview']
-                                console.print(f"[dim]    [{role}] {tokens:,}t: {preview}[/dim]")
+                                preview = msg['preview'][:50] + '...' if len(msg['preview']) > 50 else msg['preview']
+                                console.print(f"    [dim]{role:>10}  {tokens:>6,}t  {rich_escape(preview)}[/dim]")
+                        console.print()
                         continue
                     
                     elif cmd == '/compact':
@@ -1919,7 +1998,7 @@ def main():
                         before = agent.get_token_count()
                         removed = agent.compact_history(strategy)
                         after = agent.get_token_count()
-                        console.print(f"[dim]Compacted: {before:,} -> {after:,} tokens (-{removed:,})[/dim]")
+                        console.print(f"  [green]\u2713[/green] Compacted [bold]{before:,}[/bold] \u2192 [bold]{after:,}[/bold] tokens [dim](-{removed:,})[/dim]")
                         continue
                     
                     elif cmd == '/todo':
@@ -1927,30 +2006,35 @@ def main():
                             agent.todo_manager.print_todo_panel(console)
                         elif cmd_arg.startswith("add "):
                             title = cmd_arg[4:].strip()
-                            item = agent.todo_manager.add(title=title)
+                            agent.todo_manager.add(title=title)
+                            console.print(f"  [green]\u2713[/green] Added: {title}")
                             agent.todo_manager.print_todo_panel(console)
                         elif cmd_arg.startswith("done "):
                             try:
                                 item_id = int(cmd_arg[5:].strip())
                                 item = agent.todo_manager.update(item_id, status="completed")
                                 if not item:
-                                    console.print(f"[dim]Todo [{item_id}] not found[/dim]")
+                                    console.print(f"  [dim]Todo [{item_id}] not found[/dim]")
+                                else:
+                                    console.print(f"  [green]\u2713[/green] Completed: {item.title}")
                                 agent.todo_manager.print_todo_panel(console)
                             except ValueError:
-                                console.print("[dim]Usage: /todo done <id>[/dim]")
+                                console.print("  [dim]Usage: /todo done <id>[/dim]")
                         elif cmd_arg.startswith("rm "):
                             try:
                                 item_id = int(cmd_arg[3:].strip())
                                 if not agent.todo_manager.remove(item_id):
-                                    console.print(f"[dim]Todo [{item_id}] not found[/dim]")
+                                    console.print(f"  [dim]Todo [{item_id}] not found[/dim]")
+                                else:
+                                    console.print(f"  [green]\u2713[/green] Removed")
                                 agent.todo_manager.print_todo_panel(console)
                             except ValueError:
-                                console.print("[dim]Usage: /todo rm <id>[/dim]")
+                                console.print("  [dim]Usage: /todo rm <id>[/dim]")
                         elif cmd_arg.strip() == "clear":
                             agent.todo_manager.clear()
-                            console.print("[dim]All todos cleared.[/dim]")
+                            console.print("  [green]\u2713[/green] All todos cleared")
                         else:
-                            console.print("[dim]Usage: /todo [add <title>|done <id>|rm <id>|clear][/dim]")
+                            console.print("  [dim]Usage: /todo [add <title> | done <id> | rm <id> | clear][/dim]")
                         continue
                     
                     elif cmd == '/smart':
@@ -1961,40 +2045,55 @@ def main():
                         over = total_tokens > int(max_allowed * 0.85)
                         active_todos = agent.todo_manager.list_active()
                         traces = agent.smart_context.compaction_traces
-                        
-                        console.print(f"[dim]Context: {total_tokens:,} / {max_allowed:,} tokens ({pct:.0f}%)[/dim]")
-                        console.print(f"[dim]Over compaction threshold (85%): {'YES' if over else 'no'}[/dim]")
-                        console.print(f"[dim]Messages: {len(agent.messages)}  |  Active todos: {len(active_todos)}[/dim]")
-                        console.print(f"[dim]Context items: {len(agent.context.list_items())}  ({agent.context.total_size():,} chars)[/dim]")
+
+                        bar_width = 24
+                        filled = int(bar_width * pct / 100)
+                        bar_color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
+                        bar = Text()
+                        bar.append("\u2501" * filled, style=bar_color)
+                        bar.append("\u2500" * (bar_width - filled), style="dim")
+
+                        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+                        tbl.add_column("label", style="dim", width=14, justify="right")
+                        tbl.add_column("value")
+                        ctx_val = Text()
+                        ctx_val.append_text(bar)
+                        ctx_val.append(f"  {total_tokens:,} / {max_allowed:,} ({pct:.0f}%)")
+                        tbl.add_row("Context", ctx_val)
+                        threshold_style = "red bold" if over else "green"
+                        tbl.add_row("Compaction", f"[{threshold_style}]{'OVER 85% threshold' if over else 'below threshold'}[/{threshold_style}]")
+                        tbl.add_row("Messages", str(len(agent.messages)))
+                        tbl.add_row("Active todos", str(len(active_todos)))
+                        tbl.add_row("Context items", f"{len(agent.context.list_items())}  [dim]({agent.context.total_size():,} chars)[/dim]")
+                        console.print()
+                        console.print(Panel(tbl, title="[bold]Smart Context[/bold]", border_style="dim", padding=(1, 2)))
                         if traces:
-                            console.print(f"[dim]Compactions this session: {len(traces)}[/dim]")
+                            console.print(f"  [dim]Compactions this session: {len(traces)}[/dim]")
                             for t in traces[-5:]:
-                                console.print(f"[dim]  - {t.format_notice()}[/dim]")
+                                console.print(f"    [dim]\u2192 {t.format_notice()}[/dim]")
                         else:
-                            console.print(f"[dim]No compactions yet this session.[/dim]")
+                            console.print("  [dim]No compactions yet.[/dim]")
+                        console.print()
                         continue
                     
                     elif cmd == '/dump':
                         dump_path = agent.dump_context(reason="user_requested")
-                        console.print(f"[dim]Context dumped to: {dump_path}[/dim]")
                         breakdown = agent.get_token_breakdown()
-                        console.print(f"[dim]  System prompt: {breakdown['system']:,} tokens ({len(agent.messages[0].content) if agent.messages else 0:,} chars)[/dim]")
-                        console.print(f"[dim]  Conversation:  {breakdown['conversation']:,} tokens ({breakdown['message_count']} messages)[/dim]")
-                        console.print(f"[dim]  Total:         {breakdown['total']:,} tokens[/dim]")
+                        console.print(f"  [green]\u2713[/green] Context dumped to [cyan]{rich_escape(str(dump_path))}[/cyan]")
+                        console.print(f"  [dim]System: {breakdown['system']:,}t \u00b7 Conversation: {breakdown['conversation']:,}t ({breakdown['message_count']} msgs) \u00b7 Total: {breakdown['total']:,}t[/dim]")
                         if agent.messages and agent.messages[0].role == "system":
                             sys_content = agent.messages[0].content
                             expected_tools = [
                                 'read_file', 'write_to_file', 'replace_in_file',
                                 'execute_command', 'manage_todos', 'create_plan',
                             ]
-                            tools_present = [t for t in expected_tools if t in sys_content]
                             tools_missing = [t for t in expected_tools if t not in sys_content]
                             if tools_missing:
-                                console.print(f"[red]  WARNING: System prompt MISSING tools: {', '.join(tools_missing)}[/red]")
+                                console.print(f"  [red]\u2717 System prompt missing tools: {', '.join(tools_missing)}[/red]")
                             else:
-                                console.print(f"[dim]  System prompt OK: all {len(tools_present)} core tools present[/dim]")
+                                console.print(f"  [green]\u2713[/green] [dim]All {len(expected_tools)} core tools present in system prompt[/dim]")
                         else:
-                            console.print("[red]  WARNING: No system message found![/red]")
+                            console.print("  [red]\u2717 No system message found![/red]")
                         continue
                     
                     elif cmd == '/config':
@@ -2003,21 +2102,27 @@ def main():
                             scope = subparts[1].lower() if len(subparts) > 1 else "active"
                             try:
                                 result = run_in_app_config_wizard(workspace, console, agent, providers, scope)
-                                console.print(f"[dim]{result}[/dim]")
+                                console.print(f"  [dim]{result}[/dim]")
                             except KeyboardInterrupt:
-                                console.print("\n[dim]Config wizard cancelled.[/dim]")
+                                console.print("\n  [dim]Config wizard cancelled.[/dim]")
                             continue
 
                         key_preview = agent.config.api_key[:8] + "..." if agent.config.api_key else "(not set)"
-                        console.print(f"[dim]API URL: {agent.config.api_url}[/dim]")
-                        console.print(f"[dim]Model:   {agent.config.model}[/dim]")
-                        console.print(f"[dim]API Key: {key_preview}[/dim]")
-                        console.print(f"[dim]Max tokens: {agent.config.max_tokens:,}[/dim]")
-                        console.print(f"[dim]Temp: {agent.config.temperature}[/dim]")
-                        console.print(f"[dim]Max iterations: {agent.max_iterations}[/dim]")
+                        tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
+                        tbl.add_column("label", style="dim", width=13, justify="right")
+                        tbl.add_column("value")
+                        tbl.add_row("API URL", f"[cyan]{rich_escape(agent.config.api_url)}[/cyan]")
+                        tbl.add_row("Model", f"[bold]{rich_escape(agent.config.model)}[/bold]")
+                        tbl.add_row("API Key", key_preview)
+                        tbl.add_row("Max Tokens", f"{agent.config.max_tokens:,}")
+                        tbl.add_row("Temperature", str(agent.config.temperature))
+                        tbl.add_row("Max Iters", str(agent.max_iterations))
                         if providers:
-                            console.print(f"[dim]Saved provider profiles: {', '.join(sorted(providers.keys()))}[/dim]")
-                        console.print("[dim]Use /providers to manage saved providers and /model to search models.[/dim]")
+                            tbl.add_row("Providers", ", ".join(sorted(providers.keys())))
+                        console.print()
+                        console.print(Panel(tbl, title="[bold]Configuration[/bold]", border_style="dim", padding=(1, 2)))
+                        console.print("  [dim][white]/providers[/white] to manage providers, [white]/model[/white] to switch models.[/dim]")
+                        console.print()
                         continue
 
                     elif cmd in ('/provider', '/providers'):
@@ -2026,31 +2131,32 @@ def main():
                                 result = run_providers_hub(workspace, console, agent, providers, cmd_arg)
                             else:
                                 result = run_provider_manager(workspace, console, agent, providers, cmd_arg)
-                            console.print(f"[dim]{result}[/dim]")
+                            if result:
+                                console.print(f"  [dim]{result}[/dim]")
                         except KeyboardInterrupt:
-                            console.print("\n[dim]Provider command cancelled.[/dim]")
+                            console.print("\n  [dim]Cancelled.[/dim]")
                         continue
 
                     elif cmd == '/model':
                         try:
                             result = run_model_switch_wizard(workspace, console, agent, providers, cmd_arg)
-                            console.print(f"[dim]{result}[/dim]")
+                            if result:
+                                console.print(f"  [dim]{result}[/dim]")
                         except KeyboardInterrupt:
-                            console.print("\n[dim]Model selection cancelled.[/dim]")
+                            console.print("\n  [dim]Cancelled.[/dim]")
                         continue
 
                     elif cmd == '/maxctx':
                         if not cmd_arg.strip():
-                            console.print(f"[dim]Max tokens (active request cap): {agent.config.max_tokens:,}[/dim]")
-                            console.print("[dim]Usage: /maxctx <tokens>   examples: /maxctx 8000, /maxctx 32k[/dim]")
+                            console.print(f"  [dim]Max tokens:[/dim] [bold]{agent.config.max_tokens:,}[/bold]")
+                            console.print("  [dim]Usage: /maxctx <tokens>  e.g. /maxctx 8000, /maxctx 32k[/dim]")
                             continue
                         parsed = _parse_token_limit_input(cmd_arg)
                         if not parsed:
-                            console.print("[dim]Invalid value. Examples: /maxctx 8000, /maxctx 32k, /maxctx 0.5m[/dim]")
+                            console.print("  [dim]Invalid value. Examples: /maxctx 8000, /maxctx 32k, /maxctx 0.5m[/dim]")
                             continue
-                        # Keep a sane floor to avoid accidental tiny limits.
                         if parsed < 256:
-                            console.print("[dim]Minimum allowed is 256 tokens.[/dim]")
+                            console.print("  [yellow]\u26a0[/yellow] Minimum allowed is 256 tokens")
                             continue
                         agent.config.max_tokens = parsed
                         agent.tool_handlers.config = agent.config
@@ -2059,33 +2165,31 @@ def main():
                         if active_profile and active_profile in providers:
                             _save_provider_profile_fields(workspace, providers, active_profile, {"max_tokens": parsed})
                             providers[active_profile]["max_tokens"] = parsed
-                            console.print(f"[dim]Max tokens set to {parsed:,} (saved to active config and provider '{active_profile}')[/dim]")
-                        else:
-                            console.print(f"[dim]Max tokens set to {parsed:,} (saved to active config)[/dim]")
+                        console.print(f"  [green]\u2713[/green] Max tokens set to [bold]{parsed:,}[/bold]")
                         continue
                     
                     elif cmd == '/iter':
                         if not cmd_arg:
-                            console.print(f"[dim]Max iterations: {agent.max_iterations}[/dim]")
+                            console.print(f"  [dim]Max iterations:[/dim] [bold]{agent.max_iterations}[/bold]")
                             continue
                         try:
                             new_val = int(cmd_arg.strip())
                             if new_val < 1:
-                                console.print("[dim]Must be at least 1[/dim]")
+                                console.print("  [yellow]\u26a0[/yellow] Must be at least 1")
                                 continue
                             agent.max_iterations = new_val
-                            console.print(f"[dim]Max iterations set to {new_val}[/dim]")
+                            console.print(f"  [green]\u2713[/green] Max iterations set to [bold]{new_val}[/bold]")
                         except ValueError:
-                            console.print("[dim]Usage: /iter <number>[/dim]")
+                            console.print("  [dim]Usage: /iter <number>[/dim]")
                         continue
                     
                     elif cmd == '/clip':
                         img_path, error = get_clipboard_image()
                         if error:
-                            console.print(f"[red]{error}[/red]")
+                            console.print(f"  [red]\u2717 {error}[/red]")
                             continue
                         
-                        console.print(f"[dim]Clipboard image: {img_path}[/dim]")
+                        console.print(f"  [dim]Clipboard image: {img_path}[/dim]")
                         question = cmd_arg.strip() if cmd_arg else "Describe this image in detail."
                         user_input = f"Analyze this image: {img_path}\n\nQuestion: {question}"
                         # Fall through to process this request
@@ -2093,24 +2197,24 @@ def main():
                     elif cmd == '/index':
                         idx = agent.workspace_index
                         if cmd_arg.strip().lower() == 'rebuild':
-                            console.print("[dim]Rebuilding workspace index...[/dim]")
+                            console.print("  [dim]Rebuilding workspace index...[/dim]")
                             idx.build()
-                            console.print(f"[dim]Index rebuilt: {len(idx.files)} files in {idx._build_time:.2f}s[/dim]")
+                            console.print(f"  [green]\u2713[/green] Index rebuilt: {len(idx.files)} files in {idx._build_time:.2f}s")
                         elif cmd_arg.strip().lower() == 'tree':
                             console.print(f"[dim]{idx.compact_tree()}[/dim]")
                         else:
-                            console.print(f"[dim]{idx.summary()}[/dim]")
-                            console.print(f"[dim]  /index rebuild  — re-scan workspace[/dim]")
-                            console.print(f"[dim]  /index tree     — show file list only[/dim]")
+                            console.print(f"  [dim]{idx.summary()}[/dim]")
+                            console.print("  [dim][white]/index rebuild[/white]  re-scan workspace[/dim]")
+                            console.print("  [dim][white]/index tree[/white]     show file tree[/dim]")
                         continue
                     
                     elif cmd == '/log':
                         log_file = os.path.join(workspace, ".harness_output", "harness.log")
                         if not os.path.exists(log_file):
-                            console.print("[dim]No log file yet.[/dim]")
+                            console.print("  [dim]No log file yet.[/dim]")
                         else:
                             size_kb = os.path.getsize(log_file) / 1024
-                            console.print(f"[dim]Log file: {log_file} ({size_kb:.0f} KB)[/dim]")
+                            console.print(f"  [dim]Log: {log_file} ({size_kb:.0f} KB)[/dim]")
                             if cmd_arg.strip():
                                 try:
                                     n = int(cmd_arg.strip())
@@ -2121,64 +2225,56 @@ def main():
                             with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
                                 lines = fh.readlines()
                             for ln in lines[-n:]:
-                                console.print(f"[dim]{ln.rstrip()}[/dim]")
+                                console.print(f"  [dim]{rich_escape(ln.rstrip())}[/dim]")
                         continue
                     
                     elif cmd in ('/help', '/?'):
-                        help_text = """[dim]Commands:
-  !<command>          - Execute shell command directly
-  /sessions          - List all sessions
-  /session <name>    - Switch to session (creates if new)
-  /delete <name>     - Delete a session
-  /clear             - Clear conversation history
-  /compact [strat]   - Remove older messages (half/quarter/last2)
-  /tokens            - Show token breakdown  
-  /config            - Show current API configuration
-  /config setup [name] - Quick setup (active config or saved provider profile)
-  /providers         - Provider manager (list + configure/override + use)
-  /providers [args]  - Providers: list/use/setup/remove/current
-  /model [query]     - Search and pick models across all configured providers
-  /model list        - List models for current provider
-  /maxctx [tokens]   - Show/set max token cap (e.g. 8k, 32k)
-  /iter [n]          - Show or set max iterations
-  /clip [question]   - Analyze image from clipboard (fallback helper)
-  /todo              - Show todo list
-  /todo add <title>  - Add a todo
-  /todo done <id>    - Mark todo as completed
-  /todo rm <id>      - Remove a todo
-  /todo clear        - Clear all todos
-  /smart             - Show smart context analysis
-  /dump              - Dump full model context to JSON file
-  /save              - Save current session
-  /history           - Show message count
-  /cost              - Show session API usage/cost totals
-  /bg                - List background processes
-  /ctx               - Show context container
-  /index [rebuild|tree] - Show project map, rebuild index, or show file tree
-  /log [n]           - Show last n lines of harness.log (default 30)
-  /exit              - Save and exit
-
-Logging: full observability log at .harness_output/harness.log (always on)
-
-Keys during agent work:
-  Esc                - Stop/interrupt (responds within ~300ms)
-  Ctrl+B             - Send running command to background
-  Ctrl+C             - Interrupt (press twice within 2s to exit)"""
+                        console.print()
+                        console.print("  [bold]Chat[/bold]")
+                        console.print("  [cyan]!command[/cyan]             [dim]Run a shell command[/dim]")
+                        console.print("  [cyan]/clear[/cyan]               [dim]Clear conversation history[/dim]")
+                        console.print("  [cyan]/compact[/cyan] [dim][strategy][/dim]   [dim]Compact context (half/quarter/last2)[/dim]")
+                        console.print()
+                        console.print("  [bold]Sessions[/bold]")
+                        console.print("  [cyan]/sessions[/cyan]            [dim]List all sessions[/dim]")
+                        console.print("  [cyan]/session[/cyan] [dim]<name>[/dim]      [dim]Switch or create session[/dim]")
+                        console.print("  [cyan]/delete[/cyan] [dim]<name>[/dim]       [dim]Delete a session[/dim]")
+                        console.print("  [cyan]/save[/cyan]                [dim]Save current session[/dim]")
+                        console.print()
+                        console.print("  [bold]Models & Providers[/bold]")
+                        console.print("  [cyan]/model[/cyan] [dim]<query>[/dim]       [dim]Search and switch models[/dim]")
+                        console.print("  [cyan]/model list[/cyan]          [dim]List models from current provider[/dim]")
+                        console.print("  [cyan]/providers[/cyan]           [dim]Manage provider profiles[/dim]")
+                        console.print("  [cyan]/config[/cyan]              [dim]Show/edit API configuration[/dim]")
+                        console.print("  [cyan]/maxctx[/cyan] [dim]<n>[/dim]          [dim]Set max token cap (e.g. 8k, 32k)[/dim]")
+                        console.print("  [cyan]/iter[/cyan] [dim]<n>[/dim]            [dim]Set max agent iterations[/dim]")
+                        console.print()
+                        console.print("  [bold]Tools[/bold]")
+                        console.print("  [cyan]/todo[/cyan]                [dim]Manage todo list (add/done/rm/clear)[/dim]")
+                        console.print("  [cyan]/bg[/cyan]                  [dim]List background processes[/dim]")
+                        console.print("  [cyan]/clip[/cyan] [dim][question][/dim]     [dim]Analyze clipboard image[/dim]")
+                        console.print()
+                        console.print("  [bold]Diagnostics[/bold]")
+                        console.print("  [cyan]/ctx[/cyan]                 [dim]Show context usage[/dim]")
+                        console.print("  [cyan]/tokens[/cyan]              [dim]Token breakdown by message[/dim]")
+                        console.print("  [cyan]/cost[/cyan]                [dim]API usage and cost totals[/dim]")
+                        console.print("  [cyan]/smart[/cyan]               [dim]Smart context analysis[/dim]")
+                        console.print("  [cyan]/dump[/cyan]                [dim]Dump full context to JSON[/dim]")
+                        console.print("  [cyan]/index[/cyan] [dim][rebuild|tree][/dim] [dim]Project file index[/dim]")
+                        console.print("  [cyan]/log[/cyan] [dim][n][/dim]             [dim]Show last n log lines[/dim]")
+                        console.print()
+                        console.print("  [bold]Keys[/bold]")
+                        console.print("  [cyan]Esc[/cyan]                  [dim]Stop / interrupt agent[/dim]")
+                        console.print("  [cyan]Ctrl+C[/cyan]               [dim]Interrupt (press twice to exit)[/dim]")
+                        console.print("  [cyan]Ctrl+B[/cyan]               [dim]Send command to background[/dim]")
                         if HAS_PROMPT_TOOLKIT:
-                            help_text += """
-
-Input:
-  Ctrl+Enter         - Insert newline (multiline input)
-  Enter              - Submit input
-  Up/Down            - Browse history
-  Paste              - Multiline paste supported
-  Ctrl+V             - Paste clipboard image into your message (multimodal when supported)"""
-                        help_text += "[/dim]"
-                        console.print(help_text)
+                            console.print("  [cyan]Ctrl+Enter[/cyan]           [dim]Insert newline[/dim]")
+                            console.print("  [cyan]Ctrl+V[/cyan]               [dim]Paste clipboard image[/dim]")
+                        console.print()
                         continue
                     
                     else:
-                        console.print("[dim]Type /help for commands[/dim]")
+                        console.print(f"  [dim]Unknown command. Type [white]/help[/white] for available commands.[/dim]")
                         continue
                 
                 multimodal_content: Optional[List[Dict[str, Any]]] = None
@@ -2191,11 +2287,11 @@ Input:
                         if _supports_multimodal_input(agent.config.api_url, agent.config.model):
                             multimodal_content = _build_multimodal_user_content(text_part, image_paths)
                             multimodal_label = text_part or f"[pasted {len(image_paths)} image(s)]"
-                            console.print(f"[dim]Attached {len(image_paths)} pasted image(s) to your message.[/dim]")
+                            console.print(f"  [dim]Attached {len(image_paths)} image(s)[/dim]")
                         else:
                             fallback_q = text_part or "Describe this image in detail."
                             user_input = f"Analyze this image: {image_paths[0]}\n\nQuestion: {fallback_q}"
-                            console.print("[dim]Current model may not support images directly; using /clip-style fallback.[/dim]")
+                            console.print("  [dim]Model may not support images \u2014 using fallback mode[/dim]")
                     else:
                         user_input, _ = _extract_clipboard_image_markers(user_input)
 
@@ -2214,11 +2310,11 @@ Input:
                     agent.todo_manager.print_todo_panel(console)
                 except KeyboardInterrupt:
                     log.warning("KeyboardInterrupt during run_single")
-                    console.print("\n[yellow][STOP] Interrupted - Ctrl+C again to exit[/yellow]")
+                    console.print("\n  [yellow]Interrupted[/yellow] [dim]- press Ctrl+C again to exit[/dim]")
                     last_interrupt_time = time.time()
                 except Exception as e:
                     log_exception(log, "run_single failed", e)
-                    console.print(f"[red]Error: {rich_escape(str(e))}[/red]")
+                    console.print(f"  [red]\u2717 {rich_escape(str(e))}[/red]")
                 
                 # Auto-save session after each exchange
                 agent.save_session(str(session_path))
@@ -2234,7 +2330,7 @@ Input:
                 
             except KeyboardInterrupt:
                 cleanup_and_save()
-                console.print("\n[dim]Session saved. Exiting...[/dim]")
+                console.print("\n  [dim]Session saved. Goodbye![/dim]")
                 break
             except EOFError:
                 cleanup_and_save()

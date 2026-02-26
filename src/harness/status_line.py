@@ -34,10 +34,8 @@ class StatusLine:
     COMPACTING = "compacting"
     WAITING = "waiting"
 
-    # Spinner frames for active states (minimal dots)
-    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    # Cyan ANSI color for spinner/icon
-    _CYAN = "\033[36m"
+    _SPINNER = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+    _ACCENT = "\033[38;5;75m"
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled and sys.stdout.isatty()
@@ -146,16 +144,15 @@ class StatusLine:
         self._visible = True
 
     def _get_icon(self) -> str:
-        """Get the current icon/spinner character with cyan coloring."""
-        c = self._CYAN
-        r = "\033[0m\033[2m"  # reset to dim (we're inside a dim block)
+        """Get the current icon/spinner character with accent coloring."""
+        c = self._ACCENT
+        r = "\033[0m\033[2m"
         if self._state in (self.STREAMING,):
-            return f"{c}●{r}"
+            return f"{c}\u25cf{r}"
         if self._state == self.IDLE:
-            return f"{c}○{r}"
+            return f"{c}\u25cb{r}"
         if self._state == self.RETRYING:
-            return f"{c}⟳{r}"
-        # Animated spinner for all other active states
+            return f"{c}\u27f3{r}"
         self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER)
         return f"{c}{self._SPINNER[self._spinner_idx]}{r}"
 
