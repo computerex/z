@@ -55,6 +55,11 @@ TOOL_DEFS: List[ToolDef] = [
     ToolDef("replace_in_file", category="file", complex_content=True,
             params=[ToolParam("path", required=True),
                     ToolParam("diff", required=True)]),
+    ToolDef("replace_between_anchors", category="file", complex_content=True,
+            params=[ToolParam("path", required=True),
+                    ToolParam("start_anchor", required=True),
+                    ToolParam("end_anchor", required=True),
+                    ToolParam("replacement", required=True)]),
 
     # --- Shell / process ---
     ToolDef("execute_command",          category="shell",
@@ -84,6 +89,9 @@ TOOL_DEFS: List[ToolDef] = [
     ToolDef("list_context",        category="context"),
     ToolDef("remove_from_context", category="context",
             params=[ToolParam("id"), ToolParam("source")]),
+    ToolDef("retrieve_tool_result", category="context",
+            params=[ToolParam("result_id", required=True,
+                    description="The ID of the stored tool result (e.g., res_abc123_456)")]),
 
     # --- Agent meta ---
     ToolDef("manage_todos",     category="agent",
