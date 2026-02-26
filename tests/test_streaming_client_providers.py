@@ -86,3 +86,26 @@ def test_normalize_openai_usage_preserves_reasoning_and_cache_details():
     assert out["completion_tokens"] == 20
     assert out["prompt_cached_tokens"] == 60
     assert out["completion_reasoning_tokens"] == 7
+
+
+def test_minimax_reasoning_details_extraction_flattens_text_blocks():
+    client = StreamingJSONClient("k", "https://api.minimax.io/v1", "MiniMax-M2.5")
+    assert client._is_minimax_provider() is True
+    text = client._extract_reasoning_details_text([
+        {"type": "reasoning.summary", "text": "plan "},
+        {"type": "reasoning.text", "text": "step 1"},
+        {"type": "reasoning.text", "ignored": "x"},
+        "skip",
+    ])
+    assert text == "plan step 1"
+
+
+def test_minimax_reasoning_details_extraction_handles_nested_message_shape():
+    text = StreamingJSONClient._extract_reasoning_details_text({
+        "role": "assistant",
+        "reasoning_details": [
+            {"type": "reasoning.summary", "text": "Thinking: "},
+            {"type": "reasoning.text", "text": "hello"},
+        ],
+    })
+    assert text == "Thinking: hello"

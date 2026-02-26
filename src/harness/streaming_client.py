@@ -219,6 +219,33 @@ class StreamingJSONClient:
             return "openai"
         return "openai_compat"
 
+    def _is_minimax_provider(self) -> bool:
+        return "minimax" in (self.base_url or "").lower()
+
+    @staticmethod
+    def _extract_reasoning_details_text(value: Any) -> str:
+        """Flatten MiniMax/OpenAI-compatible `reasoning_details` blocks into text."""
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str):
+                return value["text"]
+            if "reasoning_details" in value:
+                return StreamingJSONClient._extract_reasoning_details_text(value.get("reasoning_details"))
+            parts: List[str] = []
+            for k in ("summary", "content", "items"):
+                if k in value:
+                    t = StreamingJSONClient._extract_reasoning_details_text(value.get(k))
+                    if t:
+                        parts.append(t)
+            return "".join(parts)
+        if not isinstance(value, list):
+            return ""
+        parts: List[str] = []
+        for item in value:
+            t = StreamingJSONClient._extract_reasoning_details_text(item)
+            if t:
+                parts.append(t)
+        return "".join(parts)
+
     @staticmethod
     def _data_uri_to_anthropic_image_block(url: str) -> Optional[Dict[str, Any]]:
         """Convert data URI image_url to Anthropic image block."""
@@ -576,6 +603,9 @@ class StreamingJSONClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if self._is_minimax_provider():
+            payload["reasoning_split"] = True
+            payload["extra_body"] = {"reasoning_split": True}
         
         last_error = None
         
@@ -584,6 +614,8 @@ class StreamingJSONClient:
                 extractor = ContentExtractor()
                 usage = {}
                 finish_reason = "stop"
+                full_reasoning = ""
+                minimax_reasoning_snapshot = ""
                 
                 async with self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
@@ -616,10 +648,31 @@ class StreamingJSONClient:
                             choice = data.get("choices", [{}])[0]
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
+                            reasoning = (
+                                delta.get("reasoning_content", "")
+                                or delta.get("reasoning", "")
+                            )
+                            if not reasoning:
+                                rd_full = self._extract_reasoning_details_text(delta.get("reasoning_details"))
+                                if not rd_full:
+                                    rd_full = self._extract_reasoning_details_text(choice.get("message", {}))
+                                if rd_full:
+                                    if rd_full.startswith(minimax_reasoning_snapshot):
+                                        reasoning = rd_full[len(minimax_reasoning_snapshot):]
+                                    elif minimax_reasoning_snapshot.startswith(rd_full):
+                                        reasoning = ""
+                                    else:
+                                        reasoning = rd_full
+                                    minimax_reasoning_snapshot = rd_full
                             
                             # Track finish reason
                             if choice.get("finish_reason"):
                                 finish_reason = choice["finish_reason"]
+
+                            if reasoning:
+                                full_reasoning += reasoning
+                                if on_thinking:
+                                    on_thinking(reasoning)
                             
                             if content:
                                 extractor.feed(content, on_content)
@@ -629,7 +682,7 @@ class StreamingJSONClient:
                 parsed = extractor.get_json()
                 
                 if parsed:
-                    result.thinking = parsed.get("thinking")
+                    result.thinking = parsed.get("thinking") or (full_reasoning or None)
                     result.message = parsed.get("message")
                     
                     tool_name = parsed.get("tool")
@@ -639,6 +692,8 @@ class StreamingJSONClient:
                             parameters=parsed["parameters"]
                         )
                 
+                if not result.thinking and full_reasoning:
+                    result.thinking = full_reasoning
                 return result
                 
             except httpx.HTTPStatusError as e:
@@ -702,6 +757,9 @@ class StreamingJSONClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if self._is_minimax_provider():
+            payload["reasoning_split"] = True
+            payload["extra_body"] = {"reasoning_split": True}
         
         # ZAI native reasoning stream (Claude/Cursor-like visible thinking).
         # Safe no-op for providers that ignore unknown fields.
@@ -731,6 +789,7 @@ class StreamingJSONClient:
             try:
                 full_content = ""
                 full_reasoning = ""
+                minimax_reasoning_snapshot = ""
                 usage = {}
                 finish_reason = "stop"
                 interrupted = False
@@ -824,6 +883,18 @@ class StreamingJSONClient:
                                 delta.get("reasoning_content", "")
                                 or delta.get("reasoning", "")
                             )
+                            if not reasoning:
+                                rd_full = self._extract_reasoning_details_text(delta.get("reasoning_details"))
+                                if not rd_full:
+                                    rd_full = self._extract_reasoning_details_text(choice.get("message", {}))
+                                if rd_full:
+                                    if rd_full.startswith(minimax_reasoning_snapshot):
+                                        reasoning = rd_full[len(minimax_reasoning_snapshot):]
+                                    elif minimax_reasoning_snapshot.startswith(rd_full):
+                                        reasoning = ""
+                                    else:
+                                        reasoning = rd_full
+                                    minimax_reasoning_snapshot = rd_full
                             
                             if choice.get("finish_reason"):
                                 finish_reason = choice["finish_reason"]
