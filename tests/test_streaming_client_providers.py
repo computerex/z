@@ -74,6 +74,37 @@ def test_build_anthropic_messages_does_not_cache_mark_empty_text_block():
     assert "cache_control" not in assistant_blocks[1]
 
 
+def test_build_anthropic_messages_caps_cache_markers_at_four():
+    client = StreamingJSONClient("k", "https://api.anthropic.com/v1", "claude-3-5-sonnet")
+    messages = [StreamingMessage(role="system", content="sys")]
+    # Seed replayed assistant blocks with stale cache markers, then add enough turns
+    # that the builder would otherwise exceed Anthropic's 4-marker cap.
+    messages.append(
+        StreamingMessage(
+            role="assistant",
+            content="a0",
+            provider_blocks=[
+                {"type": "text", "text": "a0", "cache_control": {"type": "ephemeral"}},
+            ],
+        )
+    )
+    for i in range(1, 50):
+        messages.append(StreamingMessage(role="user", content=f"u{i}"))
+        messages.append(StreamingMessage(role="assistant", content=f"a{i}"))
+
+    system_blocks, anth_messages = client._build_anthropic_messages(messages, enable_prompt_caching=True)
+
+    total_markers = 0
+    for b in system_blocks:
+        if isinstance(b, dict) and "cache_control" in b:
+            total_markers += 1
+    for msg in anth_messages:
+        for b in (msg.get("content") or []):
+            if isinstance(b, dict) and "cache_control" in b:
+                total_markers += 1
+    assert total_markers <= 4
+
+
 def test_normalize_openai_usage_preserves_reasoning_and_cache_details():
     usage = {
         "prompt_tokens": 100,

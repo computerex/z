@@ -866,9 +866,11 @@ class ToolHandlers:
             win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
             if win_shell != "cmd":
                 # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
-                encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
+                ps_command = "$ProgressPreference='SilentlyContinue'; " + command
+                encoded = base64.b64encode(ps_command.encode("utf-16le")).decode("ascii")
                 launcher = (
                     "powershell -NoProfile -NonInteractive "
+                    "-InputFormat Text -OutputFormat Text "
                     "-ExecutionPolicy Bypass "
                     f"-EncodedCommand {encoded}"
                 )
