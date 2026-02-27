@@ -1231,6 +1231,8 @@ class ClineAgent:
             _client_model = config_key
 
         try:
+            _hidden_only_retry_count = 0
+            _hidden_only_retry_max = 2
             for iteration in range(self.max_iterations):
                 # (Re)create client if config changed (e.g. after set_reasoning_mode)
                 await _ensure_client()
@@ -1544,6 +1546,7 @@ class ClineAgent:
                 tool_call = all_tool_calls[-1] if all_tool_calls else None
                 
                 if all_tool_calls:
+                    _hidden_only_retry_count = 0
                     log.info("Tools parsed: %d call(s) — %s",
                              len(all_tool_calls),
                              ", ".join(tc.name for tc in all_tool_calls))
@@ -1563,13 +1566,37 @@ class ClineAgent:
                     print(f"[DEBUG] parse_all_xml_tools returned: {len(all_tool_calls)} calls")
                 
                 if not tool_call:
+                    display_text = strip_thinking_blocks(full_content).strip()
+                    raw_visible_text = (response.content or "").strip()
+                    if (not raw_visible_text and full_reasoning.strip() and
+                            _hidden_only_retry_count < _hidden_only_retry_max):
+                        _hidden_only_retry_count += 1
+                        log.warning(
+                            "Hidden-only output (no tool/no visible text), retrying (%d/%d)",
+                            _hidden_only_retry_count,
+                            _hidden_only_retry_max,
+                        )
+                        self.messages.append(StreamingMessage(
+                            role="assistant",
+                            content=full_content,
+                            provider_blocks=getattr(response, "provider_content_blocks", None),
+                        ))
+                        self.messages.append(StreamingMessage(
+                            role="user",
+                            content=(
+                                "[SYSTEM: Your last reply had hidden thinking only and no executable tool XML. "
+                                "If more work is needed, emit exactly one valid tool call now. "
+                                "If you are done, emit a concise visible summary.]"
+                            ),
+                        ))
+                        continue
+
                     # No tool call — model produced text. Reset reasoning counters.
                     self._consecutive_low_reasoning = 0
 
                     # Pretty-render markdown in TTY mode after the full response
                     # is available (avoids raw streamed markdown clutter).
                     if _defer_markdown_render:
-                        display_text = strip_thinking_blocks(full_content).strip()
                         display_text = _normalize_display_text(display_text)
                         if display_text:
                             self.console.print(Markdown(display_text))
