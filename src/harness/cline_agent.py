@@ -15,6 +15,9 @@ from rich.console import Console
 from rich.markup import escape as rich_escape
 from rich.markdown import Markdown
 
+import time as _time_mod_agent
+_agent_import_t0 = _time_mod_agent.perf_counter()
+
 from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
 from .prompts import get_system_prompt
@@ -25,13 +28,31 @@ from .context_management import (
     truncate_conversation, truncate_output, truncate_file_content,
     DuplicateDetector
 )
+_agent_t1 = _time_mod_agent.perf_counter()
+
 from .tool_handlers import ToolHandlers
+_agent_t2 = _time_mod_agent.perf_counter()
+
 from .todo_manager import TodoManager, TodoStatus
 from .smart_context import SmartContextManager
+_agent_t3 = _time_mod_agent.perf_counter()
+
 from .status_line import StatusLine
 from .workspace_index import WorkspaceIndex
-from .tool_registry import get_tool_names, get_complex_content_tools, get_metrics
+from .tool_registry import get_tool_names, get_complex_content_tools, get_metrics, get_tool_def, get_param_names
 from .logger import get_logger, log_exception, truncate as log_truncate
+_agent_t4 = _time_mod_agent.perf_counter()
+
+import logging as _logging_mod
+_boot_logger = _logging_mod.getLogger("harness.agent.boot")
+_boot_logger.info(
+    "cline_agent import breakdown: core=%.0fms tool_handlers=%.0fms smart_context=%.0fms rest=%.0fms total=%.0fms",
+    (_agent_t1 - _agent_import_t0) * 1000,
+    (_agent_t2 - _agent_t1) * 1000,
+    (_agent_t3 - _agent_t2) * 1000,
+    (_agent_t4 - _agent_t3) * 1000,
+    (_agent_t4 - _agent_import_t0) * 1000,
+)
 
 log = get_logger("agent")
 
@@ -175,8 +196,25 @@ class ParsedToolCall:
 
 
 def strip_thinking_blocks(content: str) -> str:
-    """Remove <thinking> blocks from content (MiniMax reasoning)."""
-    return re.sub(r'<thinking>.*?</thinking>\s*', '', content, flags=re.DOTALL)
+    """Remove <thinking> blocks and orphaned </thinking> tags from content."""
+    content = re.sub(r'<thinking>.*?</thinking>\s*', '', content, flags=re.DOTALL)
+    content = re.sub(r'</thinking>\s*', '', content)
+    return content
+
+
+def _normalize_tool_xml(content: str) -> str:
+    """Fix common model hallucinations in tool call XML.
+
+    Handles the <tool_call>tool_name> hybrid format where the model wraps
+    a standard tool call in <tool_call> instead of using <tool_name> directly.
+    Converts: <tool_call>tool_name>..params..</tool_name>
+    Into:     <tool_name>..params..</tool_name>
+    """
+    tool_names = get_tool_names()
+    tool_names_alt = '|'.join(re.escape(n) for n in tool_names)
+    pattern = rf'<tool_call>\s*({tool_names_alt})\s*>'
+    content = re.sub(pattern, lambda m: f'<{m.group(1)}>', content)
+    return content
 
 
 def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
@@ -186,8 +224,8 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     For tools with complex content (write_to_file, replace_in_file), uses
     greedy matching to get the full content including any nested examples.
     """
-    # Strip thinking blocks first (MiniMax outputs these)
     content = strip_thinking_blocks(content)
+    content = _normalize_tool_xml(content)
     
     tool_names = get_tool_names()
 
@@ -272,17 +310,13 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     inner = match.group(1)
     params = {}
     
-    # Parse parameters - order matters because content/diff may contain nested XML
-    # Simple params (path, command, etc.) use FIRST closing tag
-    # Complex params (content, diff) use LAST closing tag
-    simple_params = ['path', 'command', 'background', 'regex', 'file_pattern', 
-                    'result', 'query', 'image_path', 'process_id', 'item', 
-                    'search_term', 'count', 'recursive', 'id', 'lines', 'question',
-                    'action', 'title', 'status', 'parent_id', 'notes', 'context_refs',
-                    'start_line', 'end_line', 'offset', 'limit',
-                    'prompt', 'mode', 'rule', 'category', 'start_anchor', 'end_anchor',
-                    'result_id']
-    complex_params = ['content', 'diff', 'replacement']
+    # Parse parameters - order matters because large payload params may contain nested XML.
+    # Use canonical tool definitions so parser stays aligned with the registry.
+    tool_def = get_tool_def(tool_name)
+    param_names = [p.name for p in tool_def.params] if tool_def else []
+    complex_param_names = {"content", "diff", "replacement", "arguments"}
+    complex_params = [p for p in param_names if p in complex_param_names]
+    simple_params = [p for p in param_names if p not in complex_param_names]
     
     # For tools with complex content (write_to_file, replace_in_file),
     # extract the content/diff FIRST, then only search for other params
@@ -338,6 +372,7 @@ def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
     operations like adding multiple todo items in one response.
     """
     stripped = strip_thinking_blocks(content)
+    stripped = _normalize_tool_xml(stripped)
     
     tool_names = get_tool_names()
     
@@ -405,7 +440,9 @@ class ClineAgent:
         self.todo_manager = TodoManager()
         
         # Smart context manager for intelligent eviction/compaction
+        _t0_sc = time.perf_counter()
         self.smart_context = SmartContextManager(self.todo_manager)
+        log.info("SmartContextManager init: %.1fms", (time.perf_counter() - _t0_sc) * 1000)
         
         # Token tracking
         self._last_token_count = 0
@@ -417,15 +454,6 @@ class ClineAgent:
         # {filepath: {"failures": int, "last_error": str}}
         self._edit_failures: Dict[str, dict] = {}
         
-        # Reasoning quality tracking
-        self._consecutive_low_reasoning = 0
-        
-        # Introspect tool tracking: gentle nudge system (non-adversarial)
-        # Instead of forcing thinking, we suggest using the introspect tool
-        # and reward good usage via positive reinforcement in tool results.
-        self._calls_since_introspect = 0      # tool calls since last introspect
-        self._results_since_introspect = []   # (tool_name, snippet) tuples for introspect prompt
-        self._INTROSPECT_NUDGE_THRESHOLD = 6  # suggest introspect after N tool calls
         self._active_client = None            # set during _run_loop for introspect tool access
         
         # Tool handlers - delegates all tool execution logic
@@ -441,12 +469,49 @@ class ClineAgent:
         self.tool_handlers._claude_model = self.claude_cli_config.get("model")
         
         # Workspace index — built once at startup
+        _t0_idx = time.perf_counter()
         self.workspace_index = WorkspaceIndex(self.workspace_path).build()
+        log.info("WorkspaceIndex.build(): %.1fms (%d files)",
+                 (time.perf_counter() - _t0_idx) * 1000,
+                 len(self.workspace_index.files))
 
     def _system_prompt(self) -> str:
         """Return the system prompt for this agent."""
         index_summary = self.workspace_index.summary() if self.workspace_index.files else ""
-        return get_system_prompt(self.workspace_path, project_map=index_summary)
+        base = get_system_prompt(self.workspace_path, project_map=index_summary)
+        # Keep MCP server inventory visible in the active system prompt so the
+        # model can use newly added servers without restarting the harness.
+        servers = {}
+        try:
+            servers = self.tool_handlers._load_mcp_servers()
+        except Exception:
+            servers = {}
+        if isinstance(servers, dict) and servers:
+            lines = ["MCP servers (from global config):"]
+            for name in sorted(servers.keys()):
+                cfg = servers.get(name, {}) or {}
+                enabled = bool(cfg.get("enabled", True))
+                stype = str(cfg.get("type", "local"))
+                lines.append(f"- {name} [{stype}] ({'enabled' if enabled else 'disabled'})")
+            return base + "\n\n====\n\n" + "\n".join(lines)
+        return base + "\n\n====\n\nMCP servers (from global config): none configured."
+
+    def refresh_system_prompt(self) -> bool:
+        """Refresh the in-memory system prompt from current runtime config.
+
+        Returns True if the system message was updated.
+        """
+        if not self._initialized:
+            return False
+        new_prompt = self._system_prompt()
+        if self.messages and self.messages[0].role == "system":
+            old = self.messages[0].content
+            if old != new_prompt:
+                self.messages[0] = StreamingMessage(role="system", content=new_prompt)
+                return True
+            return False
+        self.messages.insert(0, StreamingMessage(role="system", content=new_prompt))
+        return True
     
     @staticmethod
     def _thinking_system_prompt() -> str:
@@ -484,12 +549,6 @@ class ClineAgent:
         if todo_state and "empty" not in todo_state.lower():
             parts.append(f"\nACTIVE TASKS:\n{todo_state}")
         
-        # Recent results summary
-        if self._results_since_introspect:
-            parts.append("\nRecent tool results to analyze:")
-            for tool_name, snippet in self._results_since_introspect[-8:]:
-                parts.append(f"  - {tool_name}: {snippet}")
-        
         parts.append(
             "\n[DEEP ANALYSIS MODE — No tools available. "
             "Analyze everything you've learned from the conversation above. "
@@ -510,26 +569,11 @@ class ClineAgent:
         so the model can ONLY produce reasoning. If the initial output is too short,
         we push the model to continue (up to _INTROSPECT_MAX_CONTINUATIONS times).
         The thinking output is returned as the tool result.
-        
-        Includes an anti-loop guard: if introspect was just called (0 tool calls
-        since last introspect), returns a redirect message instead of executing.
         """
-        # Anti-loop guard: prevent back-to-back introspect calls
-        if self._calls_since_introspect == 0:
-            log.info("Introspect anti-loop: called again with 0 intervening tool calls, redirecting")
-            self.console.print("  [dim]• Introspect skipped (just used — act on your analysis first)[/dim]")
-            return (
-                "[Introspect was just used. You already have a deep analysis in your "
-                "conversation memory above. Act on those insights now — read more files, "
-                "make edits, run commands. Call introspect again after gathering new information.]"
-            )
-        
-        log.info("Introspect tool called: focus=%r calls_since=%d results=%d",
-                 focus[:80] if focus else "(none)",
-                 self._calls_since_introspect, len(self._results_since_introspect))
+        log.info("Introspect tool called: focus=%r", focus[:80] if focus else "(none)")
         
         self.console.print(
-            "  [dim]•[/dim] [bold magenta]Deep analysis[/bold magenta]"
+            "  [dim]•[/dim] [magenta]Introspect[/magenta]"
             + (f" [dim]{focus[:80]}[/dim]" if focus else "")
         )
         
@@ -669,24 +713,13 @@ class ClineAgent:
             '', full_thinking
         ).strip()
         
-        # Reset nudge counters — model just introspected deeply
-        self._calls_since_introspect = 0
-        self._results_since_introspect = []
-        self._consecutive_low_reasoning = 0
-        
-        # Build result with positive reinforcement
         word_count = len(full_thinking.split())
         log.info("Introspect complete: %d words, %d chars, %.1fs",
                  word_count, len(full_thinking), api_elapsed)
         
         result = (
             f"[Deep analysis complete — {word_count} words, {api_elapsed:.1f}s]\n\n"
-            f"{full_thinking}\n\n"
-            "---\n"
-            "Your analysis is now part of your conversation memory. "
-            "Use these insights to guide your next actions. "
-            "Continue using introspect whenever you need to synthesize "
-            "new information or plan complex changes."
+            f"{full_thinking}"
         )
         return result
     
@@ -814,6 +847,10 @@ class ClineAgent:
                     out.append(clean)
             return out or None
         
+        # Ensure session always persists a valid system prompt at index 0.
+        if not self.messages or self.messages[0].role != "system":
+            self.messages.insert(0, StreamingMessage(role="system", content=self._system_prompt()))
+
         # Serialize context items
         context_items = []
         for item in self.context.list_items():
@@ -972,13 +1009,13 @@ class ClineAgent:
     
     def clear_history(self) -> None:
         """Clear conversation history and context."""
-        self.messages = []
+        self.messages = [StreamingMessage(role="system", content=self._system_prompt())]
         self.context.clear()
         self._duplicate_detector.clear()
         self.todo_manager.clear()
         self.smart_context = SmartContextManager(self.todo_manager)
         self._last_token_count = 0
-        self._initialized = False
+        self._initialized = True
     
     def get_token_count(self) -> int:
         """Get estimated token count of current conversation."""
@@ -1161,9 +1198,13 @@ class ClineAgent:
             ]
             self._initialized = True
             log.debug("System prompt initialised (%d chars)", len(self.messages[0].content))
+        else:
+            # Keep MCP/provider config changes reflected without requiring restart.
+            self.refresh_system_prompt()
         
         # Add user message
         self.messages.append(StreamingMessage(role="user", content=user_content))
+
         
         # Capture original request for todo grounding (first real user message)
         if (
@@ -1173,8 +1214,9 @@ class ClineAgent:
         ):
             self.todo_manager.set_original_request(user_content[:500])
         
-        # Start keyboard monitoring for escape key
-        if enable_interrupt and sys.stdin.isatty():
+        # Start keyboard monitoring for escape/Ctrl+C.
+        # Keep this enabled even in non-tty wrappers so SIGINT soft-cancel works.
+        if enable_interrupt:
             start_monitoring()
         
         try:
@@ -1193,6 +1235,7 @@ class ClineAgent:
     async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
         """Run the agent with a plain text user request."""
         return await self.run_message(user_input, enable_interrupt=enable_interrupt)
+
     
     async def _run_loop(self) -> str:
         """Main agent loop."""
@@ -1256,6 +1299,17 @@ class ClineAgent:
                 
                 # Check if we need to compact/truncate conversation
                 self._last_token_count = estimate_messages_tokens(self.messages)
+
+                # Continuous semantic maintenance (lightweight) every turn.
+                # Keeps stale guidance/noise trimmed even before hard thresholds.
+                self.messages, _maint_freed, _maint_report = self.smart_context.semantic_maintenance_tick(
+                    self.messages, max_allowed, current_tokens=self._last_token_count
+                )
+                if _maint_freed > 0:
+                    self._last_token_count = estimate_messages_tokens(self.messages)
+                    log.info("Semantic maintenance freed %d tokens. Report: %s", _maint_freed, _maint_report)
+                    self.console.print(f"[dim][~] Semantic maintenance: freed {_maint_freed:,} tokens ({_maint_report})[/dim]")
+
                 compact_threshold = int(max_allowed * 0.85)
                 if self._last_token_count > compact_threshold:
                     log.info("Context compaction triggered: %d tokens > %d threshold",
@@ -1300,15 +1354,131 @@ class ClineAgent:
                 full_content = ""
                 first_token = True
                 _defer_markdown_render = bool(sys.stdout.isatty())
+                _payload_progress_step = 32 * 1024
+                _payload_next_report = _payload_progress_step
+                _payload_announced = False
+                _stream_payload_enabled = os.environ.get("HARNESS_STREAM_CODE_CHANGES", "1") != "0"
+                _stream_tool_param = {
+                    "write_to_file": "content",
+                    "replace_in_file": "diff",
+                    "replace_between_anchors": "replacement",
+                }
+                _stream_tool_stack: List[str] = []
+                _stream_in_tag = False
+                _stream_tag_buf = ""
+                _stream_in_payload = False
+                _stream_payload_line = ""
+                _stream_payload_header_printed = False
+                _stream_payload_lines = 0
+                _stream_payload_capped = False
+                _stream_payload_max_lines = 120
+                _stream_payload_line_limit = 220
+
+                def _stream_process_tag(raw_tag: str):
+                    nonlocal _stream_tool_stack, _stream_in_payload, _stream_payload_line
+                    tag = raw_tag.strip()
+                    m = re.match(r"</?\s*([a-zA-Z_][a-zA-Z0-9_]*)", tag)
+                    if not m:
+                        return
+                    name = m.group(1)
+                    is_close = tag.startswith("</")
+                    is_self_closing = tag.endswith("/>")
+
+                    if name in _stream_tool_param:
+                        if is_close:
+                            if _stream_tool_stack and _stream_tool_stack[-1] == name:
+                                _stream_tool_stack.pop()
+                        elif not is_self_closing:
+                            _stream_tool_stack.append(name)
+                        return
+
+                    if not _stream_tool_stack:
+                        return
+
+                    active_tool = _stream_tool_stack[-1]
+                    expected_param = _stream_tool_param.get(active_tool)
+                    if not expected_param or name != expected_param:
+                        return
+
+                    if is_close:
+                        _stream_emit_payload_line(force=True)
+                        _stream_in_payload = False
+                    elif not is_self_closing:
+                        _stream_in_payload = True
+                        _stream_payload_line = ""
+
+                def _stream_emit_payload_line(force: bool = False):
+                    nonlocal _stream_payload_line, _stream_payload_lines
+                    nonlocal _stream_payload_header_printed, _stream_payload_capped
+
+                    if not _stream_payload_enabled:
+                        _stream_payload_line = ""
+                        return
+
+                    if not force and "\n" not in _stream_payload_line:
+                        return
+
+                    line = _stream_payload_line
+                    if not force:
+                        line, _stream_payload_line = line.split("\n", 1)
+                    else:
+                        _stream_payload_line = ""
+
+                    line = line.rstrip("\r")
+                    if not line.strip():
+                        return
+
+                    if _stream_payload_lines >= _stream_payload_max_lines:
+                        if not _stream_payload_capped:
+                            self.console.print("  [dim]... live payload preview capped ...[/dim]")
+                            _stream_payload_capped = True
+                        return
+
+                    if not _stream_payload_header_printed:
+                        self.console.print("  [dim]• Streaming changes…[/dim]")
+                        _stream_payload_header_printed = True
+
+                    preview = line
+                    if len(preview) > _stream_payload_line_limit:
+                        preview = preview[:_stream_payload_line_limit] + " ..."
+                    self.console.print(f"    [dim]{rich_escape(preview)}[/dim]")
+                    _stream_payload_lines += 1
+
+                def _stream_process_chunk(chunk: str):
+                    nonlocal _stream_in_tag, _stream_tag_buf
+                    nonlocal _stream_in_payload, _stream_payload_line
+                    if not _stream_payload_enabled:
+                        return
+                    for c in chunk:
+                        if _stream_in_tag:
+                            _stream_tag_buf += c
+                            if c == ">":
+                                _stream_process_tag(_stream_tag_buf)
+                                _stream_tag_buf = ""
+                                _stream_in_tag = False
+                            continue
+
+                        if c == "<":
+                            _stream_in_tag = True
+                            _stream_tag_buf = "<"
+                            continue
+
+                        if _stream_in_payload:
+                            _stream_payload_line += c
+                            if c == "\n":
+                                _stream_emit_payload_line()
+                            elif len(_stream_payload_line) >= _stream_payload_line_limit * 2:
+                                _stream_emit_payload_line(force=True)
                 
                 # ── XML stream filter ────────────────────────────────────
                 # Suppresses raw XML tool tags from the live terminal while
                 # full_content still accumulates everything for parsing.
                 # IMPORTANT: chat_stream_raw passes MULTI-CHARACTER chunks
                 # to on_chunk, so we iterate char-by-char internally.
-                _sf_tool_names = set(get_tool_names())
-                _sf_strip_tags = {'thinking', 'think'}
+                _sf_tool_names = set(get_tool_names()) | {'tool_call'}
+                _sf_thinking_tags = {'thinking', 'think'}
                 _sf_suppressing: Optional[str] = None  # tool block being eaten
+                _sf_thinking_suppress = False  # eating content inside <thinking>
                 _sf_tag_buf = ""
                 _sf_in_tag = False
                 _sf_had_visible = False
@@ -1323,7 +1493,7 @@ class ClineAgent:
 
                 def _sf_char(c: str):
                     """Process a single character through the filter."""
-                    nonlocal _sf_suppressing, _sf_tag_buf, _sf_in_tag, _sf_had_visible
+                    nonlocal _sf_suppressing, _sf_thinking_suppress, _sf_tag_buf, _sf_in_tag, _sf_had_visible
                     
                     # ── SUPPRESS_BLOCK: eat everything until </tool_name> ──
                     if _sf_suppressing:
@@ -1334,6 +1504,23 @@ class ClineAgent:
                             _sf_tag_buf = ""
                         elif len(_sf_tag_buf) > len(close) + 30:
                             _sf_tag_buf = _sf_tag_buf[-(len(close) + 10):]
+                        return
+                    
+                    # ── THINKING_SUPPRESS: route content to reasoning display ──
+                    if _sf_thinking_suppress:
+                        _sf_tag_buf += c
+                        for tag in _sf_thinking_tags:
+                            close = f"</{tag}>"
+                            if _sf_tag_buf.endswith(close):
+                                text = _sf_tag_buf[:-len(close)]
+                                if text:
+                                    on_reasoning(text)
+                                _sf_thinking_suppress = False
+                                _sf_tag_buf = ""
+                                return
+                        if len(_sf_tag_buf) > 200:
+                            on_reasoning(_sf_tag_buf[:-20])
+                            _sf_tag_buf = _sf_tag_buf[-20:]
                         return
                     
                     # ── DETECT_TAG: buffering after '<' ──
@@ -1350,8 +1537,12 @@ class ClineAgent:
                                     _sf_tag_buf = ""
                                     _sf_in_tag = False
                                     return
-                                elif tag in _sf_strip_tags:
-                                    _sf_tag_buf = ""
+                                elif tag in _sf_thinking_tags:
+                                    if is_close:
+                                        _sf_tag_buf = ""
+                                    else:
+                                        _sf_thinking_suppress = True
+                                        _sf_tag_buf = ""
                                     _sf_in_tag = False
                                     return
                             _sf_flush()
@@ -1374,12 +1565,49 @@ class ClineAgent:
 
                 def on_chunk(chunk: str):
                     """Handle a (possibly multi-char) streaming chunk."""
-                    nonlocal full_content, first_token
+                    nonlocal full_content, first_token, _payload_next_report, _payload_announced
                     full_content += chunk
+                    _stream_process_chunk(chunk)
                     if first_token:
-                        self.status.clear()
+                        # If native reasoning already started, don't repaint the
+                        # status line here; \r-based status updates can overwrite
+                        # the currently streaming thinking line.
+                        if _defer_markdown_render and not _thinking_started:
+                            self.status.update("Receiving response...", StatusLine.STREAMING)
+                        else:
+                            self.status.clear()
                         first_token = False
                     if _defer_markdown_render:
+                        # Keep status-line updates off while thinking is visible.
+                        if _thinking_started:
+                            return
+                        active_tool = None
+                        payload_bytes = 0
+                        for tname in ("write_to_file", "replace_in_file", "replace_between_anchors"):
+                            open_tag = f"<{tname}>"
+                            close_tag = f"</{tname}>"
+                            open_pos = full_content.rfind(open_tag)
+                            if open_pos == -1:
+                                continue
+                            close_pos = full_content.rfind(close_tag)
+                            if close_pos > open_pos:
+                                continue
+                            active_tool = tname
+                            payload_bytes = len(full_content) - open_pos
+                            break
+
+                        if active_tool and payload_bytes >= _payload_next_report:
+                            if not _payload_announced:
+                                self.console.print(
+                                    f"  [dim]• Receiving {active_tool}…[/dim]"
+                                )
+                                _payload_announced = True
+                            kb = max(1, payload_bytes // 1024)
+                            self.status.update(
+                                f"Receiving {active_tool} payload ({kb} KB)...",
+                                StatusLine.STREAMING,
+                            )
+                            _payload_next_report += _payload_progress_step
                         return
                     for c in chunk:
                         _sf_char(c)
@@ -1392,10 +1620,10 @@ class ClineAgent:
                 _ansi_dim = "\033[2m" if _tty else ""
                 _ansi_italic = "\033[3m" if _tty else ""
                 _ansi_reset = "\033[0m" if _tty else ""
-                _thinking_prefix = f"{_ansi_dim}│ {_ansi_reset}" if _tty else "  "
+                _thinking_prefix = f"{_ansi_dim}  {_ansi_reset}" if _tty else "  "
                 _thinking_header = (
-                    f"{_ansi_dim}{_ansi_italic}Thinking:{_ansi_reset}\n\n"
-                    if _tty else "Thinking:\n\n"
+                    f"\n{_ansi_dim}{_ansi_italic}Thinking:{_ansi_reset}\n"
+                    if _tty else "\nThinking:\n"
                 )
 
                 def on_reasoning(chunk: str):
@@ -1450,10 +1678,10 @@ class ClineAgent:
                          len(full_content), len(full_reasoning))
 
                 _sf_flush()  # Flush any trailing buffered content
+                _stream_emit_payload_line(force=True)
                 if _thinking_started:
                     if not _thinking_line_start:
                         sys.stdout.write("\n")
-                    sys.stdout.write("\n")
                     sys.stdout.flush()
                 self.status.clear()
                 if _sf_had_visible:
@@ -1566,16 +1794,22 @@ class ClineAgent:
                     print(f"[DEBUG] parse_all_xml_tools returned: {len(all_tool_calls)} calls")
                 
                 if not tool_call:
-                    display_text = strip_thinking_blocks(full_content).strip()
-                    raw_visible_text = (response.content or "").strip()
-                    if (not raw_visible_text and full_reasoning.strip() and
-                            _hidden_only_retry_count < _hidden_only_retry_max):
-                        _hidden_only_retry_count += 1
-                        log.warning(
-                            "Hidden-only output (no tool/no visible text), retrying (%d/%d)",
-                            _hidden_only_retry_count,
-                            _hidden_only_retry_max,
-                        )
+                    # Detect invalid direct MCP tool-tag usage (e.g. <browser_navigate>).
+                    # MCP tools must be invoked via mcp_call_tool, not direct tags.
+                    tool_names_set = set(get_tool_names())
+                    param_names_set = set(get_param_names())
+                    invalid_tag_names: List[str] = []
+                    for m in re.finditer(r"<([a-zA-Z_][a-zA-Z0-9_]*)>", full_content):
+                        tag = m.group(1)
+                        if tag in tool_names_set or tag in param_names_set:
+                            continue
+                        if tag in ("thinking", "think", "tool_call"):
+                            continue
+                        if "_" in tag:
+                            invalid_tag_names.append(tag)
+
+                    if invalid_tag_names:
+                        bad = ", ".join(sorted(set(invalid_tag_names))[:5])
                         self.messages.append(StreamingMessage(
                             role="assistant",
                             content=full_content,
@@ -1584,21 +1818,19 @@ class ClineAgent:
                         self.messages.append(StreamingMessage(
                             role="user",
                             content=(
-                                "[SYSTEM: Your last reply had hidden thinking only and no executable tool XML. "
-                                "If more work is needed, emit exactly one valid tool call now. "
-                                "If you are done, emit a concise visible summary.]"
+                                "[SYSTEM: Invalid tool format. Do NOT emit direct tool tags like "
+                                f"{bad}. MCP tools must be called via <mcp_call_tool> with "
+                                "<server>, <tool>, and <arguments> JSON. Re-issue only valid harness tool XML.]"
                             ),
                         ))
                         continue
 
-                    # No tool call — model produced text. Reset reasoning counters.
-                    self._consecutive_low_reasoning = 0
+                    display_text = strip_thinking_blocks(full_content).strip()
 
-                    # Pretty-render markdown in TTY mode after the full response
-                    # is available (avoids raw streamed markdown clutter).
                     if _defer_markdown_render:
                         display_text = _normalize_display_text(display_text)
                         if display_text:
+                            self.console.print()
                             self.console.print(Markdown(display_text))
 
                     # No tool call — final response to user
@@ -1633,11 +1865,9 @@ class ClineAgent:
                     
                     # Spill each individual result BEFORE combining, so that
                     # small results stay inline even when there are many calls.
-                    # Introspect results stay in context — that's the whole point.
-                    if tc.name != "introspect":
-                        tc_result = self.tool_handlers.spill_output_to_file(
-                            tc_result, tc.name
-                        )
+                    tc_result = self.tool_handlers.spill_output_to_file(
+                        tc_result, tc.name
+                    )
                     
                     if len(all_tool_calls) > 1:
                         tool_results_combined.append(f"[{tc.name} result ({tc_idx+1}/{len(all_tool_calls)})]:\n{tc_result}")
@@ -1661,40 +1891,6 @@ class ClineAgent:
                 
                 tool_result = "\n\n".join(tool_results_combined)
 
-                # Track reasoning quality (lightweight — feeds into nudge)
-                _exempt_tools = {'manage_todos', 'list_context', 'introspect'}
-                _first_checkable = next(
-                    (tc for tc in all_tool_calls if tc.name not in _exempt_tools),
-                    None,
-                )
-                if _first_checkable:
-                    tag_pos = full_content.find(f'<{_first_checkable.name}>')
-                    reasoning_text = ''
-                    if tag_pos >= 0:
-                        reasoning_text = full_content[:tag_pos].strip()
-                        reasoning_text = re.sub(r'<thinking>.*?</thinking>', '', reasoning_text, flags=re.DOTALL).strip()
-                    
-                    if len(reasoning_text) < 200:
-                        self._consecutive_low_reasoning += 1
-                    else:
-                        self._consecutive_low_reasoning = 0
-                
-                # Introspect tool resets counters — model is actively reasoning
-                _has_introspect = any(tc.name == "introspect" for tc in all_tool_calls)
-                if _has_introspect:
-                    self._calls_since_introspect = 0
-                    self._results_since_introspect = []
-                    self._consecutive_low_reasoning = 0
-                else:
-                    self._calls_since_introspect += len(all_tool_calls)
-                    # Track results for building introspect prompt context
-                    _result_snippet = tool_result[:150].replace('\n', ' ').strip()
-                    if len(all_tool_calls) == 1:
-                        self._results_since_introspect.append((tc.name, _result_snippet))
-                    else:
-                        self._results_since_introspect.append(
-                            (f"{len(all_tool_calls)} tools", _result_snippet))
-                
                 # Add to history
                 self.messages.append(StreamingMessage(
                     role="assistant",
@@ -1718,33 +1914,6 @@ class ClineAgent:
                         if len(not_started) > 5:
                             todo_hint += f" (+{len(not_started) - 5} more)"
                     header_parts.append(todo_hint)
-                
-                # Escalating nudge: suggest introspect after many calls without it
-                if not _has_introspect and self._calls_since_introspect >= self._INTROSPECT_NUDGE_THRESHOLD:
-                    n = self._calls_since_introspect
-                    if n >= self._INTROSPECT_NUDGE_THRESHOLD + 4:
-                        # Strong nudge after 10+ calls
-                        header_parts.append(
-                            f"[IMPORTANT: You've made {n} tool calls without using introspect. "
-                            "Stop and call <introspect> NOW to synthesize your findings. "
-                            "Introspect produces your best reasoning — use it before proceeding.]"
-                        )
-                    else:
-                        # Gentle nudge after 6+ calls
-                        header_parts.append(
-                            "[Tip: You've gathered a lot of information. "
-                            "Consider using the introspect tool to synthesize what you've "
-                            "learned before making changes.]"
-                        )
-                
-                # Nudge on errors (errors benefit most from deep analysis)
-                _error_patterns = ['error:', 'failed', 'panic:', 'exception',
-                                   'traceback', 'undefined:', 'syntax error']
-                if any(p in tool_result.lower() for p in _error_patterns):
-                    header_parts.append(
-                        "[Note: This result contains errors. "
-                        "Use introspect to analyze what went wrong before attempting fixes.]"
-                    )
                 
                 header = "\n".join(header_parts)
                 # Label: for multi-tool batches show count; for single tool
@@ -1824,8 +1993,7 @@ class ClineAgent:
                 path = tool.parameters.get("path", "")
                 result = await self.tool_handlers.read_file(tool.parameters)
                 lines = result.count('\n') + 1
-                self.console.print(f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}[/dim]")
-                self.console.print(f"    [dim]… {lines} lines[/dim]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}  ({lines} lines)[/dim]")
                 
             elif tool.name == "write_to_file":
                 path = tool.parameters.get("path", "")
@@ -1838,7 +2006,7 @@ class ClineAgent:
                         old_content = resolved.read_text(encoding="utf-8")
                     except Exception:
                         pass
-                self.console.print(f"  [dim]•[/dim] [green]Wrote[/green] [dim]{rich_escape(path)} ({len(content)} bytes)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [green]Write[/green] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.write_file(tool.parameters)
                 # Show diff for overwrites, or creation summary for new files
                 if old_content is not None and not result.startswith("Error:"):
@@ -1850,7 +2018,7 @@ class ClineAgent:
             elif tool.name == "replace_in_file":
                 path = tool.parameters.get("path", "")
                 diff_text = tool.parameters.get("diff", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Edited[/yellow] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [yellow]Edit[/yellow] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.replace_in_file(tool.parameters)
                 
                 # Show pretty diff on success
@@ -1889,7 +2057,7 @@ class ClineAgent:
 
             elif tool.name == "replace_between_anchors":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Rewrote section[/yellow] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [yellow]Rewrite[/yellow] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.replace_between_anchors(tool.parameters)
                 if not result.startswith("Error:"):
                     norm_path = str(self.tool_handlers._resolve_path(path))
@@ -1902,38 +2070,36 @@ class ClineAgent:
                 path = tool.parameters.get("path", "")
                 result = await self.tool_handlers.list_files(tool.parameters)
                 count = len(result.splitlines())
-                self.console.print(f"  [dim]•[/dim] [blue]Listed[/blue] [dim]{rich_escape(path)}[/dim]")
-                self.console.print(f"    [dim]… {count} items[/dim]")
+                self.console.print(f"  [dim]•[/dim] [blue]Listed[/blue] [dim]{rich_escape(path)}  ({count} items)[/dim]")
                 
             elif tool.name == "search_files":
                 regex = tool.parameters.get("regex", "")
                 result = await self.tool_handlers.search_files(tool.parameters)
                 matches = len(result.splitlines()) if result != "(no matches)" else 0
-                self.console.print(f"  [dim]•[/dim] [magenta]Searched[/magenta] [dim]{rich_escape(regex)}[/dim]")
-                self.console.print(f"    [dim]… {matches} matches[/dim]")
+                self.console.print(f"  [dim]•[/dim] [magenta]Searched[/magenta] [dim]{rich_escape(regex)}  ({matches} matches)[/dim]")
                 
             elif tool.name == "check_background_process":
                 bg_id = tool.parameters.get("id", "")
-                self.console.print(f"  [dim]•[/dim] [cyan]Checking process[/cyan] [dim]{bg_id or 'all'}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Check process[/cyan] [dim]{bg_id or 'all'}[/dim]")
                 result = await self.tool_handlers.check_background_process(tool.parameters)
                 
             elif tool.name == "stop_background_process":
                 bg_id = tool.parameters.get("id", "")
-                self.console.print(f"  [dim]•[/dim] [red]Stopping process[/red] [dim]{bg_id}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [red]Stop process[/red] [dim]{bg_id}[/dim]")
                 result = await self.tool_handlers.stop_background_process(tool.parameters)
                 
             elif tool.name == "list_background_processes":
-                self.console.print(f"  [dim]•[/dim] [cyan]Listing background processes[/cyan]")
+                self.console.print(f"  [dim]•[/dim] [cyan]List processes[/cyan]")
                 result = await self.tool_handlers.list_background_processes(tool.parameters)
             
             elif tool.name == "set_reasoning_mode":
                 mode = tool.parameters.get("mode", "")
-                self.console.print(f"  [dim]•[/dim] [bold yellow]Switching mode[/bold yellow] [dim]→ {mode}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [yellow]Mode[/yellow] [dim]→ {mode}[/dim]")
                 result = self._handle_set_reasoning_mode(tool.parameters)
                 
             elif tool.name == "create_plan":
                 prompt = tool.parameters.get("prompt", "")
-                self.console.print(f"  [dim]•[/dim] [bold yellow]Creating plan[/bold yellow] [dim](Claude CLI)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [yellow]Plan[/yellow] [dim](Claude CLI)[/dim]")
                 # Auto-build context summary
                 context_summary = self._build_plan_context()
                 result = await self.tool_handlers.create_plan(tool.parameters, context_summary=context_summary)
@@ -1941,38 +2107,60 @@ class ClineAgent:
             elif tool.name == "update_agent_rules":
                 rule = tool.parameters.get("rule", "")
                 category = tool.parameters.get("category", "preference")
-                self.console.print(f"  [dim]•[/dim] [bold cyan]Recording rule[/bold cyan] [dim][{category}] {rich_escape(rule[:60])}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Rule[/cyan] [dim][{category}] {rich_escape(rule[:60])}[/dim]")
                 result = self._handle_update_agent_rules(tool.parameters)
                 
             elif tool.name == "list_context":
                 result = self.context.summary()
                 n_items = len(self.context.list_items())
-                self.console.print(f"  [dim]•[/dim] [blue]Listed context[/blue] [dim]({n_items} items, {self.context.total_size():,} chars)[/dim]")
+                self.console.print(f"  [dim]•[/dim] [blue]Context[/blue] [dim]({n_items} items)[/dim]")
 
             elif tool.name == "retrieve_tool_result":
-                self.console.print(f"  [dim]•[/dim] [cyan]Retrieving stored result[/cyan]")
+                self.console.print(f"  [dim]•[/dim] [cyan]Retrieve result[/cyan]")
                 result = await self.tool_handlers.retrieve_tool_result(tool.parameters)
                 
             elif tool.name == "remove_from_context":
                 item_id = tool.parameters.get("id", "")
                 source = tool.parameters.get("source", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Removed from context[/yellow] [dim]{rich_escape(item_id or source)}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [yellow]Remove context[/yellow] [dim]{rich_escape(item_id or source)}[/dim]")
                 result = self._remove_from_context(tool.parameters)
                 
             elif tool.name == "analyze_image":
                 path = tool.parameters.get("path", "")
                 question = tool.parameters.get("question", "Describe this image in detail.")
-                self.console.print(f"  [dim]•[/dim] [magenta]Analyzing image[/magenta] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(f"  [dim]•[/dim] [magenta]Analyze image[/magenta] [dim]{rich_escape(path)}[/dim]")
                 result = await self.tool_handlers.analyze_image(tool.parameters)
                 
             elif tool.name == "web_search":
                 query = tool.parameters.get("query", "")
-                self.console.print(f"  [dim]•[/dim] [cyan]Web search[/cyan] [dim]{rich_escape(query)}[/dim]")
+                self.console.print(f"  [dim]*[/dim] [cyan]Web search[/cyan] [dim]{rich_escape(query)}[/dim]")
                 result = await self.tool_handlers.web_search(tool.parameters)
                 
+
+            elif tool.name == "mcp_search_tools":
+                server = tool.parameters.get("server", "")
+                query = tool.parameters.get("query", "")
+                self.console.print(
+                    f"  [dim]*[/dim] [cyan]MCP search[/cyan] [dim]{rich_escape(server)} - {rich_escape(query)}[/dim]"
+                )
+                result = await self.tool_handlers.mcp_search_tools(tool.parameters)
+
+            elif tool.name == "mcp_list_tools":
+                server = tool.parameters.get("server", "")
+                self.console.print(f"  [dim]*[/dim] [cyan]MCP list[/cyan] [dim]{rich_escape(server)}[/dim]")
+                result = await self.tool_handlers.mcp_list_tools(tool.parameters)
+
+            elif tool.name == "mcp_call_tool":
+                server = tool.parameters.get("server", "")
+                tname = tool.parameters.get("tool", "")
+                self.console.print(
+                    f"  [dim]*[/dim] [cyan]MCP call[/cyan] [dim]{rich_escape(server)}::{rich_escape(tname)}[/dim]"
+                )
+                result = await self.tool_handlers.mcp_call_tool(tool.parameters)
+
             elif tool.name == "manage_todos":
                 action = tool.parameters.get("action", "list")
-                self.console.print(f"  [dim]•[/dim] [blue]Todo[/blue] [dim]{action}[/dim]")
+                self.console.print(f"  [dim]*[/dim] [blue]Todo[/blue] [dim]{action}[/dim]")
                 result = self._handle_manage_todos(tool.parameters)
                 # Render live todo panel after any todo change
                 self.todo_manager.print_todo_panel(self.console)

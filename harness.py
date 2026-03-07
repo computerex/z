@@ -3,6 +3,50 @@
 
 import sys
 import os
+import time as _time_mod
+
+_BOOT_T0 = _time_mod.perf_counter()
+_boot_marks: list = []  # [(label, elapsed_since_boot)]
+
+def _mark(label: str) -> None:
+    _boot_marks.append((label, _time_mod.perf_counter() - _BOOT_T0))
+
+
+def _print_boot_timing(console=None) -> None:
+    """Print a table of startup phase durations."""
+    if not _boot_marks:
+        return
+    try:
+        from rich.table import Table as _T
+        from rich.console import Console as _C
+        con = console or _C()
+        tbl = _T(
+            title="[bold]startup timing[/bold]",
+            show_header=True, box=None, padding=(0, 2), expand=False,
+        )
+        tbl.add_column("phase", style="dim")
+        tbl.add_column("delta", justify="right")
+        tbl.add_column("cumulative", justify="right", style="bold")
+        prev = 0.0
+        for label, cumul in _boot_marks:
+            delta = cumul - prev
+            style = "red" if delta > 1.0 else ("yellow" if delta > 0.3 else "")
+            tbl.add_row(label, f"[{style}]{delta*1000:8.0f}ms[/{style}]" if style else f"{delta*1000:8.0f}ms",
+                        f"{cumul*1000:8.0f}ms")
+            prev = cumul
+        con.print()
+        con.print(tbl)
+        con.print()
+    except Exception:
+        prev = 0.0
+        print("\n--- startup timing ---")
+        for label, cumul in _boot_marks:
+            delta = cumul - prev
+            flag = " ***" if delta > 1.0 else ""
+            print(f"  {label:25s}  delta={delta*1000:8.1f}ms  cumul={cumul*1000:8.1f}ms{flag}")
+            prev = cumul
+        print()
+
 
 # Force unbuffered output and UTF-8 encoding BEFORE any imports
 os.environ['PYTHONUNBUFFERED'] = '1'
@@ -13,6 +57,8 @@ try:
 except Exception:
     pass  # May fail on some systems
 
+_mark("env_setup")
+
 import asyncio
 import base64
 import hashlib
@@ -20,24 +66,32 @@ import time
 import json
 import mimetypes
 import re
+import shlex
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Union, Any, Callable
 import httpx
 
+_mark("stdlib_imports")
+
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from harness.config import Config
+_mark("import_config")
 from harness.cline_agent import ClineAgent
+_mark("import_cline_agent")
 from harness.cost_tracker import get_global_tracker, reset_global_tracker
 from harness.logger import init_logging, get_logger, log_exception, truncate
+_mark("import_harness_core")
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.markup import escape as rich_escape
 from rich import box
+_mark("import_rich")
 
 log = get_logger("main")
 
@@ -90,7 +144,7 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
         api_url: API base URL (headless mode)
         api_key: API key (headless mode)
         model: Model name (headless mode)
-        global_config: If True, save to ~/.z.json, else workspace/.z/.z.json
+        global_config: Deprecated; config is always saved to ~/.z.json
     """
     from pathlib import Path
     import json
@@ -103,12 +157,7 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
             "model": model or "glm-4.7",
         }
         
-        if global_config:
-            config_path = Path.home() / ".z.json"
-        else:
-            config_dir = Path.cwd() / ".z"
-            config_dir.mkdir(parents=True, exist_ok=True)
-            config_path = config_dir / ".z.json"
+        config_path = Path.home() / ".z.json"
         
         config_path.write_text(json.dumps(config_data, indent=2))
         print(f"Configuration saved to: {config_path}")
@@ -200,22 +249,10 @@ def run_install(api_url: str = None, api_key: str = None, model: str = None, glo
         "model": model,
     }
     
-    con.print("\n  Where to save configuration?\n")
-    con.print("  [cyan][1][/cyan] Global [dim](~/.z.json \u2014 all projects)[/dim]")
-    con.print("  [cyan][2][/cyan] Workspace [dim](.z/.z.json \u2014 this project only)[/dim]")
-    con.print()
-    
-    save_choice = input("Enter choice [1/2] (default: 1): ").strip() or "1"
-    
-    if save_choice == "2":
-        config_dir = Path.cwd() / ".z"
-        config_path = config_dir / ".z.json"
-        location = "workspace"
-    else:
-        config_dir = Path.home()
-        config_path = config_dir / ".z.json"
-        location = "global"
-    
+    config_dir = Path.home()
+    config_path = config_dir / ".z.json"
+    location = "global"
+
     # Create directory if needed
     config_dir.mkdir(parents=True, exist_ok=True)
     
@@ -275,7 +312,7 @@ def get_clipboard_image() -> tuple[Path | None, str]:
         return None, f"Error getting clipboard: {e}"
 
 
-CLIPBOARD_IMAGE_MARKER_RE = re.compile(r"\[\[clipboard_image:(.+?)\]\]")
+CLIPBOARD_IMAGE_MARKER_RE = re.compile(r"\[\[clipboard_image:(.+-)\]\]")
 
 
 def _supports_multimodal_input(api_url: str, model: str) -> bool:
@@ -345,39 +382,76 @@ def get_session_path(workspace: str, session_name: str = "default") -> Path:
 
 
 
+
+def _get_global_config_path() -> Path:
+    return Path.home() / ".z.json"
+
+
+def _get_legacy_global_models_path() -> Path:
+    return Path.home() / ".z" / "models.json"
+
+
 def load_providers(workspace: str) -> Dict[str, dict]:
-    """Load provider configs from .z/models.json.
-    
+    """Load provider configs from ~/.z.json (single-file config).
+
     Supports both old key names (low/orchestrator) and new (fast/normal).
-    Returns a normalised dict with 'fast' and 'normal' keys.
+    Migrates providers from legacy ~/.z.json on first read.
     """
     import json
-    
-    models_path = Path(workspace) / ".z" / "models.json"
-    if not models_path.exists():
-        return {}
-    data = json.loads(models_path.read_text(encoding="utf-8-sig"))
-    providers = data.get("providers", {})
-    
+
+    cfg_path = _get_global_config_path()
+    data = {}
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            data = {}
+
+    providers = dict(data.get("providers", {}) or {})
+
+    # One-time migration from legacy models file if providers are missing.
+    if not providers:
+        legacy_path = _get_legacy_global_models_path()
+        if legacy_path.exists():
+            try:
+                legacy = json.loads(legacy_path.read_text(encoding="utf-8-sig"))
+                providers = dict(legacy.get("providers", {}) or {})
+                if providers:
+                    data["providers"] = providers
+                    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+                    cfg_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
     # Normalise old key names
     if "low" in providers and "fast" not in providers:
         providers["fast"] = providers.pop("low")
     if "orchestrator" in providers and "normal" not in providers:
         providers["normal"] = providers.pop("orchestrator")
-    
+
     return providers
 
 
 def load_claude_cli_config(workspace: str) -> dict:
-    """Load optional claude_cli config from .z/models.json."""
+    """Load optional claude_cli config from ~/.z.json."""
     import json
-    models_path = Path(workspace) / ".z" / "models.json"
-    if not models_path.exists():
-        return {}
-    data = json.loads(models_path.read_text(encoding="utf-8-sig"))
-    return data.get("claude_cli", {})
+    cfg_path = _get_global_config_path()
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            return data.get("claude_cli", {})
+        except Exception:
+            pass
 
-
+    # Back-compat fallback to legacy models file.
+    legacy_path = _get_legacy_global_models_path()
+    if legacy_path.exists():
+        try:
+            data = json.loads(legacy_path.read_text(encoding="utf-8-sig"))
+            return data.get("claude_cli", {})
+        except Exception:
+            pass
+    return {}
 PROVIDER_PRESETS = {
     "zai-coding": ("Z.AI Coding", "https://api.z.ai/api/coding/paas/v4/", "glm-4.7"),
     "zai-standard": ("Z.AI Standard", "https://api.z.ai/api/paas/v4/", "glm-4.7"),
@@ -622,7 +696,7 @@ def _provider_display_name(profile: str, cfg: Dict[str, Any]) -> str:
 
 
 def _save_active_config_fields(workspace: str, updates: dict) -> Path:
-    cfg_path = Path(workspace) / ".z" / ".z.json"
+    cfg_path = Path.home() / ".z.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     if cfg_path.exists():
@@ -636,7 +710,7 @@ def _save_active_config_fields(workspace: str, updates: dict) -> Path:
 
 
 def _save_provider_profile_fields(workspace: str, providers: Dict[str, dict], profile: str, updates: dict) -> Path:
-    models_path = Path(workspace) / ".z" / "models.json"
+    models_path = _get_global_config_path()
     models_path.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     if models_path.exists():
@@ -841,7 +915,7 @@ def _choose_provider_preset_interactive(current_api_url: str, current_model: str
             con.print(f"  [cyan][{num}][/cyan] Custom URL")
         else:
             label, url, model = PROVIDER_PRESETS[key]
-            con.print(f"  [cyan][{num}][/cyan] [bold]{label}[/bold]  [dim]{model}  ·  {url}[/dim]")
+            con.print(f"  [cyan][{num}][/cyan] [bold]{label}[/bold]  [dim]{model}  Â·  {url}[/dim]")
     con.print()
     while True:
         choice = input("  Enter choice [1-7]: ").strip() or "6"
@@ -866,8 +940,8 @@ def run_in_app_config_wizard(
     """Interactive config editor inside the app.
 
     scope_arg:
-      - "" / "active" -> saves .z/.z.json and updates current agent config
-      - any other name -> saves a provider profile in .z/models.json
+      - "" / "active" -> saves ~/.z.json and updates current agent config
+      - any other name -> saves a provider profile in ~/.z.json
     """
     scope = (scope_arg or "active").strip()
     if not scope:
@@ -903,7 +977,7 @@ def run_in_app_config_wizard(
         if scope in providers:
             existing_url = providers[scope].get("api_url", "")
             if existing_url and existing_url != api_url:
-                overwrite = input(f"  Profile '{scope}' already exists ({_detect_provider_label(existing_url)}). Overwrite? [y/N]: ").strip().lower()
+                overwrite = input(f"  Profile '{scope}' already exists ({_detect_provider_label(existing_url)}). Overwrite- [y/N]: ").strip().lower()
                 if overwrite not in ("y", "yes"):
                     return "Cancelled."
 
@@ -919,14 +993,14 @@ def run_in_app_config_wizard(
     model = model_current
     family = _provider_family_for_url(api_url)
     if family in ("anthropic", "openai", "openrouter", "openai_compat"):
-        fetch_now = input(f"  Fetch available models? [Y/n]: ").strip().lower()
+        fetch_now = input(f"  Fetch available models- [Y/n]: ").strip().lower()
         if fetch_now in ("", "y", "yes"):
             try:
                 model_ids = _fetch_provider_model_ids(api_url, api_key)
                 if model_ids:
                     model = _interactive_model_picker(model_current, model_ids)
                 else:
-                    console.print("  [dim]No models returned — using manual entry[/dim]")
+                    console.print("  [dim]No models returned â€” using manual entry[/dim]")
             except Exception as e:
                 console.print(f"  [yellow]\u26a0 Model fetch failed: {rich_escape(str(e))}[/yellow]")
     if not model:
@@ -954,10 +1028,7 @@ def run_in_app_config_wizard(
     }
 
     if is_active:
-        save_scope = input("  Save to [1] workspace or [2] global? [1/2]: ").strip() or "1"
-        config_path = (Path.home() / ".z.json") if save_scope == "2" else (Path(workspace) / ".z" / ".z.json")
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+        _save_active_config_fields(workspace, config_data)
 
         agent.config.api_url = api_url
         agent.config.api_key = api_key
@@ -965,9 +1036,9 @@ def run_in_app_config_wizard(
         agent.config.max_tokens = max_tokens
         agent.config.temperature = temperature
         agent.tool_handlers.config = agent.config
-        return f"\u2713 Active config saved \u2014 {detected} / {model}"
+        return f"\u2713 Active config saved - {detected} / {model}"
 
-    models_path = Path(workspace) / ".z" / "models.json"
+    models_path = _get_global_config_path()
     models_path.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     if models_path.exists():
@@ -980,7 +1051,7 @@ def run_in_app_config_wizard(
     models_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     providers[scope] = data["providers"][scope]
     agent.providers = providers
-    return f"\u2713 Saved profile [bold]{scope}[/bold] \u2014 {detected} / {model}"
+    return f"\u2713 Saved profile [bold]{scope}[/bold] - {detected} / {model}"
 
 
 def _infer_active_provider_profile(agent: ClineAgent, providers: Dict[str, dict]) -> Optional[str]:
@@ -1057,7 +1128,7 @@ def run_provider_manager(
             "temperature": agent.config.temperature,
         })
         detected = _detect_provider_label(agent.config.api_url)
-        return f"\u2713 Switched to [bold]{profile}[/bold] — {detected} / {agent.config.model}"
+        return f"\u2713 Switched to [bold]{profile}[/bold] - {detected} / {agent.config.model}"
 
     if sub in ("remove", "rm", "delete"):
         if len(parts) < 2:
@@ -1065,7 +1136,7 @@ def run_provider_manager(
         profile = parts[1]
         if profile not in providers:
             return f"Provider profile '{profile}' not found."
-        models_path = Path(workspace) / ".z" / "models.json"
+        models_path = _get_global_config_path()
         data = {}
         if models_path.exists():
             try:
@@ -1088,6 +1159,331 @@ def run_provider_manager(
         return "Current provider is active config (not matching a saved profile)."
 
     return "Usage: /providers [list|current|setup <name>|use <name|#>|remove <name>]"
+
+
+def _load_global_config_json() -> dict:
+    cfg_path = _get_global_config_path()
+    if not cfg_path.exists():
+        return {}
+    try:
+        return json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+
+
+def _save_global_config_json(data: dict) -> Path:
+    cfg_path = _get_global_config_path()
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return cfg_path
+
+
+def run_mcp_manager(console: Console, cmd_arg: str = "") -> str:
+    """Manage generic MCP server entries in ~/.z.json.
+
+    Schema:
+      "mcp": {
+        "<name>": {
+          "type": "local",
+          "command": ["uvx", "pkg", "-y"],
+          "environment": {"KEY": "VALUE"},
+          "enabled": true
+        }
+      }
+    """
+    try:
+        parts = shlex.split(cmd_arg) if cmd_arg else []
+    except Exception:
+        parts = cmd_arg.split()
+    sub = (parts[0].lower() if parts else "list")
+
+    data = _load_global_config_json()
+    mcp = dict(data.get("mcp", {}) or {})
+
+    if sub in ("list", "ls"):
+        if not mcp:
+            return "No MCP servers configured. Use /mcp add <name> <command...>"
+        tbl = Table(show_header=True, box=None, padding=(0, 2), pad_edge=False)
+        tbl.add_column("Name", style="bold")
+        tbl.add_column("Enabled", width=8)
+        tbl.add_column("Type", width=8)
+        tbl.add_column("Command/URL", style="dim")
+        for name in sorted(mcp.keys()):
+            cfg = mcp.get(name, {}) or {}
+            enabled = bool(cfg.get("enabled", True))
+            stype = str(cfg.get("type", "local"))
+            cmd = cfg.get("command", [])
+            cmd_text = " ".join(str(x) for x in cmd) if isinstance(cmd, list) else ""
+            if stype in ("http", "streamable_http", "sse"):
+                cmd_text = str(cfg.get("url", "") or "")
+            tbl.add_row(
+                name,
+                "[green]yes[/green]" if enabled else "[yellow]no[/yellow]",
+                stype,
+                rich_escape(cmd_text[:140] + ("..." if len(cmd_text) > 140 else "")),
+            )
+        console.print()
+        console.print(Panel(tbl, title="[bold]MCP Servers[/bold]", border_style="dim", padding=(1, 2)))
+        console.print("  [dim]Use [white]/mcp show <name>[/white], [white]/mcp test <name>[/white], [white]/mcp enable|disable <name>[/white], [white]/mcp remove <name>[/white][/dim]")
+        console.print()
+        return ""
+
+    if sub == "show":
+        if len(parts) < 2:
+            return "Usage: /mcp show <name>"
+        name = parts[1]
+        cfg = mcp.get(name)
+        if not isinstance(cfg, dict):
+            return f"MCP server '{name}' not found."
+        pretty = json.dumps(cfg, indent=2, ensure_ascii=False)
+        return f"{name}:\n{pretty}"
+
+    if sub == "add":
+        if len(parts) < 3:
+            return (
+                "Usage: /mcp add <name> <command...> [--type local|http|sse] [--url URL] [--env KEY=VALUE] [--header KEY=VALUE] [--disabled]\n"
+                "Examples:\n"
+                "  /mcp add MiniMax uvx minimax-coding-plan-mcp -y --env MINIMAX_API_HOST=https://api.minimax.io\n"
+                "  /mcp add web-search-prime --type http --url https://api.z.ai/api/mcp/web_search_prime/mcp --header Authorization=\"Bearer <key>\""
+            )
+        name = parts[1]
+        if any(ch.isspace() for ch in name):
+            return "MCP server name must not contain spaces."
+        enabled = True
+        mcp_type = "local"
+        url = ""
+        env: Dict[str, str] = {}
+        headers: Dict[str, str] = {}
+        cmd: List[str] = []
+        i = 2
+        while i < len(parts):
+            token = parts[i]
+            if token == "--disabled":
+                enabled = False
+                i += 1
+                continue
+            if token == "--type":
+                if i + 1 >= len(parts):
+                    return "Usage error: --type requires local|http|sse."
+                mcp_type = str(parts[i + 1]).lower().strip()
+                i += 2
+                continue
+            if token.startswith("--type="):
+                mcp_type = token[len("--type="):].lower().strip()
+                i += 1
+                continue
+            if token == "--url":
+                if i + 1 >= len(parts):
+                    return "Usage error: --url requires a value."
+                url = parts[i + 1]
+                i += 2
+                continue
+            if token.startswith("--url="):
+                url = token[len("--url="):]
+                i += 1
+                continue
+            if token == "--env":
+                if i + 1 >= len(parts):
+                    return "Usage error: --env requires KEY=VALUE."
+                kv = parts[i + 1]
+                if "=" not in kv:
+                    return "Usage error: --env value must be KEY=VALUE."
+                k, v = kv.split("=", 1)
+                env[k] = v
+                i += 2
+                continue
+            if token.startswith("--env="):
+                kv = token[len("--env="):]
+                if "=" not in kv:
+                    return "Usage error: --env value must be KEY=VALUE."
+                k, v = kv.split("=", 1)
+                env[k] = v
+                i += 1
+                continue
+            if token == "--header":
+                if i + 1 >= len(parts):
+                    return "Usage error: --header requires KEY=VALUE."
+                kv = parts[i + 1]
+                if "=" not in kv:
+                    return "Usage error: --header value must be KEY=VALUE."
+                k, v = kv.split("=", 1)
+                headers[k] = v
+                i += 2
+                continue
+            if token.startswith("--header="):
+                kv = token[len("--header="):]
+                if "=" not in kv:
+                    return "Usage error: --header value must be KEY=VALUE."
+                k, v = kv.split("=", 1)
+                headers[k] = v
+                i += 1
+                continue
+            cmd.append(token)
+            i += 1
+        if mcp_type not in ("local", "http", "streamable_http", "sse"):
+            return "Usage error: --type must be local, http, streamable_http, or sse."
+        if mcp_type == "local" and not cmd:
+            return "Usage error: missing MCP command."
+        if mcp_type in ("http", "streamable_http", "sse") and not url:
+            return "Usage error: --url is required for HTTP/SSE MCP servers."
+
+        entry: Dict[str, Any] = {"type": mcp_type, "enabled": enabled}
+        if mcp_type == "local":
+            entry["command"] = cmd
+            entry["environment"] = env
+        else:
+            entry["url"] = url
+            entry["headers"] = headers
+        mcp[name] = entry
+        data["mcp"] = mcp
+        path = _save_global_config_json(data)
+        return f"Saved MCP server '{name}' to {path}"
+
+    if sub in ("remove", "rm", "delete"):
+        if len(parts) < 2:
+            return "Usage: /mcp remove <name>"
+        name = parts[1]
+        if name not in mcp:
+            return f"MCP server '{name}' not found."
+        mcp.pop(name, None)
+        data["mcp"] = mcp
+        path = _save_global_config_json(data)
+        return f"Removed MCP server '{name}' from {path}"
+
+    if sub in ("enable", "disable"):
+        if len(parts) < 2:
+            return f"Usage: /mcp {sub} <name>"
+        name = parts[1]
+        cfg = dict(mcp.get(name, {}) or {})
+        if not cfg:
+            return f"MCP server '{name}' not found."
+        cfg["enabled"] = (sub == "enable")
+        mcp[name] = cfg
+        data["mcp"] = mcp
+        path = _save_global_config_json(data)
+        return f"{'Enabled' if cfg['enabled'] else 'Disabled'} MCP server '{name}' in {path}"
+
+    if sub == "test":
+        if len(parts) < 2:
+            return "Usage: /mcp test <name>"
+        name = parts[1]
+        cfg = dict(mcp.get(name, {}) or {})
+        if not cfg:
+            return f"MCP server '{name}' not found."
+        mcp_type = str(cfg.get("type", "local")).lower()
+        if cfg.get("enabled", True) is False:
+            return f"MCP server '{name}' is disabled. Use /mcp enable {name} first."
+        console.print(f"  [dim]Testing MCP server '{name}'...[/dim]")
+        if mcp_type == "local":
+            cmd = cfg.get("command", [])
+            if not isinstance(cmd, list) or not cmd:
+                return f"MCP server '{name}' has invalid command config."
+            env_cfg = dict(cfg.get("environment", {}) or {})
+            env = os.environ.copy()
+            env.update({str(k): str(v) for k, v in env_cfg.items()})
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=os.getcwd(),
+                    env=env,
+                )
+            except FileNotFoundError:
+                return f"Failed to start '{name}': command not found ({cmd[0]})."
+            except Exception as e:
+                return f"Failed to start '{name}': {e}"
+
+            time.sleep(2.0)
+            rc = proc.poll()
+            output = ""
+            if proc.stdout:
+                try:
+                    output = proc.stdout.read(4000) if rc is not None else ""
+                except Exception:
+                    output = ""
+            if rc is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return f"MCP server '{name}' started successfully (command responds and stays alive)."
+            snippet = (output or "").strip()
+            if snippet:
+                snippet = snippet[:500]
+                return f"MCP server '{name}' exited early (code={rc}). Output:\n{snippet}"
+            return f"MCP server '{name}' exited early (code={rc}) with no output."
+
+        if mcp_type in ("http", "streamable_http", "sse"):
+            url = str(cfg.get("url", "") or "").strip()
+            headers = dict(cfg.get("headers", {}) or {})
+            if not url:
+                return f"MCP server '{name}' has invalid URL config."
+            try:
+                from mcp import ClientSession  # type: ignore
+                from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+                from mcp.client.sse import sse_client  # type: ignore
+            except Exception:
+                return "MCP SDK not installed; cannot test HTTP MCP server."
+            async def _probe():
+                if mcp_type == "sse":
+                    async with sse_client(url, headers=headers, timeout=15, sse_read_timeout=120) as (r, w):
+                        async with ClientSession(r, w) as s:
+                            await asyncio.wait_for(s.initialize(), timeout=20)
+                            await asyncio.wait_for(s.list_tools(), timeout=20)
+                            return
+                async with streamablehttp_client(url, headers=headers, timeout=15, sse_read_timeout=120) as (r, w, _sid):
+                    async with ClientSession(r, w) as s:
+                        await asyncio.wait_for(s.initialize(), timeout=20)
+                        await asyncio.wait_for(s.list_tools(), timeout=20)
+            try:
+                asyncio.run(_probe())
+                return f"MCP server '{name}' is reachable and responded to initialize/list_tools."
+            except Exception as e:
+                return f"MCP server '{name}' test failed: {e}"
+
+        return f"MCP server '{name}' has unsupported type '{mcp_type}'."
+
+    if sub == "setenv":
+        if len(parts) < 4:
+            return "Usage: /mcp setenv <name> <KEY> <VALUE>"
+        name, key, value = parts[1], parts[2], parts[3]
+        cfg = dict(mcp.get(name, {}) or {})
+        if not cfg:
+            return f"MCP server '{name}' not found."
+        env = dict(cfg.get("environment", {}) or {})
+        env[key] = value
+        cfg["environment"] = env
+        mcp[name] = cfg
+        data["mcp"] = mcp
+        _save_global_config_json(data)
+        return f"Set env var '{key}' on MCP server '{name}'."
+
+    if sub == "unsetenv":
+        if len(parts) < 3:
+            return "Usage: /mcp unsetenv <name> <KEY>"
+        name, key = parts[1], parts[2]
+        cfg = dict(mcp.get(name, {}) or {})
+        if not cfg:
+            return f"MCP server '{name}' not found."
+        env = dict(cfg.get("environment", {}) or {})
+        env.pop(key, None)
+        cfg["environment"] = env
+        mcp[name] = cfg
+        data["mcp"] = mcp
+        _save_global_config_json(data)
+        return f"Removed env var '{key}' from MCP server '{name}'."
+
+    return (
+        "Usage: /mcp [list|show <name>|add <name> <command...> [--env KEY=VALUE] [--disabled]|"
+        "remove <name>|enable <name>|disable <name>|test <name>|setenv <name> <KEY> <VALUE>|unsetenv <name> <KEY>]"
+    )
 
 
 def _render_providers_table(console: Console, providers: Dict[str, dict], active_name: Optional[str], show_numbers: bool = True) -> None:
@@ -1272,10 +1668,10 @@ class HarnessCompleter(Completer):
     """Tab completer for commands, file paths, and history."""
     
     COMMANDS = [
-        '/sessions', '/session', '/delete', '/clear', '/save',
+        '/sessions', '/session', '/new', '/delete', '/clear', '/save',
         '/history', '/bg', '/ctx', '/tokens', '/compact', '/cost', '/maxctx',
-        '/todo', '/smart', '/dump', '/config', '/providers', '/model', '/iter', '/clip',
-        '/index', '/log', '/help', '/?', '/exit', '/quit', '/q',
+        '/todo', '/smart', '/dump', '/policyeval', '/config', '/providers', '/model', '/iter', '/clip',
+        '/index', '/log', '/mcp', '/help', '/-', '/exit', '/quit', '/q',
     ]
     
     def __init__(self, workspace: Path, history: SafeFileHistory = None):
@@ -1315,7 +1711,7 @@ class HarnessCompleter(Completer):
                     try:
                         import glob
                         # Handle glob patterns
-                        if '*' in prefix or '?' in prefix:
+                        if '*' in prefix or '-' in prefix:
                             matches = glob.glob(prefix, recursive=False)
                         else:
                             # Complete from current directory
@@ -1653,8 +2049,9 @@ async def run_single(
     filled = int(bar_width * pct / 100)
     bar_color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
     
+    console.print()
     status = Text("  ")
-    status.append(agent.config.model, style="bold dim")
+    status.append(agent.config.model, style="dim")
     status.append("  ", style="dim")
     status.append("\u2501" * filled, style=bar_color)
     status.append("\u2500" * (bar_width - filled), style="dim")
@@ -1680,6 +2077,14 @@ def main():
     parser.add_argument("--api-key", help="API key (headless install)")
     parser.add_argument("--model", help="Model name (headless install)")
     parser.add_argument("--workspace-config", action="store_true", help="Save config to workspace instead of global")
+    parser.add_argument("--policy-eval", action="append", help="Run context policy replay on dump JSON path (repeatable)")
+    parser.add_argument("--policy-eval-out", default="", help="Write policy replay JSON report to this path")
+    parser.add_argument("--policy-no-train", action="store_true", help="Policy replay: skip classifier training")
+    parser.add_argument(
+        "--policy-embed-backend",
+        default="auto",
+        help="Policy replay embedding backend: auto | semantic_scorer | hash | hf:<model-id>",
+    )
     args = parser.parse_args()
     
     # Install mode - run setup wizard
@@ -1690,6 +2095,25 @@ def main():
             model=args.model,
             global_config=not args.workspace_config
         )
+        return
+
+    if args.policy_eval:
+        from harness.context_replay import run_replay
+        con = Console()
+        dump_paths = [Path(p).expanduser().resolve() for p in args.policy_eval]
+        result = run_replay(
+            dump_paths,
+            train=not args.policy_no_train,
+            embedding_backend=args.policy_embed_backend,
+        )
+        text = json.dumps(result, indent=2)
+        if args.policy_eval_out:
+            out_path = Path(args.policy_eval_out).expanduser().resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(text, encoding="utf-8")
+            con.print(f"  [green]\u2713[/green] Policy replay report: [cyan]{rich_escape(str(out_path))}[/cyan]")
+        else:
+            con.print(text)
         return
     
     # Resolve workspace
@@ -1718,18 +2142,21 @@ def main():
     os.chdir(workspace)
     
     # Initialise logging FIRST so every subsequent action is captured
+    _mark("pre_init_logging")
     init_logging(workspace=workspace, session_id=args.session)
+    _mark("init_logging")
     log.info("=== Harness starting === workspace=%s session=%s new=%s",
              workspace, args.session, args.new)
     
-    # Load providers from models.json
+    # Load providers from global config (~/.z.json)
     providers = load_providers(workspace)
     claude_cli_config = load_claude_cli_config(workspace)
+    _mark("load_providers")
 
     if not providers:
-        log.warning("No providers found in .z/models.json — falling back to default config")
+        log.warning("No providers found in ~/.z.json — falling back to active global config")
     
-    # Determine starting config from the active config file (.z/.z.json or ~/.z.json).
+    # Determine starting config from the active global config file (~/.z.json).
     # Provider profiles are available via /provider use and /provider setup.
     config = Config.from_json(workspace=Path(workspace))
     if (not config.api_url or not config.api_key) and providers:
@@ -1744,6 +2171,18 @@ def main():
         })
         log.info("No active config found; bootstrapping from provider profile '%s'", first_name)
     config.validate()
+    if not providers and config.api_url and config.api_key:
+        providers = {
+            "active": {
+                "api_url": config.api_url,
+                "api_key": config.api_key,
+                "model": config.model,
+                "max_tokens": config.max_tokens,
+                "temperature": config.temperature,
+            }
+        }
+        log.info("Bootstrapped in-memory provider profile 'active' from current config")
+    _mark("config_loaded")
     log.info("Config loaded: api_url=%s model=%s max_tokens=%d providers=%s",
              config.api_url, config.model, config.max_tokens, list(providers.keys()))
     
@@ -1759,6 +2198,7 @@ def main():
         providers=providers,
         claude_cli_config=claude_cli_config,
     )
+    _mark("agent_created")
     log.info("Agent created: reasoning_mode=%s", agent.reasoning_mode)
     
     # Session management
@@ -1775,6 +2215,7 @@ def main():
     else:
         log.info("New session '%s'", current_session)
         console.print(f"  [dim]New session [white]{current_session}[/white][/dim]")
+    _mark("session_loaded")
 
     def save_session():
         log.debug("Saving session")
@@ -1785,6 +2226,10 @@ def main():
         loop.run_until_complete(agent.cleanup_background_procs_async())
         save_session()
     
+    _mark("ready")
+    if os.environ.get("HARNESS_BOOT_TIMING", ""):
+        _print_boot_timing(console)
+
     # Get input from stdin or interactive prompt
     if not sys.stdin.isatty():
         # Piped input - single request
@@ -1798,7 +2243,7 @@ def main():
             cleanup_and_save()
             loop.close()
     else:
-        # Interactive mode — clean startup banner
+        # Interactive mode â€” clean startup banner
         stats = agent.get_context_stats()
         ws_short = os.path.basename(workspace) or workspace
         banner_table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
@@ -1936,6 +2381,16 @@ def main():
                         else:
                             agent.clear_history()
                             console.print(f"  [green]\u2713[/green] Created new session [bold]{current_session}[/bold]")
+                        continue
+
+                    elif cmd == '/new':
+                        agent.save_session(str(session_path))
+                        new_name = cmd_arg.strip() if cmd_arg.strip() else datetime.now().strftime("%Y%m%d-%H%M%S")
+                        current_session = new_name
+                        session_path = get_session_path(workspace, current_session)
+                        agent.clear_history()
+                        reset_global_tracker()
+                        console.print(f"  [green]\u2713[/green] Started fresh session [bold]{current_session}[/bold]")
                         continue
                     
                     elif cmd == '/clear':
@@ -2144,6 +2599,59 @@ def main():
                         else:
                             console.print("  [red]\u2717 No system message found![/red]")
                         continue
+
+                    elif cmd == '/policyeval':
+                        from harness.context_replay import run_replay
+                        arg = cmd_arg.strip()
+                        if not arg:
+                            console.print(
+                                "  [dim]Usage: /policyeval <dump.json> [--no-train] "
+                                "[--out <report.json>] [--embed-backend <auto|hash|semantic_scorer|hf:model>][/dim]"
+                            )
+                            continue
+                        try:
+                            parts = shlex.split(arg)
+                        except ValueError as e:
+                            console.print(f"  [red]\u2717 Invalid arguments:[/red] {rich_escape(str(e))}")
+                            continue
+                        no_train = "--no-train" in parts
+                        out_path = ""
+                        embed_backend = "auto"
+                        if "--out" in parts:
+                            oi = parts.index("--out")
+                            if oi + 1 < len(parts):
+                                out_path = parts[oi + 1]
+                        if "--embed-backend" in parts:
+                            bi = parts.index("--embed-backend")
+                            if bi + 1 < len(parts):
+                                embed_backend = parts[bi + 1]
+                        skip_vals = {"--no-train", "--out", out_path, "--embed-backend", embed_backend}
+                        dump_tokens = [p for p in parts if p not in skip_vals and not p.startswith("--")]
+                        if not dump_tokens:
+                            console.print("  [red]\u2717 Missing dump path.[/red]")
+                            continue
+                        dump_path = Path(dump_tokens[0]).expanduser()
+                        if not dump_path.is_absolute():
+                            dump_path = (Path(workspace) / dump_path).resolve()
+                        if not dump_path.exists():
+                            console.print(f"  [red]\u2717 Dump not found:[/red] {rich_escape(str(dump_path))}")
+                            continue
+                        result = run_replay(
+                            [dump_path],
+                            train=not no_train,
+                            embedding_backend=embed_backend,
+                        )
+                        report = json.dumps(result, indent=2)
+                        if out_path:
+                            op = Path(out_path).expanduser()
+                            if not op.is_absolute():
+                                op = (Path(workspace) / op).resolve()
+                            op.parent.mkdir(parents=True, exist_ok=True)
+                            op.write_text(report, encoding="utf-8")
+                            console.print(f"  [green]\u2713[/green] Policy replay report: [cyan]{rich_escape(str(op))}[/cyan]")
+                        else:
+                            console.print(report)
+                        continue
                     
                     elif cmd == '/config':
                         subparts = cmd_arg.split()
@@ -2191,6 +2699,18 @@ def main():
                             result = run_model_switch_wizard(workspace, console, agent, providers, cmd_arg)
                             if result:
                                 console.print(f"  [dim]{result}[/dim]")
+                        except KeyboardInterrupt:
+                            console.print("\n  [dim]Cancelled.[/dim]")
+                        continue
+
+                    elif cmd == '/mcp':
+                        try:
+                            result = run_mcp_manager(console, cmd_arg)
+                            refreshed = agent.refresh_system_prompt()
+                            if result:
+                                console.print(f"  [dim]{result}[/dim]")
+                            if refreshed:
+                                console.print("  [dim]System prompt refreshed (MCP config updated).[/dim]")
                         except KeyboardInterrupt:
                             console.print("\n  [dim]Cancelled.[/dim]")
                         continue
@@ -2277,7 +2797,7 @@ def main():
                                 console.print(f"  [dim]{rich_escape(ln.rstrip())}[/dim]")
                         continue
                     
-                    elif cmd in ('/help', '/?'):
+                    elif cmd in ('/help', '/-'):
                         console.print()
                         console.print("  [bold]Chat[/bold]")
                         console.print("  [cyan]!command[/cyan]             [dim]Run a shell command[/dim]")
@@ -2287,6 +2807,7 @@ def main():
                         console.print("  [bold]Sessions[/bold]")
                         console.print("  [cyan]/sessions[/cyan]            [dim]List all sessions[/dim]")
                         console.print("  [cyan]/session[/cyan] [dim]<name>[/dim]      [dim]Switch or create session[/dim]")
+                        console.print("  [cyan]/new[/cyan] [dim][name][/dim]          [dim]Start a fresh session[/dim]")
                         console.print("  [cyan]/delete[/cyan] [dim]<name>[/dim]       [dim]Delete a session[/dim]")
                         console.print("  [cyan]/save[/cyan]                [dim]Save current session[/dim]")
                         console.print()
@@ -2294,6 +2815,7 @@ def main():
                         console.print("  [cyan]/model[/cyan] [dim]<query>[/dim]       [dim]Search and switch models[/dim]")
                         console.print("  [cyan]/model list[/cyan]          [dim]List models from current provider[/dim]")
                         console.print("  [cyan]/providers[/cyan]           [dim]Manage provider profiles[/dim]")
+                        console.print("  [cyan]/mcp[/cyan]                 [dim]Manage MCP servers (/mcp test <name>)[/dim]")
                         console.print("  [cyan]/config[/cyan]              [dim]Show/edit API configuration[/dim]")
                         console.print("  [cyan]/maxctx[/cyan] [dim]<n>[/dim]          [dim]Set max token cap (e.g. 8k, 32k)[/dim]")
                         console.print("  [cyan]/iter[/cyan] [dim]<n>[/dim]            [dim]Set max agent iterations[/dim]")
@@ -2309,6 +2831,7 @@ def main():
                         console.print("  [cyan]/cost[/cyan]                [dim]API usage and cost totals[/dim]")
                         console.print("  [cyan]/smart[/cyan]               [dim]Smart context analysis[/dim]")
                         console.print("  [cyan]/dump[/cyan]                [dim]Dump full context to JSON[/dim]")
+                        console.print("  [cyan]/policyeval[/cyan] [dim]<dump.json> [--embed-backend <...>][/dim] [dim]Replay + classifier eval on a context dump[/dim]")
                         console.print("  [cyan]/index[/cyan] [dim][rebuild|tree][/dim] [dim]Project file index[/dim]")
                         console.print("  [cyan]/log[/cyan] [dim][n][/dim]             [dim]Show last n log lines[/dim]")
                         console.print()
@@ -2394,3 +2917,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+

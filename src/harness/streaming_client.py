@@ -189,6 +189,28 @@ class StreamingJSONClient:
         if self.base_url:
             kwargs["base_url"] = _normalize_anthropic_base_url(self.base_url)
         return AsyncAnthropic(**kwargs)
+
+    async def _await_task_interruptible(
+        self,
+        task: "asyncio.Task[Any]",
+        check_interrupt: Optional[Callable[[], bool]] = None,
+        poll_interval: float = 0.1,
+    ) -> Any:
+        """Wait for a task while polling interrupt state."""
+        while True:
+            if check_interrupt and check_interrupt():
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                raise asyncio.CancelledError("stream interrupted by user")
+
+            done, _ = await asyncio.wait({task}, timeout=poll_interval)
+            if not done:
+                continue
+            return task.result()
         
     async def __aenter__(self):
         self._client = httpx.AsyncClient(
@@ -501,19 +523,26 @@ class StreamingJSONClient:
             "max_tokens": self.max_tokens,
             "messages": anth_messages,
         }
-        if os.environ.get("HARNESS_ENABLE_ANTHROPIC_THINKING", "0") != "1":
+        anthropic_thinking_enabled = os.environ.get("HARNESS_ENABLE_ANTHROPIC_THINKING", "1") != "0"
+        if not anthropic_thinking_enabled:
             stream_kwargs["temperature"] = self.temperature
         if system_blocks:
             stream_kwargs["system"] = system_blocks
 
-        # Anthropic "thinking" is optional and model-specific; only enable if asked.
-        if os.environ.get("HARNESS_ENABLE_ANTHROPIC_THINKING", "0") == "1":
+        # Anthropic thinking is enabled by default; set
+        # HARNESS_ENABLE_ANTHROPIC_THINKING=0 to disable.
+        if anthropic_thinking_enabled:
             stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
         interrupted = False
-
         final_msg = None
-        async with self._anthropic_client.messages.stream(**stream_kwargs) as stream:
+        stream_cm = self._anthropic_client.messages.stream(**stream_kwargs)
+        stream = None
+        try:
+            enter_task = asyncio.create_task(stream_cm.__aenter__())
+            stream = await self._await_task_interruptible(
+                enter_task, check_interrupt=check_interrupt, poll_interval=0.1
+            )
             async for event in stream:
                 if check_interrupt and check_interrupt():
                     interrupted = True
@@ -573,6 +602,14 @@ class StreamingJSONClient:
                         usage["cache_read_input_tokens"] = int(cache_read or 0)
             except Exception as e:
                 _log.debug("Anthropic final message unavailable: %s", e)
+        except asyncio.CancelledError:
+            interrupted = True
+            finish_reason = "interrupted"
+        finally:
+            try:
+                await stream_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
         provider_blocks = None
         if final_msg is not None:
@@ -814,9 +851,14 @@ class StreamingJSONClient:
                 web_search_data = []  # Collect web search results
                 raw_chunks = []  # For debug logging
                 
-                async with self._client.stream(
+                stream_cm = self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
-                ) as response:
+                )
+                try:
+                    enter_task = asyncio.create_task(stream_cm.__aenter__())
+                    response = await self._await_task_interruptible(
+                        enter_task, check_interrupt=check_interrupt, poll_interval=0.1
+                    )
                     response.raise_for_status()
                     
                     line_buffer = ""
@@ -926,6 +968,14 @@ class StreamingJSONClient:
                                 full_content += content
                                 if on_content:
                                     on_content(content)
+                except asyncio.CancelledError:
+                    interrupted = True
+                    finish_reason = "interrupted"
+                finally:
+                    try:
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
                 
                 # Parse web search results
                 web_search_results = []

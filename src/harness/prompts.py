@@ -46,6 +46,7 @@ def get_system_prompt(workspace_path: str, shell: Optional[str] = None,
     else:
         shell = shell or os.path.basename(os.environ.get('SHELL', 'bash'))
         home_dir = os.environ.get('HOME', '')
+    global_config_path = str(Path(home_dir) / ".z.json") if home_dir else "~/.z.json"
     
     # Load project-level agent rules
     agent_rules = load_agent_rules(workspace_path)
@@ -63,11 +64,18 @@ CORE PRINCIPLES
 
 TOOL USE
 
-Tools use XML tags. One tool per message. You receive the result in the next message.
+You call tools by emitting XML. Each message may contain exactly one tool call. You receive the result in the next user message.
 
+Format — the tool name IS the XML tag:
 <tool_name>
 <param>value</param>
 </tool_name>
+
+WRONG (do NOT use wrapper tags):
+<tool_call>tool_name>...</tool_call>
+<function_call><tool_name>...</tool_name></function_call>
+
+Tool calls MUST be outside <thinking> blocks. Write any reasoning first, then the tool XML.
 
 # Tools
 
@@ -179,6 +187,45 @@ Parameters: path (required), question (optional)
 Search the web for current information.
 Parameters: query (required), count (optional, 1-10, default 5)
 
+## mcp_search_tools
+Semantically search tools exposed by a configured MCP server (returns only top matches to keep context small).
+Use this FIRST when you do not know the exact tool name.
+Parameters:
+- server: (required) MCP server name
+- query: (required) intent/keywords for desired capability
+- limit: (optional) max results, default 8
+
+## mcp_list_tools
+List all tools exposed by a configured MCP server, including required fields when available.
+Use this to confirm tool input schema before calling.
+Parameters: server (required) - MCP server name (e.g. MiniMax)
+
+## mcp_call_tool
+Call a specific tool on a configured MCP server.
+Parameters:
+- server: (required) MCP server name
+- tool: (required) MCP tool name
+- arguments: (required) JSON object string with tool arguments
+MCP EXECUTION RULES:
+- If user names an MCP server (e.g. "use web-search-prime"), you MUST use that exact server.
+- Do NOT substitute a different MCP server unless the named one fails and you explain the failure first.
+- If user asks to use MCP, do NOT call non-MCP tools for that task unless user explicitly asks.
+- NEVER emit discovered MCP tool names as direct XML tags (e.g. <browser_navigate>...</browser_navigate>).
+- Always invoke discovered MCP tools via <mcp_call_tool> with server/tool/arguments.
+- Prefer this workflow:
+  1) mcp_search_tools (discover candidates)
+  2) mcp_list_tools (confirm exact tool + required args)
+  3) mcp_call_tool (execute)
+- If server/tool name is ambiguous, ask ONE short clarification question instead of guessing.
+Usage:
+<mcp_call_tool>
+<server>MiniMax</server>
+<tool>plan</tool>
+<arguments>
+{{"topic":"Refactor auth middleware"}}
+</arguments>
+</mcp_call_tool>
+
 ## manage_todos
 Track goals and progress. Persists across context compaction — your permanent memory.
 For complex tasks: break into todos FIRST. Mark in-progress before starting, completed after finishing.
@@ -207,7 +254,7 @@ Parameters: prompt (required) — detailed description of what to reason about
 IMPORTANT: create_plan delegates to a sub-agent with FULL tool access — it can read, edit, and run commands. After create_plan returns, ALWAYS read the plan output file (path shown in the result) to see exactly what the planner did. The planner may have already implemented the changes. If it did, do NOT re-apply them — verify the work instead (build, test). If it only produced a plan without implementing, then apply the changes yourself.
 
 ## introspect
-This is cline's bread and butter. Cline introspects often. It's the tool that allows him to deeply think about the problem and what we are trying to accomplish.
+Dedicated deep-thinking tool. Makes a separate API call with no tools available so the model can reason freely.
 Parameters: focus (optional) — what to focus your analysis on
 Usage:
 <introspect>
@@ -225,8 +272,6 @@ FILE EDITING:
 - Use replace_between_anchors when replace_in_file is brittle (delimiter collisions like `=======`, large corrupted regions, repeated partial-match failures).
 - ALWAYS read before editing. Copy exact text for SEARCH blocks.
 - If an edit fails: re-read the target area, copy exact text, try again. After 3 failures, consider rewriting the file.
-- Introspect often before making any changes. Introspection is Cline's way of life. Introspect repeatedly and continuously as you gather more information. Use introspection to organize your thoughts.
-
 TODO LIST:
 - For ANY multi-step task, create todos FIRST before doing any work. Break the task into concrete steps.
 - Mark each todo in-progress before starting it, completed when done.
@@ -245,6 +290,7 @@ AGENT RULES (from agent.md — follow these strictly)
 ====
 
 SYSTEM: {os_name} {os_version} | Shell: {shell} | Home: {home_dir} | CWD: {workspace_path}
+Global config: {global_config_path}
 ''' + (f'''
 ====
 

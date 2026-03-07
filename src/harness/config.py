@@ -12,7 +12,7 @@ def get_global_config_path() -> Path:
 
 
 def get_workspace_config_path(workspace: Optional[Path] = None) -> Path:
-    """Get path to workspace config: workspace/.z/.z.json"""
+    """Legacy helper kept for compatibility (workspace config is ignored)."""
     ws = workspace or Path.cwd()
     return ws / ".z" / ".z.json"
 
@@ -25,6 +25,25 @@ def load_json_config(path: Path) -> dict:
         except (json.JSONDecodeError, IOError):
             pass
     return {}
+
+
+def _is_empty_override(value) -> bool:
+    """True when a config value should not override an existing non-empty value."""
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _merge_non_empty(base: dict, overlay: dict) -> dict:
+    """Merge overlay into base, skipping None/empty-string values."""
+    out = dict(base)
+    for k, v in (overlay or {}).items():
+        if _is_empty_override(v):
+            continue
+        out[k] = v
+    return out
 
 
 @dataclass
@@ -46,25 +65,21 @@ class Config:
         workspace: Optional[Path] = None,
         overrides: Optional[dict] = None,
     ) -> "Config":
-        """Load configuration from JSON files.
-        
+        """Load configuration from JSON files (global-only).
+
         Priority (later overrides earlier):
         1. ~/.z.json (global)
-        2. workspace/.z/.z.json (workspace-specific)
+        2. explicit overrides (runtime)
         """
         # Start with defaults
         config_data = {}
         
         # Load global config
         global_config = load_json_config(get_global_config_path())
-        config_data.update(global_config)
-        
-        # Load workspace config (overrides global)
-        ws_config = load_json_config(get_workspace_config_path(workspace))
-        config_data.update(ws_config)
+        config_data = _merge_non_empty(config_data, global_config)
         
         if overrides:
-            config_data.update(overrides)
+            config_data = _merge_non_empty(config_data, overrides)
         
         return cls(
             api_url=config_data.get("api_url", ""),
@@ -82,12 +97,8 @@ class Config:
         env_path: Optional[Path] = None,
         workspace: Optional[Path] = None,
     ) -> "Config":
-        """Load configuration from JSON config files.
-        
-        Priority (later overrides earlier):
-        1. ~/.z.json (global)
-        2. workspace/.z/.z.json (workspace-specific — WINS)
-        
+        """Load configuration from global JSON config file.
+
         The env_path parameter is accepted but ignored (legacy compat).
         """
         return cls.from_json(workspace)

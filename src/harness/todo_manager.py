@@ -231,11 +231,12 @@ class TodoManager:
         lines.append(self.get_progress_summary())
         lines.append("")
 
-        # Group by parent
-        roots = [i for i in items if not i.parent_id]
+        # Group by parent (orphans whose parent is missing show as roots)
+        item_ids = {i.id for i in items}
+        roots = [i for i in items if not i.parent_id or i.parent_id not in item_ids]
         children_map: Dict[int, List[TodoItem]] = {}
         for item in items:
-            if item.parent_id:
+            if item.parent_id and item.parent_id in item_ids:
                 children_map.setdefault(item.parent_id, []).append(item)
 
         for root in roots:
@@ -317,11 +318,12 @@ class TodoManager:
 
         tree = Tree(progress_text)
 
-        # Group into roots and children
-        roots = [i for i in items if not i.parent_id]
+        # Group into roots and children (orphans whose parent is missing show as roots)
+        item_ids = {i.id for i in items}
+        roots = [i for i in items if not i.parent_id or i.parent_id not in item_ids]
         children_map: Dict[int, List[TodoItem]] = {}
         for item in items:
-            if item.parent_id:
+            if item.parent_id and item.parent_id in item_ids:
                 children_map.setdefault(item.parent_id, []).append(item)
 
         for root in roots:

@@ -16,17 +16,59 @@ Designed around these principles:
 """
 
 import hashlib
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Any, Set, TYPE_CHECKING
+from collections import Counter
 
+import time as _time_mod_sc
+_sc_t0 = _time_mod_sc.perf_counter()
 import numpy as np
+_sc_t1 = _time_mod_sc.perf_counter()
 
 from .context_management import estimate_tokens, estimate_messages_tokens
+from .logger import get_logger
+
+# Lazy-load sklearn to avoid ~1s import overhead at startup.
+# Only needed for the optional ML prior in _compute_score which runs
+# mid-session (not at startup), so deferring is safe.
+HAS_SKLEARN = None  # tri-state: None=untested, True/False=resolved
+
+def _ensure_sklearn():
+    """Lazy-import sklearn on first use. Returns (LogisticRegression, Pipeline, StandardScaler) or None."""
+    global HAS_SKLEARN
+    if HAS_SKLEARN is False:
+        return None
+    if HAS_SKLEARN is True:
+        return _ensure_sklearn._cached
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+        HAS_SKLEARN = True
+        _ensure_sklearn._cached = (LogisticRegression, Pipeline, StandardScaler)
+        return _ensure_sklearn._cached
+    except Exception:
+        HAS_SKLEARN = False
+        return None
+
+_ensure_sklearn._cached = None
+_sc_t2 = _time_mod_sc.perf_counter()
+
+import logging as _logging_sc
+_logging_sc.getLogger("harness.smart_context.boot").info(
+    "smart_context import: numpy=%.0fms sklearn=deferred total=%.0fms",
+    (_sc_t1 - _sc_t0) * 1000,
+    (_sc_t2 - _sc_t0) * 1000,
+)
 
 if TYPE_CHECKING:
     from .todo_manager import TodoManager
+
+
+log = get_logger("smart_context")
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +131,39 @@ class SemanticScorer:
         if self._load_failed:
             return False
         try:
+            _t0_import = time.perf_counter()
             from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer("all-MiniLM-L6-v2")
+            _t1_import = time.perf_counter()
+
+            # Some environments inject a broken loopback proxy (127.0.0.1:9),
+            # which blocks model fetch even when network is otherwise available.
+            # Temporarily clear only known-bad proxy values while loading.
+            proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+            old_proxy_vals: Dict[str, Optional[str]] = {}
+            try:
+                for k in proxy_keys:
+                    v = os.environ.get(k)
+                    old_proxy_vals[k] = v
+                    if v and ("127.0.0.1:9" in v or "localhost:9" in v):
+                        os.environ.pop(k, None)
+
+                try:
+                    self._model = SentenceTransformer(
+                        "all-MiniLM-L6-v2", local_files_only=True,
+                    )
+                except OSError:
+                    self._model = SentenceTransformer("all-MiniLM-L6-v2")
+            finally:
+                for k, v in old_proxy_vals.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            _t2_load = time.perf_counter()
+            log.info("SemanticScorer model ready: import=%.0fms load=%.0fms total=%.0fms",
+                     (_t1_import - _t0_import) * 1000,
+                     (_t2_load - _t1_import) * 1000,
+                     (_t2_load - _t0_import) * 1000)
             return True
         except Exception:
             self._load_failed = True
@@ -266,6 +339,24 @@ class CompactionTrace:
                 f"[{COMPACT_MARKER} {self.original_type}: {self.summary} "
                 f"({self.tokens_freed} tok freed)]"
             )
+
+
+# ---------------------------------------------------------------------------
+# Context node metadata (persistent semantic breadcrumbs)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContextNodeMeta:
+    """Persistent metadata for a message fingerprint across turns."""
+    node_id: str
+    first_seen: float
+    last_seen: float
+    seen_count: int
+    role: str
+    msg_type: str
+    source: str
+    last_tokens: int
+    lifecycle_state: str = "warm"  # hot/warm/cold/archived
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +590,17 @@ class SmartContextManager:
         # If the last N messages exceed this, the oldest ones in the
         # window become eviction candidates.
         self.recent_window_max_tokens = 16_000
+        # Automatic semantic-maintenance target for per-turn cleanup.
+        self.soft_target_ratio = 0.62
+        # Base cap for guidance pruning each tick; increases dynamically
+        # when context utilization is already moderate/high.
+        self.max_guidance_prune_per_tick = 8
+        self.guidance_prune_boost_threshold = 0.55
+        self.max_guidance_prune_per_tick_boosted = 12
+        # Persistent semantic metadata keyed by message fingerprint.
+        self.node_metadata: Dict[str, ContextNodeMeta] = {}
+        # Telemetry snapshot for latest learned-prior scoring pass.
+        self.last_policy_stats: Dict[str, Any] = {}
 
     # -- Backward-compat shims for code that references the old API --------
 
@@ -535,8 +637,28 @@ class SmartContextManager:
             current_tokens = estimate_messages_tokens(messages)
 
         budget = int(max_tokens * self.budget_ratio)
+        debug_scoring = os.environ.get("HARNESS_DEBUG_SMART_CONTEXT", "0") == "1"
+
+        log.debug(
+            "compact_context start: current=%d budget=%d ratio=%.2f max=%d msgs=%d",
+            current_tokens, budget, self.budget_ratio, max_tokens, len(messages),
+        )
 
         if current_tokens <= budget:
+            if debug_scoring:
+                scored_preview = self._score_all_messages(messages, set(), set())
+                scored_preview.sort(key=lambda x: x[1])
+                preview_rows = []
+                for index, score, msg_type, source in scored_preview[:8]:
+                    tok = estimate_tokens(_get_content(messages[index]))
+                    preview_rows.append(
+                        f"idx={index} score={score:.3f} tok={tok} type={msg_type} src={source[:60]}"
+                    )
+                if preview_rows:
+                    log.debug(
+                        "compact_context skipped (under budget). lowest-score candidates: %s",
+                        " | ".join(preview_rows),
+                    )
             return messages, 0, ""
 
         excess = current_tokens - budget
@@ -555,6 +677,15 @@ class SmartContextManager:
         # Phase 2: score every non-protected message, compact lowest first
         scored = self._score_all_messages(messages, set(), set())
         scored.sort(key=lambda x: x[1])  # lowest keep-priority first
+
+        if debug_scoring and scored:
+            preview_rows = []
+            for index, score, msg_type, source in scored[:10]:
+                tok = estimate_tokens(_get_content(messages[index]))
+                preview_rows.append(
+                    f"idx={index} score={score:.3f} tok={tok} type={msg_type} src={source[:60]}"
+                )
+            log.debug("scored candidates (lowest first): %s", " | ".join(preview_rows))
 
         tokens_still_needed = excess - total_freed
         compacted_count = 0
@@ -595,6 +726,56 @@ class SmartContextManager:
             report_parts.append(
                 f"Compacted {compacted_count} messages: -{compact_freed:,} tok"
             )
+            if debug_scoring:
+                type_counts = Counter(t.original_type for t in self.compaction_traces[-compacted_count:])
+                log.debug(
+                    "compacted message types: %s",
+                    ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())),
+                )
+
+        # Phase 2.5: Emergency compaction of oversized recent-window messages.
+        # If Phase 2 couldn't find candidates (e.g. short conversation where
+        # everything falls within the recent window), compact the largest
+        # non-protected messages in-place without evicting them.
+        current_tokens = estimate_messages_tokens(messages)
+        if current_tokens > budget and compacted_count == 0:
+            protected_recent = self._get_protected_recent(messages)
+            emergency_candidates = []
+            for i, msg in enumerate(messages):
+                if i in PROTECTED_INDICES:
+                    continue
+                content = _get_content(msg)
+                if not content or COMPACT_MARKER in content[:20]:
+                    continue
+                tokens = estimate_tokens(content)
+                if tokens < MIN_COMPACT_TOKENS:
+                    continue
+                role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+                msg_type, source = self._classify(content, role)
+                emergency_candidates.append((i, tokens, msg_type, source, content))
+
+            # Compact largest messages first
+            emergency_candidates.sort(key=lambda x: x[1], reverse=True)
+            for i, tokens, msg_type, source, content in emergency_candidates:
+                if current_tokens <= budget:
+                    break
+                notice, summary = self._compact_message(content, msg_type, source, i)
+                new_tokens = estimate_tokens(notice)
+                freed = tokens - new_tokens
+                if freed <= 0:
+                    continue
+                _set_content(messages[i], notice)
+                current_tokens -= freed
+                total_freed += freed
+                compacted_count += 1
+                self.compaction_traces.append(CompactionTrace(
+                    original_type=msg_type, source=source,
+                    summary=summary, tokens_freed=freed,
+                ))
+            if compacted_count > 0:
+                report_parts.append(
+                    f"Emergency compacted {compacted_count} oversized messages"
+                )
 
         # Phase 3: If STILL over budget after compaction, evict entire
         # lowest-scored messages.  Already-compacted messages (◇ marker)
@@ -660,12 +841,125 @@ class SmartContextManager:
                 report_parts.append(
                     f"Evicted {len(evicted_indices)} low-priority messages"
                 )
+                if debug_scoring:
+                    log.debug("evicted indices: %s", sorted(evicted_indices))
 
         # Trim trace history
         if len(self.compaction_traces) > self._max_traces:
             self.compaction_traces = self.compaction_traces[-self._max_traces:]
 
+        final_tokens = estimate_messages_tokens(messages)
+        log.debug(
+            "compact_context done: freed=%d final_tokens=%d report=%s",
+            total_freed, final_tokens, "; ".join(report_parts),
+        )
         return messages, total_freed, "; ".join(report_parts)
+
+    def semantic_maintenance_tick(
+        self,
+        messages: List[Any],
+        max_tokens: int,
+        current_tokens: Optional[int] = None,
+    ) -> Tuple[List[Any], int, str]:
+        """Continuous low-overhead semantic maintenance.
+
+        Runs each turn to keep context healthy even before hard limits.
+        """
+        if current_tokens is None:
+            current_tokens = estimate_messages_tokens(messages)
+        budget = int(max_tokens * self.soft_target_ratio)
+
+        total_freed = 0
+        report_parts: List[str] = []
+
+        # Refresh semantic breadcrumbs each turn before maintenance actions.
+        self._refresh_node_metadata(messages)
+
+        utilization = (current_tokens / max_tokens) if max_tokens > 0 else 0.0
+        guidance_limit = self.max_guidance_prune_per_tick
+        if utilization >= self.guidance_prune_boost_threshold:
+            guidance_limit = self.max_guidance_prune_per_tick_boosted
+
+        # 1) Lifecycle-expire stale guidance/nudges first.
+        messages, guidance_freed, guidance_count = self._compact_stale_guidance(
+            messages, limit=guidance_limit
+        )
+        if guidance_freed > 0:
+            total_freed += guidance_freed
+            current_tokens = max(0, current_tokens - guidance_freed)
+            report_parts.append(
+                f"Guidance lifecycle pruning: {guidance_count} msgs, -{guidance_freed:,} tok"
+            )
+
+        # 2) If still above soft budget, run full compaction toward soft target.
+        if current_tokens > budget:
+            old_ratio = self.budget_ratio
+            try:
+                self.budget_ratio = self.soft_target_ratio
+                messages, freed, report = self.compact_context(
+                    messages, max_tokens, current_tokens=current_tokens
+                )
+                if freed > 0:
+                    total_freed += freed
+                    if report:
+                        report_parts.append(report)
+            finally:
+                self.budget_ratio = old_ratio
+
+        return messages, total_freed, "; ".join(report_parts)
+
+    def _refresh_node_metadata(self, messages: List[Any]) -> None:
+        """Update persistent metadata for each visible message."""
+        now = time.time()
+        total = len(messages)
+        for i, msg in enumerate(messages):
+            content = _get_content(msg)
+            if not content:
+                continue
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            msg_type, source = self._classify(content, role)
+            node_id = _message_fingerprint(role, content)
+            tokens = estimate_tokens(content)
+            age_from_end = max(0, total - 1 - i)
+            lifecycle = self._lifecycle_for_age(age_from_end)
+            if COMPACT_MARKER in content[:20]:
+                lifecycle = "archived"
+
+            existing = self.node_metadata.get(node_id)
+            if existing is None:
+                self.node_metadata[node_id] = ContextNodeMeta(
+                    node_id=node_id,
+                    first_seen=now,
+                    last_seen=now,
+                    seen_count=1,
+                    role=role,
+                    msg_type=msg_type,
+                    source=source,
+                    last_tokens=tokens,
+                    lifecycle_state=lifecycle,
+                )
+            else:
+                existing.last_seen = now
+                existing.seen_count += 1
+                existing.role = role
+                existing.msg_type = msg_type
+                existing.source = source
+                existing.last_tokens = tokens
+                existing.lifecycle_state = lifecycle
+
+        # Prevent unbounded metadata growth.
+        if len(self.node_metadata) > 5000:
+            items = sorted(self.node_metadata.values(), key=lambda x: x.last_seen)
+            for meta in items[:1000]:
+                self.node_metadata.pop(meta.node_id, None)
+
+    @staticmethod
+    def _lifecycle_for_age(age_from_end: int) -> str:
+        if age_from_end <= 2:
+            return "hot"
+        if age_from_end <= 12:
+            return "warm"
+        return "cold"
 
     def build_context_recovery_notice(self) -> str:
         """Build a reorientation notice after context compaction/truncation.
@@ -721,6 +1015,20 @@ class SmartContextManager:
                 }
                 for t in self.compaction_traces
             ],
+            "node_metadata": [
+                {
+                    "node_id": m.node_id,
+                    "first_seen": m.first_seen,
+                    "last_seen": m.last_seen,
+                    "seen_count": m.seen_count,
+                    "role": m.role,
+                    "msg_type": m.msg_type,
+                    "source": m.source,
+                    "last_tokens": m.last_tokens,
+                    "lifecycle_state": m.lifecycle_state,
+                }
+                for m in self.node_metadata.values()
+            ],
         }
 
     def load_dict(self, data: dict):
@@ -736,6 +1044,24 @@ class SmartContextManager:
                 tokens_freed=tokens,
                 compacted_at=t.get("compacted_at", t.get("evicted_at", 0)),
             ))
+        self.node_metadata = {}
+        for m in data.get("node_metadata", []):
+            try:
+                node = ContextNodeMeta(
+                    node_id=str(m.get("node_id", "")),
+                    first_seen=float(m.get("first_seen", 0)),
+                    last_seen=float(m.get("last_seen", 0)),
+                    seen_count=int(m.get("seen_count", 0)),
+                    role=str(m.get("role", "")),
+                    msg_type=str(m.get("msg_type", "")),
+                    source=str(m.get("source", "")),
+                    last_tokens=int(m.get("last_tokens", 0)),
+                    lifecycle_state=str(m.get("lifecycle_state", "warm")),
+                )
+                if node.node_id:
+                    self.node_metadata[node.node_id] = node
+            except Exception:
+                continue
 
     # ------------------------------------------------------------------
     # Phase 1: Duplicate consolidation
@@ -855,26 +1181,29 @@ class SmartContextManager:
         protected_recent = self._get_protected_recent(messages)
 
         # First pass: collect candidates
-        candidates: List[Tuple[int, str, int, str, str]] = []
-        # (index, content, tokens, msg_type, source)
+        candidates: List[Tuple[int, str, int, str, str, str]] = []
+        # (index, content, tokens, msg_type, source, role)
 
         for i, msg in enumerate(messages):
             if i in PROTECTED_INDICES or i in protected_recent:
                 continue
 
             content = _get_content(msg)
-            if not content or len(content) < 50:
+            if not content or len(content) < 10:
                 continue
             if COMPACT_MARKER in content[:20]:
                 continue
 
-            tokens = estimate_tokens(content)
-            if tokens < MIN_COMPACT_TOKENS:
-                continue
-
             role = msg.role if hasattr(msg, "role") else msg.get("role", "")
             msg_type, source = self._classify(content, role)
-            candidates.append((i, content, tokens, msg_type, source))
+
+            tokens = estimate_tokens(content)
+            # Guidance nudges are always candidates (they accumulate as noise).
+            # Other messages need a minimum size to be worth compacting.
+            if tokens < MIN_COMPACT_TOKENS and msg_type != "guidance_nudge":
+                continue
+
+            candidates.append((i, content, tokens, msg_type, source, role))
 
         if not candidates:
             return []
@@ -891,13 +1220,31 @@ class SmartContextManager:
 
         # Combine all signals into final keep-priority score
         results: List[Tuple[int, float, str, str]] = []
-        for (index, content, tokens, msg_type, source), relevance in zip(
+        base_scores: List[float] = []
+        for (index, _content, tokens, msg_type, source, _role), relevance in zip(
             candidates, relevance_scores
         ):
             score = self._compute_score(
                 msg_type, index, total, tokens, relevance,
             )
+            base_scores.append(score)
             results.append((index, score, msg_type, source))
+
+        # Learned prior: train fast logistic model on weak labels from this
+        # candidate set and blend expected keep-probability into the final rank.
+        learned_keep = self._infer_policy_keep_scores(
+            candidates=candidates,
+            relevance_scores=relevance_scores,
+            total=total,
+            query_text=query_text,
+        )
+        if learned_keep:
+            blended: List[Tuple[int, float, str, str]] = []
+            for (index, base, msg_type, source) in results:
+                ml_keep = learned_keep.get(index, base)
+                score = max(0.0, min(1.0, base * 0.65 + ml_keep * 0.35))
+                blended.append((index, score, msg_type, source))
+            return blended
 
         return results
 
@@ -933,6 +1280,8 @@ class SmartContextManager:
             "assistant_tool_call":0.5,   # contains action context
             "todo_result":        0.05,  # trivially regenerated
             "context_result":     0.05,  # trivially regenerated
+            "introspect_result":  0.15,  # reasoning already absorbed into subsequent actions
+            "guidance_nudge":     0.01,  # lifecycle guidance should decay quickly
             "other_tool_result":  0.4,
             "other":              0.4,
         }
@@ -959,6 +1308,143 @@ class SmartContextManager:
 
         return max(0.0, min(1.0, score))
 
+    @staticmethod
+    def _policy_weak_label(msg_type: str, tokens: int, role: str) -> int:
+        """Weak label mapping used by the runtime logistic prior.
+
+        0=KEEP_FULL, 1=SUMMARIZE, 2=ARCHIVE_WITH_BREADCRUMB, 3=EVICT
+        """
+        if msg_type == "guidance_nudge":
+            return 3
+        if msg_type in ("todo_result", "context_result"):
+            return 3
+        if msg_type == "introspect_result":
+            return 2 if tokens >= 120 else 1
+        if msg_type in ("command_output", "search_result", "other_tool_result"):
+            return 2 if tokens >= 120 else 1
+        if msg_type == "assistant_analysis":
+            return 1 if tokens >= 160 else 0
+        if role == "system":
+            return 0
+        return 0
+
+    def _infer_policy_keep_scores(
+        self,
+        candidates: List[Tuple[int, str, int, str, str, str]],
+        relevance_scores: List[float],
+        total: int,
+        query_text: str,
+    ) -> Dict[int, float]:
+        """Return learned keep-scores keyed by message index.
+
+        Fits a lightweight logistic model on weak labels from candidate nodes
+        and converts class probabilities into a keep-priority expectation.
+        """
+        sklearn_classes = _ensure_sklearn()
+        if sklearn_classes is None or len(candidates) < 8:
+            self.last_policy_stats = {"used": False, "reason": "insufficient_data_or_no_sklearn"}
+            return {}
+        LogisticRegression, Pipeline, StandardScaler = sklearn_classes
+
+        # Build metadata features.
+        type_vocab = {
+            "file_read": 0,
+            "command_output": 1,
+            "search_result": 2,
+            "assistant_analysis": 3,
+            "assistant_tool_call": 4,
+            "todo_result": 5,
+            "context_result": 6,
+            "other_tool_result": 7,
+            "guidance_nudge": 8,
+            "introspect_result": 9,
+            "other": 10,
+        }
+        rows_meta: List[List[float]] = []
+        y_list: List[int] = []
+        for (index, content, tokens, msg_type, _source, role), relevance in zip(candidates, relevance_scores):
+            age_from_end = max(0, (total - 1) - index)
+            rows_meta.append(
+                [
+                    float(type_vocab.get(msg_type, 10)),
+                    float(tokens),
+                    float(age_from_end),
+                    float(relevance),
+                    1.0 if msg_type == "guidance_nudge" else 0.0,
+                    float(len(content) / 1000.0),
+                ]
+            )
+            y_list.append(self._policy_weak_label(msg_type, tokens, role))
+
+        y = np.asarray(y_list, dtype=np.int32)
+        classes = np.unique(y)
+        if len(classes) < 2:
+            self.last_policy_stats = {"used": False, "reason": "single_class"}
+            return {}
+
+        x_meta = np.asarray(rows_meta, dtype=np.float32)
+
+        # Add embedding features (same semantic scorer used elsewhere).
+        contents = [c[1][:_EMBED_MAX_CHARS] for c in candidates]
+        x_emb: np.ndarray
+        if self._scorer.available:
+            try:
+                embs = self._scorer._embed_batch(contents)
+                x_emb = np.asarray(embs, dtype=np.float32)
+            except Exception:
+                x_emb = np.zeros((len(candidates), 8), dtype=np.float32)
+        else:
+            # Lightweight lexical fallback to keep runtime deterministic.
+            fallback_rows: List[List[float]] = []
+            for _idx, content, _tok, _mt, _src, _role in candidates:
+                lower = content.lower()
+                fallback_rows.append(
+                    [
+                        float(lower.count("error")),
+                        float(lower.count("introspect")),
+                        float(lower.count("todo")),
+                        float(lower.count("<read_file>")),
+                        float(lower.count("<execute_command>")),
+                        1.0 if "result" in lower else 0.0,
+                        1.0 if query_text and any(k in lower for k in query_text.lower().split()) else 0.0,
+                        float(len(content) / 1200.0),
+                    ]
+                )
+            x_emb = np.asarray(fallback_rows, dtype=np.float32)
+
+        x = np.concatenate([x_meta, x_emb], axis=1)
+
+        # Robust logistic fit.
+        try:
+            model = Pipeline(
+                [
+                    ("scale", StandardScaler(with_mean=False)),
+                    ("clf", LogisticRegression(max_iter=1200, class_weight="balanced")),
+                ]
+            )
+            model.fit(x, y)
+            proba = model.predict_proba(x)
+            class_ids = [int(c) for c in model.named_steps["clf"].classes_]
+        except Exception as e:
+            self.last_policy_stats = {"used": False, "reason": f"fit_failed:{type(e).__name__}"}
+            return {}
+
+        keep_weights = {0: 1.0, 1: 0.65, 2: 0.35, 3: 0.0}
+        keep_scores: Dict[int, float] = {}
+        for row_idx, (index, *_rest) in enumerate(candidates):
+            expected_keep = 0.0
+            for col_idx, cls_id in enumerate(class_ids):
+                expected_keep += float(proba[row_idx, col_idx]) * keep_weights.get(cls_id, 0.5)
+            keep_scores[index] = max(0.0, min(1.0, expected_keep))
+
+        self.last_policy_stats = {
+            "used": True,
+            "samples": len(candidates),
+            "features": int(x.shape[1]),
+            "classes": sorted(set(int(v) for v in y_list)),
+        }
+        return keep_scores
+
     # ------------------------------------------------------------------
     # Classification
     # ------------------------------------------------------------------
@@ -966,6 +1452,22 @@ class SmartContextManager:
     @staticmethod
     def _classify(content: str, role: str) -> Tuple[str, str]:
         """Classify a message into ``(type, source_label)``."""
+
+        # Structured guidance markers injected by the agent.
+        if content.startswith("[GUIDANCE_NUDGE"):
+            m = re.search(r"type=([a-zA-Z0-9._-]+)", content)
+            nudge_type = m.group(1) if m else "guidance"
+            return "guidance_nudge", nudge_type
+
+        # Backward compatibility for sessions without explicit marker.
+        if role == "user":
+            lower = content.lower()
+            if "without using introspect" in lower:
+                return "guidance_nudge", "introspect"
+            if "consider using the introspect tool" in lower:
+                return "guidance_nudge", "introspect-tip"
+            if "result contains errors" in lower:
+                return "guidance_nudge", "error-analysis"
 
         # Tool results are stored as user messages: "[tool_name result]\n..."
         tool_match = re.match(r'\[(\w+) result(?:\s*-[^\]]+)?\]', content)
@@ -991,7 +1493,14 @@ class SmartContextManager:
             if tool_name in ("list_context", "remove_from_context"):
                 return "context_result", "context"
 
+            if tool_name == "introspect":
+                return "introspect_result", "introspect"
+
             return "other_tool_result", tool_name
+
+        # Introspect results (single-tool format — no [tool_name result] wrapper)
+        if content.startswith("[Deep analysis complete"):
+            return "introspect_result", "introspect"
 
         # Assistant messages
         if role == "assistant":
@@ -1176,6 +1685,21 @@ class SmartContextManager:
             trace = CompactionTrace(msg_type, source, summary)
             return trace.format_notice(), summary
 
+        if msg_type == "introspect_result":
+            focus_match = re.search(r'FOCUS:\s*(.+?)(?:\n|$)', content)
+            focus_hint = focus_match.group(1).strip()[:80] if focus_match else ""
+            first_lines = content.split("\n", 6)
+            excerpt = " ".join(l.strip() for l in first_lines[2:6] if l.strip())[:200]
+            summary = focus_hint or excerpt or "deep analysis"
+            return (
+                f"[{COMPACT_MARKER} Introspect: {summary}]\n"
+                f"(Reasoning already applied in subsequent actions)"
+            ), summary
+
+        if msg_type == "guidance_nudge":
+            summary = f"guidance:{source}"
+            return f"[{COMPACT_MARKER} Guidance note archived: {source}]", summary
+
         if msg_type == "other_tool_result":
             # Extract tool name from content (format: [tool_name result])
             tool_match = re.match(r'\[(\w+) result', content)
@@ -1209,6 +1733,51 @@ class SmartContextManager:
         summary = lines[0][:100] if lines else "content"
         trace = CompactionTrace(msg_type, source, summary)
         return trace.format_notice(), summary
+
+    def _compact_stale_guidance(
+        self,
+        messages: List[Any],
+        limit: Optional[int] = None,
+    ) -> Tuple[List[Any], int, int]:
+        """Compact stale guidance/nudge messages outside the recent window."""
+        tokens_freed = 0
+        compacted = 0
+        protected_recent = self._get_protected_recent(messages)
+        max_to_prune = limit if limit is not None else self.max_guidance_prune_per_tick
+
+        for i, msg in enumerate(messages):
+            if compacted >= max_to_prune:
+                break
+            if i in PROTECTED_INDICES or i in protected_recent:
+                continue
+            content = _get_content(msg)
+            if not content or COMPACT_MARKER in content[:20]:
+                continue
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            msg_type, source = self._classify(content, role)
+            if msg_type != "guidance_nudge":
+                continue
+
+            old_tokens = estimate_tokens(content)
+            notice, summary = self._compact_message(content, msg_type, source, i)
+            new_tokens = estimate_tokens(notice)
+            freed = old_tokens - new_tokens
+            if freed <= 0:
+                continue
+
+            _set_content(msg, notice)
+            tokens_freed += freed
+            compacted += 1
+            self.compaction_traces.append(CompactionTrace(
+                original_type="guidance_nudge",
+                source=source,
+                summary=summary,
+                tokens_freed=freed,
+            ))
+
+        if compacted and len(self.compaction_traces) > self._max_traces:
+            self.compaction_traces = self.compaction_traces[-self._max_traces:]
+        return messages, tokens_freed, compacted
 
 
 # ---------------------------------------------------------------------------
@@ -1276,3 +1845,9 @@ def _sample_start_middle_end(content: str, chunk_chars: int = 450) -> str:
         "[End excerpt]\n"
         f"{end}"
     )
+
+
+def _message_fingerprint(role: str, content: str) -> str:
+    """Stable fingerprint for message-level metadata tracking."""
+    base = f"{role}\n{content[:4000]}"
+    return hashlib.sha1(base.encode("utf-8", errors="replace")).hexdigest()

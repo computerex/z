@@ -353,12 +353,118 @@ class TestSmartContextManager:
         )
         assert msg_type == "todo_result"
 
+    def test_classify_structured_guidance_nudge(self):
+        msg_type, source = SmartContextManager._classify(
+            "[GUIDANCE_NUDGE type=introspect severity=strong calls=12]\n"
+            "[IMPORTANT: You've made 12 tool calls without using introspect.]",
+            "user",
+        )
+        assert msg_type == "guidance_nudge"
+        assert source == "introspect"
+
+    def test_classify_legacy_guidance_nudge(self):
+        msg_type, source = SmartContextManager._classify(
+            "[Note: This result contains errors. Use introspect to analyze what went wrong before attempting fixes.]",
+            "user",
+        )
+        assert msg_type == "guidance_nudge"
+        assert source == "error-analysis"
+
+    def test_semantic_maintenance_prunes_stale_guidance(self):
+        tm = TodoManager()
+        sc = SmartContextManager(tm)
+        msgs = [
+            MockMessage("system", "System prompt"),
+            MockMessage("user", "First task"),
+            MockMessage("assistant", "OK"),
+            MockMessage("user", "[GUIDANCE_NUDGE type=introspect severity=strong calls=18]\n"
+                                "[IMPORTANT: You've made 18 tool calls without using introspect.]"),
+            MockMessage("assistant", "Some analysis and tool call planning " * 30),
+            MockMessage("user", "More working context " * 30),
+            MockMessage("assistant", "Recent response " * 20),
+            MockMessage("user", "Current turn context " * 20),
+            MockMessage("assistant", "Newest response " * 20),
+            MockMessage("user", "Newest user context " * 20),
+            MockMessage("assistant", "Tail response " * 20),
+            MockMessage("user", "Tail user context " * 20),
+        ]
+        before = sum(len(m.content) // 4 for m in msgs)
+        out, freed, report = sc.semantic_maintenance_tick(msgs, max_tokens=200000, current_tokens=before)
+        assert freed > 0
+        assert "Guidance lifecycle pruning" in report
+        # old guidance should be compacted
+        assert "Guidance note archived" in out[3].content
+
+    def test_runtime_logistic_prior_is_applied(self):
+        pytest.importorskip("sklearn")
+        tm = TodoManager()
+        sc = SmartContextManager(tm)
+        msgs = [
+            MockMessage("system", "System prompt"),
+            MockMessage("user", "Task setup"),
+            MockMessage("assistant", "Acknowledged"),
+        ]
+        # Add enough candidates for runtime logistic fit (>12), mixing
+        # guidance/tool chatter with analysis so model has class variety.
+        for i in range(16):
+            if i % 2 == 0:
+                msgs.append(
+                    MockMessage(
+                        "user",
+                        f"[GUIDANCE_NUDGE type=introspect severity=gentle]\n"
+                        f"consider using introspect before changing files {i} " * 8,
+                    )
+                )
+            else:
+                msgs.append(
+                    MockMessage(
+                        "assistant",
+                        ("Detailed analysis of root cause and fix path " * 40) + str(i),
+                    )
+                )
+        _ = sc._score_all_messages(msgs, set(), set())
+        assert isinstance(sc.last_policy_stats, dict)
+        assert sc.last_policy_stats.get("used") is True
+        assert sc.last_policy_stats.get("samples", 0) >= 8
+
+    def test_runtime_logistic_prior_keeps_guidance_lower(self):
+        pytest.importorskip("sklearn")
+        tm = TodoManager()
+        sc = SmartContextManager(tm)
+        msgs = [
+            MockMessage("system", "System prompt"),
+            MockMessage("user", "Task setup"),
+            MockMessage("assistant", "Acknowledged"),
+            MockMessage(
+                "user",
+                "[GUIDANCE_NUDGE type=error-analysis severity=gentle]\n"
+                + ("result contains errors, use introspect " * 30),
+            ),
+            MockMessage("assistant", "Deep technical analysis " * 60),
+        ]
+        # Add additional mixed messages so logistic prior trains.
+        for i in range(14):
+            msgs.append(MockMessage("assistant", f"Intermediate reasoning step {i} " * 25))
+        scored = sc._score_all_messages(msgs, set(), set())
+        by_index = {idx: (score, typ) for idx, score, typ, _src in scored}
+        # Guidance nudge should remain lower priority than rich analysis.
+        assert by_index[3][1] == "guidance_nudge"
+        assert by_index[4][1] == "assistant_analysis"
+        assert by_index[3][0] < by_index[4][0]
+
     def test_serialization(self):
         tm = TodoManager()
         sc = SmartContextManager(tm)
         sc.compaction_traces.append(
             CompactionTrace("file_read", "test.py", "test file", tokens_freed=100)
         )
+        msgs = [
+            MockMessage("system", "System prompt"),
+            MockMessage("user", "Do work"),
+            MockMessage("assistant", "Acknowledged"),
+            MockMessage("user", "[GUIDANCE_NUDGE type=introspect severity=gentle]\n[Tip: consider introspect]"),
+        ]
+        sc.semantic_maintenance_tick(msgs, max_tokens=200000)
 
         data = sc.to_dict()
         sc2 = SmartContextManager(tm)
@@ -366,6 +472,7 @@ class TestSmartContextManager:
 
         assert len(sc2.compaction_traces) == 1
         assert sc2.compaction_traces[0].source == "test.py"
+        assert len(sc2.node_metadata) >= 1
         assert sc2.compaction_traces[0].tokens_freed == 100
 
     def test_serialization_backward_compat(self):

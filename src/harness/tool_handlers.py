@@ -2,18 +2,35 @@
 
 import asyncio
 import base64
+import html
+import json
 import os
 import platform
 import re
 import signal
 import time
+import difflib
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from rich.console import Console
 import psutil
 
 from .context_management import truncate_file_content, truncate_output
 from .logger import get_logger, log_exception, truncate as log_truncate
+
+try:
+    from mcp import ClientSession, StdioServerParameters  # type: ignore
+    from mcp.client.stdio import stdio_client  # type: ignore
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+    from mcp.client.sse import sse_client  # type: ignore
+    HAS_MCP_SDK = True
+except Exception:
+    ClientSession = None
+    StdioServerParameters = None
+    stdio_client = None
+    streamablehttp_client = None
+    sse_client = None
+    HAS_MCP_SDK = False
 
 log = get_logger("tools")
 
@@ -80,6 +97,30 @@ def sanitize_terminal_output(text: str) -> str:
     return text
 
 
+_PS_CLIXML_STR_RE = re.compile(r'<S(?:\s+S="[^"]+")?>(.*?)</S>')
+_PS_CLIXML_HEX_ESCAPE_RE = re.compile(r'_x([0-9A-Fa-f]{4})_')
+
+
+def _decode_powershell_clixml(text: str) -> str:
+    """Best-effort decode of PowerShell CLIXML error/progress output to plain text."""
+    if not text:
+        return text
+    t = text
+    if "#< CLIXML" in t:
+        t = t.replace("#< CLIXML", "")
+    if "http://schemas.microsoft.com/powershell/2004/04" not in t and "<Objs" not in t:
+        return t.strip("\r\n")
+
+    parts = _PS_CLIXML_STR_RE.findall(t)
+    if not parts:
+        return t.strip("\r\n")
+
+    decoded = "".join(parts)
+    decoded = html.unescape(decoded)
+    decoded = _PS_CLIXML_HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), decoded)
+    return decoded.strip("\r\n")
+
+
 def parse_search_replace_blocks(diff: str) -> List[Tuple[str, str]]:
     """Parse SEARCH/REPLACE blocks from diff string."""
     blocks = []
@@ -135,6 +176,11 @@ class ToolHandlers:
         # Directory for spilled command output files
         self._output_dir = os.path.join(workspace_path, ".harness_output")
         os.makedirs(self._output_dir, exist_ok=True)
+
+        # Persistent MCP sessions (server name -> session bundle).
+        # Keeps browser/tool state across turns (critical for Playwright MCP refs).
+        self._mcp_sessions: Dict[str, Dict[str, Any]] = {}
+        self._mcp_locks: Dict[str, asyncio.Lock] = {}
     
     # -- Output spill helpers --------------------------------------------------
     
@@ -143,6 +189,8 @@ class ToolHandlers:
     
     # Maximum tokens to include inline when output is spilled.
     OUTPUT_INLINE_PREVIEW_TOKENS = 300   # ~1,200 chars — enough for LLM to understand
+    LARGE_WRITE_FEEDBACK_THRESHOLD = 256 * 1024  # chars
+    LARGE_WRITE_CHUNK_SIZE = 128 * 1024  # chars
     
     def spill_output_to_file(self, output: str, label: str) -> str:
         """Write large output to a file and return a compact reference.
@@ -198,6 +246,420 @@ class ToolHandlers:
         if not p.is_absolute():
             p = Path(self.workspace_path) / p
         return p.resolve()
+
+    def _load_mcp_servers(self) -> Dict[str, dict]:
+        cfg_path = Path.home() / ".z.json"
+        if not cfg_path.exists():
+            return {}
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            mcp = data.get("mcp", {})
+            return mcp if isinstance(mcp, dict) else {}
+        except Exception:
+            return {}
+
+    def _mcp_server_cfg(self, name: str) -> Tuple[dict, str]:
+        servers = self._load_mcp_servers()
+        cfg = servers.get(name)
+        if not isinstance(cfg, dict):
+            return {}, f"MCP server '{name}' not found in ~/.z.json mcp config."
+        if cfg.get("enabled", True) is False:
+            return {}, f"MCP server '{name}' is disabled."
+        stype = str(cfg.get("type", "local")).lower()
+        if stype in ("local", "stdio"):
+            cmd = cfg.get("command")
+            if not isinstance(cmd, list) or not cmd:
+                return {}, f"MCP server '{name}' has invalid command configuration."
+        elif stype in ("http", "streamable_http", "sse"):
+            url = cfg.get("url")
+            if not isinstance(url, str) or not url.strip():
+                return {}, f"MCP server '{name}' has invalid URL configuration."
+        else:
+            return {}, f"MCP server '{name}' has unsupported type '{stype}'."
+        return cfg, ""
+
+    def _normalize_mcp_command(self, cmd: List[str]) -> List[str]:
+        """Rewrite known noisy MCP launchers into protocol-safe equivalents."""
+        if len(cmd) >= 2 and cmd[0] == "uvx" and cmd[1] == "minimax-coding-plan-mcp":
+            # minimax-coding-plan-mcp prints a banner to stdout before protocol
+            # frames, which breaks MCP SDK parsing. Run its module directly.
+            return [
+                "uvx",
+                "--from",
+                "minimax-coding-plan-mcp",
+                "python",
+                "-c",
+                "from minimax_mcp.server import mcp; mcp.run()",
+            ]
+        return cmd
+
+    async def _close_mcp_session(self, name: str) -> None:
+        entry = self._mcp_sessions.pop(name, None)
+        if not entry:
+            return
+        try:
+            session_cm = entry.get("session_cm")
+            if session_cm is not None:
+                await session_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            cm = entry.get("cm")
+            if cm is not None:
+                await cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            errlog = entry.get("errlog")
+            if errlog is not None:
+                errlog.close()
+        except Exception:
+            pass
+
+    async def _get_or_create_mcp_session(self, name: str, cfg: dict):
+        if not HAS_MCP_SDK:
+            raise RuntimeError(
+                "MCP SDK is not installed. Install package 'mcp' to enable MCP server execution."
+            )
+        cfg_key = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+        existing = self._mcp_sessions.get(name)
+        if existing and existing.get("cfg_key") == cfg_key:
+            return existing.get("session")
+        if existing:
+            await self._close_mcp_session(name)
+
+        stype = str(cfg.get("type", "local")).lower()
+
+        if stype in ("local", "stdio"):
+            cmd = [str(x) for x in (cfg.get("command", []) or [])]
+            if not cmd:
+                raise RuntimeError("MCP server command is empty.")
+            cmd = self._normalize_mcp_command(cmd)
+            env_cfg = cfg.get("environment", {})
+            env = os.environ.copy()
+            if isinstance(env_cfg, dict):
+                env.update({str(k): str(v) for k, v in env_cfg.items()})
+
+            server_params = StdioServerParameters(
+                command=cmd[0],
+                args=cmd[1:],
+                env=env,
+            )
+
+            _errlog = open(os.devnull, "w", encoding="utf-8")
+            cm = stdio_client(server_params, errlog=_errlog)
+            read_stream, write_stream = await cm.__aenter__()
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            try:
+                await asyncio.wait_for(session.initialize(), timeout=15)
+            except Exception:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    _errlog.close()
+                except Exception:
+                    pass
+                raise
+            self._mcp_sessions[name] = {
+                "cfg_key": cfg_key,
+                "stype": stype,
+                "cm": cm,
+                "session_cm": session_cm,
+                "session": session,
+                "errlog": _errlog,
+            }
+            return session
+
+        if stype in ("http", "streamable_http", "sse"):
+            url = str(cfg.get("url", "") or "").strip()
+            if not url:
+                raise RuntimeError("MCP HTTP server URL is empty.")
+            headers_cfg = cfg.get("headers", {})
+            headers: Dict[str, str] = {}
+            if isinstance(headers_cfg, dict):
+                headers = {str(k): str(v) for k, v in headers_cfg.items()}
+
+            if stype == "sse":
+                cm = sse_client(url, headers=headers, timeout=20, sse_read_timeout=300)
+                read_stream, write_stream = await cm.__aenter__()
+                session_cm = ClientSession(read_stream, write_stream)
+                session = await session_cm.__aenter__()
+                try:
+                    await asyncio.wait_for(session.initialize(), timeout=20)
+                except Exception:
+                    try:
+                        await session_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    raise
+                self._mcp_sessions[name] = {
+                    "cfg_key": cfg_key,
+                    "stype": stype,
+                    "cm": cm,
+                    "session_cm": session_cm,
+                    "session": session,
+                }
+                return session
+
+            cm = streamablehttp_client(url, headers=headers, timeout=20, sse_read_timeout=300)
+            read_stream, write_stream, _get_session_id = await cm.__aenter__()
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            try:
+                await asyncio.wait_for(session.initialize(), timeout=20)
+            except Exception:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                raise
+            self._mcp_sessions[name] = {
+                "cfg_key": cfg_key,
+                "stype": stype,
+                "cm": cm,
+                "session_cm": session_cm,
+                "session": session,
+            }
+            return session
+
+        raise RuntimeError(f"Unsupported MCP server type: {stype}")
+
+    async def _mcp_with_sdk_session(self, name: str, cfg: dict, fn):
+        lock = self._mcp_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            session = await self._get_or_create_mcp_session(name, cfg)
+            try:
+                return await asyncio.wait_for(fn(session), timeout=45)
+            except Exception:
+                # Reset broken sessions so next call recreates cleanly.
+                await self._close_mcp_session(name)
+                raise
+
+    async def mcp_list_tools(self, params: Dict[str, str]) -> str:
+        name = (params.get("server") or "").strip()
+        if not name:
+            return "Error: mcp_list_tools requires <server>."
+        cfg, err = self._mcp_server_cfg(name)
+        if err:
+            return f"Error: {err}"
+        try:
+            async def _do(session):
+                return await session.list_tools()
+
+            result = await self._mcp_with_sdk_session(name, cfg, _do)
+            tools = getattr(result, "tools", None)
+            if tools is None and isinstance(result, dict):
+                tools = result.get("tools", [])
+            if not isinstance(tools, list):
+                tools = []
+            if not tools:
+                return f"MCP server '{name}' returned no tools."
+            lines = [f"MCP tools on '{name}':"]
+            for t in tools[:200]:
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")).strip()
+                req_fields: List[str] = []
+                schema = getattr(t, "inputSchema", None)
+                if schema is None and isinstance(t, dict):
+                    schema = t.get("inputSchema")
+                if isinstance(schema, dict):
+                    req = schema.get("required", [])
+                    if isinstance(req, list):
+                        req_fields = [str(x) for x in req if isinstance(x, str)]
+                req_txt = f" [required: {', '.join(req_fields)}]" if req_fields else ""
+                lines.append(f"- {tn}" + (f": {td}" if td else "") + req_txt)
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: MCP list failed for '{name}': {e}"
+
+    async def mcp_search_tools(self, params: Dict[str, str]) -> str:
+        name = (params.get("server") or "").strip()
+        query = (params.get("query") or "").strip()
+        try:
+            limit = int(params.get("limit", 8) or 8)
+        except Exception:
+            limit = 8
+        limit = max(1, min(limit, 20))
+        if not name or not query:
+            return "Error: mcp_search_tools requires <server> and <query>."
+
+        cfg, err = self._mcp_server_cfg(name)
+        if err:
+            return f"Error: {err}"
+        try:
+            async def _do(session):
+                return await session.list_tools()
+
+            result = await self._mcp_with_sdk_session(name, cfg, _do)
+            tools = getattr(result, "tools", None)
+            if tools is None and isinstance(result, dict):
+                tools = result.get("tools", [])
+            if not isinstance(tools, list) or not tools:
+                return f"MCP server '{name}' returned no tools."
+
+            q = query.lower()
+            q_tokens = {t for t in re.split(r"[^a-z0-9]+", q) if t}
+
+            scored: List[Tuple[float, dict]] = []
+            for t in tools:
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else ""))
+                hay = f"{tn} {td}".lower()
+                hay_tokens = {x for x in re.split(r"[^a-z0-9]+", hay) if x}
+                overlap = 0.0
+                if q_tokens:
+                    overlap = len(q_tokens & hay_tokens) / len(q_tokens)
+                ratio_name = difflib.SequenceMatcher(None, q, tn.lower()).ratio()
+                ratio_hay = difflib.SequenceMatcher(None, q, hay).ratio()
+                score = overlap * 2.0 + ratio_name * 1.5 + ratio_hay
+                if q in hay:
+                    score += 1.5
+                scored.append((score, t))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top = [t for s, t in scored[:limit] if s > 0.1]
+            if not top:
+                return f"No relevant MCP tools found on '{name}' for query: {query}"
+
+            lines = [f"Top MCP tools on '{name}' for '{query}' (limit={limit}):"]
+            for t in top:
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")).strip()
+                req_fields: List[str] = []
+                schema = getattr(t, "inputSchema", None)
+                if schema is None and isinstance(t, dict):
+                    schema = t.get("inputSchema")
+                if isinstance(schema, dict):
+                    req = schema.get("required", [])
+                    if isinstance(req, list):
+                        req_fields = [str(x) for x in req if isinstance(x, str)]
+                req_txt = f" [required: {', '.join(req_fields)}]" if req_fields else ""
+                lines.append(f"- {tn}" + (f": {td[:180]}" if td else "") + req_txt)
+            lines.append("Use mcp_call_tool with the exact chosen tool name.")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: MCP search failed for '{name}': {e}"
+
+    async def mcp_call_tool(self, params: Dict[str, str]) -> str:
+        name = (params.get("server") or "").strip()
+        tool = (params.get("tool") or "").strip()
+        args_raw = (params.get("arguments") or "").strip()
+        if not name or not tool:
+            return "Error: mcp_call_tool requires <server> and <tool>."
+        if not args_raw:
+            args_raw = "{}"
+        try:
+            arguments = json.loads(args_raw)
+            if not isinstance(arguments, dict):
+                return "Error: <arguments> must be a JSON object."
+        except Exception as e:
+            return f"Error: invalid JSON in <arguments>: {e}"
+
+        cfg, err = self._mcp_server_cfg(name)
+        if err:
+            return f"Error: {err}"
+        try:
+            async def _do(session):
+                # Schema-aware argument aliasing: if caller provided a generic
+                # "query" field but the MCP tool requires e.g. "search_query",
+                # map it automatically to reduce model-side friction.
+                try:
+                    listed = await session.list_tools()
+                    listed_tools = getattr(listed, "tools", None)
+                    if listed_tools is None and isinstance(listed, dict):
+                        listed_tools = listed.get("tools", [])
+                    if isinstance(listed_tools, list):
+                        match = None
+                        for t in listed_tools:
+                            tname = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                            if tname == tool:
+                                match = t
+                                break
+                        if match is not None:
+                            schema = getattr(match, "inputSchema", None)
+                            if schema is None and isinstance(match, dict):
+                                schema = match.get("inputSchema")
+                            if isinstance(schema, dict):
+                                required = schema.get("required", [])
+                                if isinstance(required, list):
+                                    missing = [r for r in required if isinstance(r, str) and r not in arguments]
+                                    if "query" in arguments:
+                                        query_val = arguments.get("query")
+                                        for r in missing:
+                                            if isinstance(query_val, str) and r.endswith("query"):
+                                                arguments[r] = query_val
+                except Exception:
+                    pass
+
+                return await session.call_tool(tool, arguments)
+
+            result = await self._mcp_with_sdk_session(name, cfg, _do)
+            text_parts: List[str] = []
+            content = getattr(result, "content", None)
+            if content is None and isinstance(result, dict):
+                content = result.get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    txt = getattr(part, "text", None)
+                    if txt is None and isinstance(part, dict):
+                        txt = part.get("text")
+                    if isinstance(txt, str):
+                        text_parts.append(txt)
+            if text_parts:
+                return "\n".join(text_parts)
+            try:
+                if hasattr(result, "model_dump"):
+                    return json.dumps(result.model_dump(), ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            if isinstance(result, dict):
+                return json.dumps(result, ensure_ascii=False, indent=2)
+            return str(result)
+        except Exception as e:
+            return f"Error: MCP tool call failed on '{name}/{tool}': {e}"
+
+    def _display_path(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(Path(self.workspace_path)))
+        except Exception:
+            return str(path)
+
+    async def _write_text_with_feedback(self, path: Path, content: str, action: str = "Writing") -> None:
+        """Write text with visible progress for large payloads."""
+        total = len(content)
+        if total < self.LARGE_WRITE_FEEDBACK_THRESHOLD:
+            path.write_text(content, encoding="utf-8")
+            return
+
+        self.console.print(f"[dim]   {action} {self._display_path(path)} ({total:,} chars)[/dim]")
+        next_report = 10
+        written = 0
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            for i in range(0, total, self.LARGE_WRITE_CHUNK_SIZE):
+                chunk = content[i:i + self.LARGE_WRITE_CHUNK_SIZE]
+                f.write(chunk)
+                written += len(chunk)
+                pct = int((written * 100) / max(total, 1))
+                if pct >= next_report and pct < 100:
+                    self.console.print(f"[dim]     ... {pct}%[/dim]")
+                    next_report += 10
+                    await asyncio.sleep(0)
+        self.console.print("[dim]     ... 100%[/dim]")
     
     async def _background_log_tailer(self, bg_id: int, proc: asyncio.subprocess.Process,
                                       log_path: str):
@@ -273,6 +735,13 @@ class ToolHandlers:
                         info["task"].cancel()
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+        # Close persistent MCP sessions on shutdown.
+        for sname in list(self._mcp_sessions.keys()):
+            try:
+                await self._close_mcp_session(sname)
             except Exception:
                 pass
         self._background_procs.clear()
@@ -429,7 +898,7 @@ class ToolHandlers:
             self.console.print(f"[yellow]Warning: Overwriting existing file ({old_size} bytes). Consider replace_in_file for edits.[/yellow]")
         
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        await self._write_text_with_feedback(path, content, action="Writing")
         
         # DEBUG: Verify write
         if os.environ.get("HARNESS_DEBUG"):
@@ -483,7 +952,7 @@ class ToolHandlers:
         body_start = start_idx + len(start_anchor)
         old_segment = content[body_start:end_idx]
         new_content = content[:body_start] + replacement + content[end_idx:]
-        path.write_text(new_content, encoding="utf-8")
+        await self._write_text_with_feedback(path, new_content, action="Writing updated file")
 
         old_lines = old_segment.count("\n") + (1 if old_segment else 0)
         new_lines = replacement.count("\n") + (1 if replacement else 0)
@@ -696,7 +1165,7 @@ class ToolHandlers:
             # Strategy 5: Fail with helpful diagnostic
             return build_diagnostic(content, search)
         
-        path.write_text(content, encoding="utf-8")
+        await self._write_text_with_feedback(path, content, action="Writing updated file")
         return f"Successfully made {changes} replacement(s) in {path}"
     
     async def execute_command(self, params: Dict[str, str]) -> str:
@@ -717,10 +1186,9 @@ class ToolHandlers:
             return "Error: execute_command requires a non-empty <command> parameter."
         log.info("execute_command: cmd=%s bg=%s", log_truncate(command, 200), background)
         
-        # Show command being executed
         mode_indicator = "[bg] " if background else ""
         cmd_short = command.split('\n')[0][:120]  # First line, truncated
-        self.console.print(f"\n  [dim]•[/dim] Running [dim]{mode_indicator}{cmd_short}[/dim]")
+        self.console.print(f"  [dim]•[/dim] [bold]Running[/bold] [dim]{mode_indicator}{cmd_short}[/dim]")
         
         if background:
             return await self._run_background_command(command)
@@ -762,7 +1230,7 @@ class ToolHandlers:
                 # Check for interrupt (Esc)
                 if is_interrupted():
                     self._kill_proc(proc)
-                    self.console.print(f"\n    [yellow]⏹ Command interrupted[/yellow]")
+                    self.console.print(f"    [yellow]interrupted[/yellow]")
                     raw_output = self._read_log_file(cmd_log_path)
                     output = self.spill_output_to_file(
                         raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
@@ -771,12 +1239,12 @@ class ToolHandlers:
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
                     reset_background()
-                    self.console.print(f"\n    [cyan]→ Sending to background...[/cyan]")
+                    self.console.print(f"    [cyan]→ background[/cyan]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
-                    self.console.print(f"    [dim](Ctrl+B to background, Esc to stop)[/dim]")
+                    self.console.print(f"    [dim]Ctrl+B background · Esc stop[/dim]")
                     hint_shown = True
                 
                 # Auto-background after timeout.  Use a shorter timeout for
@@ -784,7 +1252,7 @@ class ToolHandlers:
                 # that block cmd.exe but have no console output to tail.
                 effective_timeout = 10 if not output_lines else timeout_secs
                 if elapsed > effective_timeout:
-                    self.console.print(f"\n    [cyan]→ No output for {elapsed:.0f}s, sending to background...[/cyan]")
+                    self.console.print(f"    [cyan]→ background[/cyan] [dim](no output for {elapsed:.0f}s)[/dim]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Read new content from log file
@@ -814,7 +1282,7 @@ class ToolHandlers:
                 if output_lines:
                     # Log file is growing — a detached app is still running.
                     # Promote to background so the log tailer keeps reading.
-                    self.console.print(f"    [cyan]→ Detached process detected, sending to background...[/cyan]")
+                    self.console.print(f"    [cyan]→ background[/cyan] [dim](detached process)[/dim]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
 
             exit_code = proc.returncode
@@ -892,10 +1360,13 @@ class ToolHandlers:
                 new_pos = f.tell()
             if new_data:
                 for line in new_data.splitlines():
-                    output_lines.append(line)
+                    decoded_line = _decode_powershell_clixml(line)
+                    if not decoded_line.strip():
+                        continue
+                    output_lines.append(decoded_line)
                     n = len(output_lines)
                     if n <= self._MAX_LIVE_DISPLAY:
-                        safe_line = sanitize_terminal_output(line)
+                        safe_line = sanitize_terminal_output(decoded_line)
                         self.console.print(f"    [dim]{safe_line}[/dim]")
                     elif n == self._MAX_LIVE_DISPLAY + 1:
                         self.console.print(f"    [dim]… +more lines (running)[/dim]")
@@ -908,7 +1379,9 @@ class ToolHandlers:
     def _read_log_file(self, log_path: str) -> str:
         """Read the entire contents of a log file."""
         try:
-            return Path(log_path).read_text(encoding="utf-8", errors="replace")
+            raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            decoded = _decode_powershell_clixml(raw)
+            return decoded or raw
         except Exception:
             return ""
     
@@ -930,7 +1403,7 @@ class ToolHandlers:
             "log_file": log_path,
             "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
-        self.console.print(f"    [green]→ Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
         recent = "\n".join(output_lines[-30:])
         return (
             f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
@@ -1134,7 +1607,7 @@ class ToolHandlers:
             "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
         
-        self.console.print(f"    [green]→ Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
         return (
             f"Command started in background (ID: {proc_id}, PID: {proc.pid}).\n"
             f"Log file: {log_path}\n"
@@ -1468,22 +1941,31 @@ class ToolHandlers:
         parsed = urlparse(self.config.api_url)
         search_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
         
-        payload = {
-            "model": "glm-4.7",
-            "messages": [{"role": "user", "content": f"Search the web for: {query}"}],
-            "temperature": 0.7,
-            "max_tokens": 2048,
-            "stream": False,
-            "tools": [{
-                "type": "web_search",
-                "web_search": {
-                    "enable": True,
-                    "search_engine": "search-prime",
-                    "search_result": True,
-                    "count": str(count),
-                }
-            }]
-        }
+        def _build_payload(q: str, attempt: int) -> dict:
+            msg = f"Search the web for: {q}"
+            # Retry hint when the model returns unresolved function metadata.
+            if attempt > 0:
+                msg = (
+                    f"Search the web for: {q}\n"
+                    "Return final search results and summary text directly. "
+                    "Do not return tool/function call metadata."
+                )
+            return {
+                "model": "glm-4.7",
+                "messages": [{"role": "user", "content": msg}],
+                "temperature": 0.4 if attempt > 0 else 0.7,
+                "max_tokens": 2048,
+                "stream": False,
+                "tools": [{
+                    "type": "web_search",
+                    "web_search": {
+                        "enable": True,
+                        "search_engine": "search-prime",
+                        "search_result": True,
+                        "count": str(count),
+                    }
+                }]
+            }
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
@@ -1492,17 +1974,49 @@ class ToolHandlers:
         
         try:
             async with httpx.AsyncClient(timeout=120.0) as http_client:
-                response = await http_client.post(search_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                
-                results = data.get("web_search", [])
+                data = {}
+                results = []
                 content = ""
-                if "choices" in data and data["choices"]:
-                    content = data["choices"][0].get("message", {}).get("content", "")
-                
+                raw_fc_content = ""
+                for attempt in range(2):
+                    payload = _build_payload(query, attempt)
+                    response = await http_client.post(search_url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+
+                    results = data.get("web_search", [])
+                    content = ""
+                    if "choices" in data and data["choices"]:
+                        content = data["choices"][0].get("message", {}).get("content", "")
+
+                    # Some responses occasionally return unresolved function-call JSON
+                    # like {"function":"google_search","arguments":"..."} in content.
+                    unresolved_fc = False
+                    raw_fc_content = ""
+                    if isinstance(content, str):
+                        ct = content.strip()
+                        if ct.startswith("{") and ct.endswith("}"):
+                            try:
+                                parsed = json.loads(ct)
+                                if isinstance(parsed, dict) and "function" in parsed and "arguments" in parsed:
+                                    unresolved_fc = True
+                                    raw_fc_content = ct
+                            except Exception:
+                                pass
+
+                    if unresolved_fc and not results and attempt == 0:
+                        # Transient backend behavior: retry once with clearer instruction.
+                        continue
+                    break
+
                 if not results and not content:
                     return f"No results found for: {query}"
+                if not results and raw_fc_content:
+                    return (
+                        "Search backend returned unresolved function-call metadata instead of final results. "
+                        "Please retry once.\n\n"
+                        f"Raw content: {raw_fc_content[:300]}"
+                    )
                 
                 # Format results
                 output = [f"Web Search Results for: {query}\n"]

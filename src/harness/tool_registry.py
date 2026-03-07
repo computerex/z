@@ -84,6 +84,16 @@ TOOL_DEFS: List[ToolDef] = [
             params=[ToolParam("path", required=True), ToolParam("question")]),
     ToolDef("web_search",    category="external",
             params=[ToolParam("query", required=True), ToolParam("count")]),
+    ToolDef("mcp_search_tools", category="external",
+            params=[ToolParam("server", required=True),
+                    ToolParam("query", required=True),
+                    ToolParam("limit")]),
+    ToolDef("mcp_list_tools", category="external",
+            params=[ToolParam("server", required=True)]),
+    ToolDef("mcp_call_tool", category="external", complex_content=True,
+            params=[ToolParam("server", required=True),
+                    ToolParam("tool", required=True),
+                    ToolParam("arguments", required=True)]),
 
     # --- Context management ---
     ToolDef("list_context",        category="context"),

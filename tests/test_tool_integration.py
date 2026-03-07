@@ -156,6 +156,43 @@ class TestParseXmlTool:
         assert result.parameters["query"] == "Python 3.12 asyncio changes"
         assert result.parameters["count"] == "5"
 
+    def test_parse_mcp_list_tools(self):
+        content = """<mcp_list_tools>
+<server>MiniMax</server>
+</mcp_list_tools>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "mcp_list_tools"
+        assert result.parameters["server"] == "MiniMax"
+
+    def test_parse_mcp_search_tools(self):
+        content = """<mcp_search_tools>
+<server>MiniMax</server>
+<query>Montgomery Alabama events March 2026</query>
+<limit>5</limit>
+</mcp_search_tools>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "mcp_search_tools"
+        assert result.parameters["server"] == "MiniMax"
+        assert result.parameters["query"] == "Montgomery Alabama events March 2026"
+        assert result.parameters["limit"] == "5"
+
+    def test_parse_mcp_call_tool(self):
+        content = """<mcp_call_tool>
+<server>MiniMax</server>
+<tool>web_search</tool>
+<arguments>
+{"query":"Montgomery AL events March 2026","count":5}
+</arguments>
+</mcp_call_tool>"""
+        result = parse_xml_tool(content)
+        assert result is not None
+        assert result.name == "mcp_call_tool"
+        assert result.parameters["server"] == "MiniMax"
+        assert result.parameters["tool"] == "web_search"
+        assert "Montgomery AL events March 2026" in result.parameters["arguments"]
+
     def test_parse_list_context(self):
         content = """Let me check what's in my context.
 
