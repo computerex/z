@@ -1370,8 +1370,6 @@ class ClineAgent:
                 _stream_payload_line = ""
                 _stream_payload_header_printed = False
                 _stream_payload_lines = 0
-                _stream_payload_capped = False
-                _stream_payload_max_lines = 120
                 _stream_payload_line_limit = 220
 
                 def _stream_process_tag(raw_tag: str):
@@ -1409,7 +1407,7 @@ class ClineAgent:
 
                 def _stream_emit_payload_line(force: bool = False):
                     nonlocal _stream_payload_line, _stream_payload_lines
-                    nonlocal _stream_payload_header_printed, _stream_payload_capped
+                    nonlocal _stream_payload_header_printed
 
                     if not _stream_payload_enabled:
                         _stream_payload_line = ""
@@ -1428,13 +1426,8 @@ class ClineAgent:
                     if not line.strip():
                         return
 
-                    if _stream_payload_lines >= _stream_payload_max_lines:
-                        if not _stream_payload_capped:
-                            self.console.print("  [dim]... live payload preview capped ...[/dim]")
-                            _stream_payload_capped = True
-                        return
-
                     if not _stream_payload_header_printed:
+                        self.console.print()
                         self.console.print("  [dim]• Streaming changes…[/dim]")
                         _stream_payload_header_printed = True
 

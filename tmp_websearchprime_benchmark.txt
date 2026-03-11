@@ -1,0 +1,97 @@
+TOP 12 combinations by heuristic score
+
+[41] variant=loc_us_high | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. Selma March
+     https://www.britannica.com/event/Selma-March
+  3. Alabama - List View (U.S. National Park Service)
+     https://www.nps.gov/state/al/list.htm?program=all
+
+[39] variant=loc_us_nolimit | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. Selma March
+     https://www.britannica.com/event/Selma-March
+  3. Alabama - List View (U.S. National Park Service)
+     https://www.nps.gov/state/al/list.htm?program=all
+
+[39] variant=loc_us_domain_visitmontgomery | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. Selma March
+     https://www.britannica.com/event/Selma-March
+  3. Alabama - List View (U.S. National Park Service)
+     https://www.nps.gov/state/al/list.htm?program=all
+
+[39] variant=loc_us_domain_montgomeryal | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. Selma March
+     https://www.britannica.com/event/Selma-March
+  3. Alabama - List View (U.S. National Park Service)
+     https://www.nps.gov/state/al/list.htm?program=all
+
+[36] variant=loc_us | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. Selma March
+     https://www.britannica.com/event/Selma-March
+  3. 蒙哥马利，塞尔玛地区多景点通行证| 阿拉巴马 - Tripadvisor
+     https://cn.tripadvisor.com/AttractionProductReview-g30712-d24154257-Montgomery_Selma_Area_Multi_Attraction_Pass-Montgomery_Alabama.html
+
+[36] variant=loc_us_year | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. Selma March
+     https://www.britannica.com/event/Selma-March
+  3. Toronto Blue Jays Unveil Exciting Giveaway Schedule for 2026 Home Games
+     https://www.sohu.com/a/983633347_122342248
+
+[30] variant=base | query=events happening in Montgomery AL March 2026
+  1. 2025 年蒙哥马利将迎来哪些重磅活动？
+     https://m.163.com/dy/article/JS4K39GS05568E2R.html
+  2. montgomery
+     https://www.montgomerycollege.edu/
+  3. 2026 Infinite Sums Rural & Small Libraries Cohort Grant ...
+     http://librarygrants.blogspot.com/2025/09/2026-infinite-sums-rural-small.html
+
+[29] variant=loc_us_high | query=Montgomery Alabama events March 2026
+  1. Selma March
+     https://www.britannica.com/event/Selma-March
+  2. 历史与现实情境下的阿拉巴马州国会参议员特别选举
+     https://m.thepaper.cn/newsDetail_forward_1905750
+  3. 蒙哥马利市
+     https://m.meet99.com/emap-MONTGOMERY.html
+
+[27] variant=loc_us | query=Montgomery Alabama events March 2026
+  1. Selma March
+     https://www.britannica.com/event/Selma-March
+  2. 历史与现实情境下的阿拉巴马州国会参议员特别选举
+     https://m.thepaper.cn/newsDetail_forward_1905750
+  3. 蒙哥马利市
+     https://m.meet99.com/emap-MONTGOMERY.html
+
+[27] variant=loc_us_high | query=Montgomery AL event calendar March 2026
+  1. March 2026 Calendar
+     https://www.calendar-365.com/calendar/2026/March.html
+  2. 2026年3月日历表
+     https://www.fuhaoku.cn/calendar-2026/3/
+  3. Calendar
+     https://moodle.scnu.edu.cn/calendar/view.php?lang=en&time=1772294400&view=month
+
+[25] variant=loc_us | query=Montgomery AL event calendar March 2026
+  1. March 2026 Calendar
+     https://www.calendar-365.com/calendar/2026/March.html
+  2. 2026年3月日历表
+     https://www.fuhaoku.cn/calendar-2026/3/
+  3. Calendar
+     https://moodle.scnu.edu.cn/calendar/view.php?lang=en&time=1772294400&view=month
+
+[25] variant=loc_us_nolimit | query=Montgomery AL event calendar March 2026
+  1. March 2026 Calendar
+     https://www.calendar-365.com/calendar/2026/March.html
+  2. 2026年3月日历表
+     https://www.fuhaoku.cn/calendar-2026/3/
+  3. Calendar
+     https://moodle.scnu.edu.cn/calendar/view.php?lang=en&time=1772294400&view=month
