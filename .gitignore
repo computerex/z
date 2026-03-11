@@ -59,9 +59,10 @@ debug_*.py
 # Model configuration
 .z/models.json
 
-# Node modules
+# Node modules and MCP packages
 node_modules/
 **/node_modules/
+.mcp-browsermcp/
 
 # Temporary files
 tmp_*.txt
