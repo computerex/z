@@ -58,3 +58,13 @@ debug_*.py
 
 # Model configuration
 .z/models.json
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# Temporary files
+tmp_*.txt
+tmp_*.json
+*.tmp
+=======
