@@ -22,6 +22,7 @@ from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
 from .prompts import get_system_prompt
 from .cost_tracker import get_global_tracker
+from .logger import debug_print
 from .interrupt import is_interrupted, is_background_requested, reset_interrupt, start_monitoring, stop_monitoring
 from .context_management import (
     estimate_tokens, estimate_messages_tokens, get_model_limits,
@@ -477,15 +478,21 @@ class ClineAgent:
 
     def _system_prompt(self) -> str:
         """Return the system prompt for this agent."""
+        debug_print("_system_prompt: getting workspace summary...")
         index_summary = self.workspace_index.summary() if self.workspace_index.files else ""
+        debug_print("_system_prompt: calling get_system_prompt...")
         base = get_system_prompt(self.workspace_path, project_map=index_summary)
         # Keep MCP server inventory visible in the active system prompt so the
         # model can use newly added servers without restarting the harness.
+        debug_print("_system_prompt: loading MCP servers...")
         servers = {}
         try:
             servers = self.tool_handlers._load_mcp_servers()
-        except Exception:
+            debug_print("_system_prompt: MCP servers loaded")
+        except Exception as e:
+            debug_print(f"_system_prompt: MCP load failed: {e}")
             servers = {}
+        debug_print("_system_prompt: building result...")
         if isinstance(servers, dict) and servers:
             lines = ["MCP servers (from global config):"]
             for name in sorted(servers.keys()):
@@ -493,7 +500,9 @@ class ClineAgent:
                 enabled = bool(cfg.get("enabled", True))
                 stype = str(cfg.get("type", "local"))
                 lines.append(f"- {name} [{stype}] ({'enabled' if enabled else 'disabled'})")
+            debug_print("_system_prompt: DONE with servers")
             return base + "\n\n====\n\n" + "\n".join(lines)
+        debug_print("_system_prompt: DONE no servers")
         return base + "\n\n====\n\nMCP servers (from global config): none configured."
 
     def refresh_system_prompt(self) -> bool:
@@ -1009,13 +1018,20 @@ class ClineAgent:
     
     def clear_history(self) -> None:
         """Clear conversation history and context."""
+        debug_print("clear_history: START")
         self.messages = [StreamingMessage(role="system", content=self._system_prompt())]
+        debug_print("clear_history: after messages")
         self.context.clear()
+        debug_print("clear_history: after context.clear()")
         self._duplicate_detector.clear()
+        debug_print("clear_history: after duplicate_detector.clear()")
         self.todo_manager.clear()
+        debug_print("clear_history: after todo_manager.clear()")
         self.smart_context = SmartContextManager(self.todo_manager)
+        debug_print("clear_history: after SmartContextManager")
         self._last_token_count = 0
         self._initialized = True
+        debug_print("clear_history: DONE")
     
     def get_token_count(self) -> int:
         """Get estimated token count of current conversation."""

@@ -83,7 +83,7 @@ _mark("import_config")
 from harness.cline_agent import ClineAgent
 _mark("import_cline_agent")
 from harness.cost_tracker import get_global_tracker, reset_global_tracker
-from harness.logger import init_logging, get_logger, log_exception, truncate, enable_debug
+from harness.logger import init_logging, get_logger, log_exception, truncate, enable_debug, debug_print
 _mark("import_harness_core")
 from rich.console import Console
 from rich.panel import Panel
@@ -2397,9 +2397,13 @@ def main():
                         continue
                     
                     elif cmd == '/clear':
+                        debug_print("/clear: calling clear_history...")
                         agent.clear_history()
+                        debug_print("/clear: clear_history returned, resetting tracker...")
                         reset_global_tracker()
+                        debug_print("/clear: resetting done, printing...")
                         console.print("  [green]\u2713[/green] History cleared")
+                        debug_print("/clear: about to continue...")
                         continue
                     
                     elif cmd == '/save':
