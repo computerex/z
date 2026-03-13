@@ -6,8 +6,10 @@ import os
 import time
 import base64
 import httpx
+import threading
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .logger import get_logger, log_exception
 
@@ -17,6 +19,59 @@ except Exception:
     AsyncAnthropic = None
 
 _log = get_logger("streaming")
+
+# File-based debug log that always writes to CWD for diagnostics
+_stream_debug_lock = threading.Lock()
+_stream_debug_path: Optional[str] = None
+_stream_debug_enabled = False
+
+
+def _init_stream_debug():
+    """Initialize stream debug log file in current working directory."""
+    global _stream_debug_path, _stream_debug_enabled
+    with _stream_debug_lock:
+        if _stream_debug_enabled:
+            return
+
+        # Create .harness_output directory if it doesn't exist
+        debug_dir = Path.cwd() / ".harness_output"
+        debug_dir.mkdir(exist_ok=True)
+
+        # Create timestamped debug log file
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _stream_debug_path = str(debug_dir / f"stream_debug_{timestamp}.log")
+        _stream_debug_enabled = True
+
+        # Write header
+        with open(_stream_debug_path, "w", encoding="utf-8") as f:
+            f.write(f"=== Stream Debug Log started {datetime.datetime.now().isoformat()} ===\n")
+            f.write(f"PWD: {os.getcwd()}\n")
+            f.write("=" * 60 + "\n\n")
+
+
+def _stream_debug_write(msg: str):
+    """Write debug message to stream debug log file."""
+    if not _stream_debug_enabled:
+        _init_stream_debug()
+    if _stream_debug_path:
+        try:
+            with open(_stream_debug_path, "a", encoding="utf-8") as f:
+                timestamp = time.time()
+                f.write(f"[{timestamp:.3f}] {msg}\n")
+        except Exception:
+            pass  # Silently fail if we can't write
+
+
+def _get_stream_debug_path() -> Optional[str]:
+    """Get the path to the current stream debug log file."""
+    return _stream_debug_path
+
+
+def _debug_log(msg: str, *args):
+    """Log to both regular logger (if debug enabled) and stream debug file."""
+    _stream_debug_write(msg % args if args else msg)
+    _log.debug(msg, *args)
 
 
 def _normalize_anthropic_base_url(url: str) -> str:
@@ -675,12 +730,12 @@ class StreamingJSONClient:
                 line_count = 0
                 content_delta_count = 0
 
-                _log.debug("[STREAM_BASIC] Starting stream to %s", url)
+                _debug_log("[STREAM_BASIC] Starting stream to %s", url)
                 async with self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
                 ) as response:
                     response.raise_for_status()
-                    _log.debug("[STREAM_BASIC] Response status: %d", response.status_code)
+                    _debug_log("[STREAM_BASIC] Response status: %d", response.status_code)
 
                     line_buffer = ""
                     stream_done = False
@@ -688,7 +743,7 @@ class StreamingJSONClient:
                         chunk_count += 1
                         chunk_size = len(chunk)
                         if chunk_count % 50 == 0:
-                            _log.debug("[STREAM_BASIC] Chunk #%d size=%d bytes buffer_len=%d", chunk_count, chunk_size, len(line_buffer))
+                            _debug_log("[STREAM_BASIC] Chunk #%d size=%d bytes buffer_len=%d", chunk_count, chunk_size, len(line_buffer))
 
                         line_buffer += chunk.decode('utf-8', errors='ignore')
 
@@ -697,12 +752,12 @@ class StreamingJSONClient:
                             line = line.strip()
 
                             if not line or not line.startswith("data: "):
-                                _log.debug("[STREAM_BASIC] Skipping non-data line: %s", line[:50] if line else "(empty)")
+                                _debug_log("[STREAM_BASIC] Skipping non-data line: %s", line[:50] if line else "(empty)")
                                 continue
 
                             data_str = line[6:]
                             if data_str.strip() == "[DONE]":
-                                _log.debug("[STREAM_BASIC] Received [DONE] signal at line %d, chunk %d", line_count, chunk_count)
+                                _debug_log("[STREAM_BASIC] Received [DONE] signal at line %d, chunk %d", line_count, chunk_count)
                                 stream_done = True
                                 break
 
@@ -711,12 +766,12 @@ class StreamingJSONClient:
                             try:
                                 data = json.loads(data_str)
                             except json.JSONDecodeError as e:
-                                _log.debug("[STREAM_BASIC] JSON decode error at line %d: %s data=%s", line_count, e, data_str[:100])
+                                _debug_log("[STREAM_BASIC] JSON decode error at line %d: %s data=%s", line_count, e, data_str[:100])
                                 continue
 
                             if "usage" in data:
                                 usage = self._normalize_openai_usage(data["usage"])
-                                _log.debug("[STREAM_BASIC] Received usage: %s", usage)
+                                _debug_log("[STREAM_BASIC] Received usage: %s", usage)
 
                             choice = data.get("choices", [{}])[0]
                             delta = choice.get("delta", {})
@@ -742,28 +797,28 @@ class StreamingJSONClient:
                             if choice.get("finish_reason"):
                                 new_finish_reason = choice["finish_reason"]
                                 if finish_reason != new_finish_reason:
-                                    _log.debug("[STREAM_BASIC] Finish reason changed: %s -> %s at line %d", finish_reason, new_finish_reason, line_count)
+                                    _debug_log("[STREAM_BASIC] Finish reason changed: %s -> %s at line %d", finish_reason, new_finish_reason, line_count)
                                 finish_reason = new_finish_reason
 
                             if reasoning:
                                 full_reasoning += reasoning
                                 if line_count % 20 == 0:
-                                    _log.debug("[STREAM_BASIC] Reasoning accumulated: %d chars", len(full_reasoning))
+                                    _debug_log("[STREAM_BASIC] Reasoning accumulated: %d chars", len(full_reasoning))
                                 if on_thinking:
                                     on_thinking(reasoning)
 
                             if content:
                                 content_delta_count += 1
                                 if content_delta_count % 20 == 0:
-                                    _log.debug("[STREAM_BASIC] Content delta #%d: %d chars, buffer now %d chars",
+                                    _debug_log("[STREAM_BASIC] Content delta #%d: %d chars, buffer now %d chars",
                                               content_delta_count, len(content), len(extractor.buffer))
                                 extractor.feed(content, on_content)
 
                         if stream_done:
-                            _log.debug("[STREAM_BASIC] Breaking outer loop due to [DONE]")
+                            _debug_log("[STREAM_BASIC] Breaking outer loop due to [DONE]")
                             break
 
-                _log.debug("[STREAM_BASIC] Stream ended. Chunks=%d Lines=%d ContentDeltas=%d FinishReason=%s BufferLen=%d",
+                _debug_log("[STREAM_BASIC] Stream ended. Chunks=%d Lines=%d ContentDeltas=%d FinishReason=%s BufferLen=%d",
                           chunk_count, line_count, content_delta_count, finish_reason, len(extractor.buffer))
 
                 # Parse final result
@@ -783,10 +838,13 @@ class StreamingJSONClient:
                 
                 if not result.thinking and full_reasoning:
                     result.thinking = full_reasoning
-                _log.debug("[STREAM_BASIC] Returning result: content_len=%d thinking_len=%s finish_reason=%s",
+                _debug_log("[STREAM_BASIC] Returning result: content_len=%d thinking_len=%s finish_reason=%s",
                           len(result.raw_json) if result.raw_json else 0,
                           len(result.thinking) if result.thinking else 0,
                           finish_reason)
+                debug_path = _get_stream_debug_path()
+                if debug_path:
+                    _stream_debug_write(f"[STREAM_BASIC] Complete. Debug log: {debug_path}")
                 return result
                 
             except httpx.HTTPStatusError as e:
@@ -902,7 +960,7 @@ class StreamingJSONClient:
                         enter_task, check_interrupt=check_interrupt, poll_interval=0.1
                     )
                     response.raise_for_status()
-                    _log.debug("[STREAM_INT] Response status: %d", response.status_code)
+                    _debug_log("[STREAM_INT] Response status: %d", response.status_code)
 
                     line_buffer = ""
                     stream_done = False
@@ -915,7 +973,7 @@ class StreamingJSONClient:
                     # is slow to emit tokens (e.g. during initial thinking).
                     aiter = response.aiter_bytes().__aiter__()
                     pending_read = None
-                    _log.debug("[STREAM_INT] Entering polling loop")
+                    _debug_log("[STREAM_INT] Entering polling loop")
                     while True:
                         polling_loop_count += 1
 
@@ -930,7 +988,7 @@ class StreamingJSONClient:
                                     pass
                             interrupted = True
                             finish_reason = "interrupted"
-                            _log.debug("[STREAM_INT] Exiting due to interrupt")
+                            _debug_log("[STREAM_INT] Exiting due to interrupt")
                             break
 
                         # Start a new read if we don't have one pending
@@ -943,19 +1001,19 @@ class StreamingJSONClient:
                         if not done:
                             # Timeout — loop back to check interrupt
                             if polling_loop_count % 100 == 0:
-                                _log.debug("[STREAM_INT] Still polling... loop=%d buffer_len=%d", polling_loop_count, len(line_buffer))
+                                _debug_log("[STREAM_INT] Still polling... loop=%d buffer_len=%d", polling_loop_count, len(line_buffer))
                             continue  # Timeout — loop back to check interrupt
 
                         try:
                             chunk = pending_read.result()
                         except StopAsyncIteration:
-                            _log.debug("[STREAM_INT] StopAsyncIteration at loop %d - stream ended naturally", polling_loop_count)
+                            _debug_log("[STREAM_INT] StopAsyncIteration at loop %d - stream ended naturally", polling_loop_count)
                             break
                         pending_read = None
 
                         chunk_count += 1
                         if chunk_count % 50 == 0:
-                            _log.debug("[STREAM_INT] Chunk #%d size=%d buffer_len=%d", chunk_count, len(chunk), len(line_buffer))
+                            _debug_log("[STREAM_INT] Chunk #%d size=%d buffer_len=%d", chunk_count, len(chunk), len(line_buffer))
 
                         if debug_log:
                             raw_chunks.append(chunk)
@@ -968,12 +1026,12 @@ class StreamingJSONClient:
 
                             if not line or not line.startswith("data: "):
                                 if line:
-                                    _log.debug("[STREAM_INT] Skipping non-data line: %s", line[:50])
+                                    _debug_log("[STREAM_INT] Skipping non-data line: %s", line[:50])
                                 continue
 
                             data_str = line[6:]
                             if data_str.strip() == "[DONE]":
-                                _log.debug("[STREAM_INT] *** [DONE] received at line %d, chunk %d, loop %d ***", line_count, chunk_count, polling_loop_count)
+                                _debug_log("[STREAM_INT] *** [DONE] received at line %d, chunk %d, loop %d ***", line_count, chunk_count, polling_loop_count)
                                 stream_done = True
                                 break
 
@@ -982,21 +1040,21 @@ class StreamingJSONClient:
                             try:
                                 data = json.loads(data_str)
                             except json.JSONDecodeError as e:
-                                _log.debug("[STREAM_INT] JSON decode error at line %d: %s data=%s", line_count, e, data_str[:100])
+                                _debug_log("[STREAM_INT] JSON decode error at line %d: %s data=%s", line_count, e, data_str[:100])
                                 continue
 
                             if "usage" in data:
                                 usage = self._normalize_openai_usage(data["usage"])
-                                _log.debug("[STREAM_INT] Received usage at line %d: %s", line_count, usage)
+                                _debug_log("[STREAM_INT] Received usage at line %d: %s", line_count, usage)
 
                             # Capture web_search results from response
                             if "web_search" in data:
                                 web_search_data = data["web_search"]
-                                _log.debug("[STREAM_INT] Received web_search data at line %d: %d items", line_count, len(web_search_data) if isinstance(web_search_data, list) else 1)
+                                _debug_log("[STREAM_INT] Received web_search data at line %d: %d items", line_count, len(web_search_data) if isinstance(web_search_data, list) else 1)
 
                             choices = data.get("choices", [])
                             if not choices:
-                                _log.debug("[STREAM_INT] No choices in data at line %d", line_count)
+                                _debug_log("[STREAM_INT] No choices in data at line %d", line_count)
                                 continue
                             choice = choices[0]
                             delta = choice.get("delta", {})
@@ -1030,13 +1088,13 @@ class StreamingJSONClient:
                             if choice.get("finish_reason"):
                                 new_finish_reason = choice["finish_reason"]
                                 if finish_reason != new_finish_reason:
-                                    _log.debug("[STREAM_INT] Finish reason changed at line %d: %s -> %s", line_count, finish_reason, new_finish_reason)
+                                    _debug_log("[STREAM_INT] Finish reason changed at line %d: %s -> %s", line_count, finish_reason, new_finish_reason)
                                 finish_reason = new_finish_reason
 
                             if reasoning:
                                 full_reasoning += reasoning
                                 if line_count % 20 == 0:
-                                    _log.debug("[STREAM_INT] Reasoning accumulated: %d chars at line %d", len(full_reasoning), line_count)
+                                    _debug_log("[STREAM_INT] Reasoning accumulated: %d chars at line %d", len(full_reasoning), line_count)
                                 if on_reasoning:
                                     on_reasoning(reasoning)
 
@@ -1044,16 +1102,16 @@ class StreamingJSONClient:
                                 content_delta_count += 1
                                 full_content += content
                                 if content_delta_count % 20 == 0:
-                                    _log.debug("[STREAM_INT] Content delta #%d: +%d chars, total %d chars at line %d",
+                                    _debug_log("[STREAM_INT] Content delta #%d: +%d chars, total %d chars at line %d",
                                               content_delta_count, len(content), len(full_content), line_count)
                                 if on_content:
                                     on_content(content)
 
                         if stream_done:
-                            _log.debug("[STREAM_INT] Breaking outer polling loop due to [DONE]")
+                            _debug_log("[STREAM_INT] Breaking outer polling loop due to [DONE]")
                             break
 
-                    _log.debug("[STREAM_INT] Polling loop ended. Chunks=%d Lines=%d ContentDeltas=%d FinishReason=%s ContentLen=%d ReasoningLen=%d",
+                    _debug_log("[STREAM_INT] Polling loop ended. Chunks=%d Lines=%d ContentDeltas=%d FinishReason=%s ContentLen=%d ReasoningLen=%d",
                               chunk_count, line_count, content_delta_count, finish_reason, len(full_content), len(full_reasoning))
                 except asyncio.CancelledError:
                     _log.warning("[STREAM_INT] *** CANCELLED ERROR caught - content_len=%d reasoning_len=%d ***",
@@ -1094,8 +1152,11 @@ class StreamingJSONClient:
                           "content_len=%d reasoning_len=%d elapsed=%.1fs usage=%s chunks=%d lines=%d",
                           finish_reason, interrupted, len(full_content),
                           len(full_reasoning), _req_elapsed, usage, chunk_count, line_count)
-                _log.debug("[STREAM_INT] Returning StreamingChatResponse with content_len=%d thinking_len=%d",
+                _debug_log("[STREAM_INT] Returning StreamingChatResponse with content_len=%d thinking_len=%d",
                           len(full_content), len(full_reasoning))
+                debug_path = _get_stream_debug_path()
+                if debug_path:
+                    _stream_debug_write(f"[STREAM_INT] Complete. Debug log: {debug_path}")
                 return StreamingChatResponse(
                     content=full_content,
                     thinking=full_reasoning or None,
@@ -1110,7 +1171,7 @@ class StreamingJSONClient:
                 last_error = e
                 _log.warning("[STREAM_INT] HTTP error %d on attempt %d/%d: %s",
                              e.response.status_code, attempt + 1, max_retries, e)
-                _log.debug("[STREAM_INT] Partial content before error: %d chars", len(full_content) if full_content else 0)
+                _debug_log("[STREAM_INT] Partial content before error: %d chars", len(full_content) if full_content else 0)
                 if e.response.status_code in (429, 500, 502, 503):
                     if attempt < max_retries:
                         wait = min(2 ** (attempt + 1), 60)
@@ -1137,7 +1198,7 @@ class StreamingJSONClient:
                 last_error = e
                 _log.warning("[STREAM_INT] Connection error on attempt %d/%d: %s: %s",
                              attempt + 1, max_retries, type(e).__name__, e)
-                _log.debug("[STREAM_INT] Partial content before error: %d chars", len(full_content) if full_content else 0)
+                _debug_log("[STREAM_INT] Partial content before error: %d chars", len(full_content) if full_content else 0)
                 if attempt < max_retries:
                     wait = min(2 ** (attempt + 1), 60)
                     reason = type(e).__name__
