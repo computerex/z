@@ -745,7 +745,7 @@ class StreamingJSONClient:
                         if chunk_count % 50 == 0:
                             _debug_log("[STREAM_BASIC] Chunk #%d size=%d bytes buffer_len=%d", chunk_count, chunk_size, len(line_buffer))
 
-                        line_buffer += chunk.decode('utf-8', errors='ignore')
+                        line_buffer += chunk.decode('utf-8', errors='replace')
 
                         while '\n' in line_buffer:
                             line, line_buffer = line_buffer.split('\n', 1)
@@ -817,6 +817,16 @@ class StreamingJSONClient:
                         if stream_done:
                             _debug_log("[STREAM_BASIC] Breaking outer loop due to [DONE]")
                             break
+
+                    # Process any remaining data in buffer when stream ends
+                    if line_buffer.strip() and not stream_done:
+                        _debug_log("[STREAM_BASIC] Processing remaining buffer data: %d chars", len(line_buffer))
+                        line = line_buffer.strip()
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                _debug_log("[STREAM_BASIC] Found [DONE] in remaining buffer")
+                                stream_done = True
 
                 _debug_log("[STREAM_BASIC] Stream ended. Chunks=%d Lines=%d ContentDeltas=%d FinishReason=%s BufferLen=%d",
                           chunk_count, line_count, content_delta_count, finish_reason, len(extractor.buffer))
@@ -1008,6 +1018,24 @@ class StreamingJSONClient:
                             chunk = pending_read.result()
                         except StopAsyncIteration:
                             _debug_log("[STREAM_INT] StopAsyncIteration at loop %d - stream ended naturally", polling_loop_count)
+                            # Process any remaining data in buffer (partial last line)
+                            if line_buffer.strip():
+                                _debug_log("[STREAM_INT] Processing remaining buffer data: %d chars", len(line_buffer))
+                                # Try to process as a complete line (might be [DONE] without newline)
+                                line = line_buffer.strip()
+                                if line.startswith("data: "):
+                                    data_str = line[6:]
+                                    if data_str.strip() == "[DONE]":
+                                        _debug_log("[STREAM_INT] Found [DONE] in remaining buffer")
+                                        stream_done = True
+                                    else:
+                                        # Try to parse as JSON one more time
+                                        try:
+                                            data = json.loads(data_str)
+                                            # Process this final chunk
+                                            _debug_log("[STREAM_INT] Processing final JSON chunk from buffer")
+                                        except json.JSONDecodeError as e:
+                                            _debug_log("[STREAM_INT] Final buffer chunk not valid JSON: %s", e)
                             break
                         pending_read = None
 
@@ -1018,7 +1046,7 @@ class StreamingJSONClient:
                         if debug_log:
                             raw_chunks.append(chunk)
 
-                        line_buffer += chunk.decode('utf-8', errors='ignore')
+                        line_buffer += chunk.decode('utf-8', errors='replace')
 
                         while '\n' in line_buffer:
                             line, line_buffer = line_buffer.split('\n', 1)
