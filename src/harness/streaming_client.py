@@ -933,6 +933,13 @@ class StreamingJSONClient:
             payload["thinking"] = {"type": "enabled"}
             payload["tool_stream"] = True
             payload["clear_thinking"] = False
+
+        # OpenRouter: Enable Claude extended thinking pass-through
+        # OpenRouter requires these parameters to expose Claude's thinking content
+        if ("openrouter.ai" in self.base_url.lower()
+                and os.environ.get("HARNESS_ENABLE_NATIVE_THINKING", "1") != "0"):
+            payload["thinking"] = {"type": "enabled", "budget_tokens": 2048}
+            _log.debug("OpenRouter: Enabled Claude extended thinking with budget_tokens=2048")
         
         # Add built-in web search tool if enabled
         if enable_web_search:
