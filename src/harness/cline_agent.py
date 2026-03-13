@@ -1831,23 +1831,40 @@ class ClineAgent:
                             self.console.print()
                             self.console.print(Markdown(display_text))
 
+                    # Check for empty or thinking-only response and auto-retry with guidance
+                    if not display_text or len(display_text) < 20:
+                        thinking_len = len(response.thinking) if response.thinking else 0
+
+                        # Model produced thinking-only or empty response
+                        if thinking_len > 50 or not display_text:
+                            log.warning("Model returned empty response (thinking_len=%d, content_len=%d) - sending guidance nudge",
+                                       thinking_len, len(full_content))
+
+                            # Add the assistant's response (even if empty/thinking-only) to history
+                            self.messages.append(StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(response, "provider_content_blocks", None),
+                            ))
+
+                            # Add a guidance message to nudge the model
+                            guidance_msg = (
+                                "Your previous response was incomplete or contained only internal thinking. "
+                                "Please provide a clear, written response to complete the user's request. "
+                                "If you need to use a tool, emit the appropriate tool call in XML format."
+                            )
+                            self.messages.append(StreamingMessage(role="user", content=guidance_msg))
+                            self.console.print("\n  [dim]→ Model response was empty. Sending guidance nudge...[/dim]\n")
+
+                            # Continue to next iteration to try again
+                            continue
+
                     # No tool call — final response to user
                     self.messages.append(StreamingMessage(
                         role="assistant",
                         content=full_content,
                         provider_blocks=getattr(response, "provider_content_blocks", None),
                     ))
-
-                    # Warn if model produced empty or thinking-only response
-                    if not display_text or len(display_text) < 20:
-                        thinking_len = len(response.thinking) if response.thinking else 0
-                        if thinking_len > 50:
-                            self.console.print("\n  [yellow]⚠[/yellow] [dim]Model sent only thinking content ({} chars) with no actual output.[/dim]")
-                            self.console.print("  [dim]This may indicate the model is stuck or the task is unclear. Try rephrasing your request.[/dim]\n")
-                        elif not display_text:
-                            log.warning("Model returned empty response (thinking_len=%d, content_len=%d)",
-                                       thinking_len, len(full_content))
-
                     return full_content
                 
                 # Execute tool(s) — if multiple calls found, run them all
