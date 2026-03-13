@@ -18,6 +18,28 @@ import sys
 import time
 import traceback
 from logging.handlers import RotatingFileHandler
+
+
+# ── Preventive fix: monkey-patch platform.system() to avoid Windows freezes ──
+# platform.system() can block indefinitely on Windows in certain terminal states.
+# We replace it with sys.platform mapping which is always safe and fast.
+def _safe_platform_system():
+    """Safe replacement for platform.system() that won't block on Windows."""
+    if sys.platform == 'win32':
+        return 'Windows'
+    elif sys.platform == 'darwin':
+        return 'Darwin'
+    else:
+        return 'Linux'
+
+
+# Apply the monkey-patch at module import time (before any other code runs)
+try:
+    import platform as _platform_mod
+    _platform_mod.system = _safe_platform_system
+except Exception:
+    pass  # If platform module isn't available, nothing to patch
+# ────────────────────────────────────────────────────────────────────────────────
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +48,36 @@ from typing import Optional
 _initialized = False
 _log_dir: Optional[Path] = None
 _session_id: Optional[str] = None
+_debug_enabled = False
+
+
+def enable_debug() -> None:
+    """Enable debug mode for stdout debug prints."""
+    global _debug_enabled
+    _debug_enabled = True
+
+
+def is_debug_enabled() -> bool:
+    """Check if debug mode is enabled."""
+    return _debug_enabled
+
+
+def debug_print(msg: str) -> None:
+    """Print debug message to stdout if debug mode is enabled."""
+    if _debug_enabled:
+        try:
+            # Write to file for debugging (works even when stdout is broken)
+            try:
+                debug_log = Path.cwd() / ".harness_output" / "debug.log"
+                debug_log.parent.mkdir(parents=True, exist_ok=True)
+                with open(debug_log, "a", encoding="utf-8") as f:
+                    f.write(f"{msg}\n")
+            except Exception:
+                pass
+            # Also try stdout
+            sys.stdout.write(f"[DEBUG] {msg}\n")
+        except Exception:
+            pass  # Silently fail if stdout is broken
 
 
 def _ensure_log_dir() -> Path:

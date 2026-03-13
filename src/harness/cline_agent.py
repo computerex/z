@@ -1016,6 +1016,12 @@ class ClineAgent:
         self.smart_context = SmartContextManager(self.todo_manager)
         self._last_token_count = 0
         self._initialized = True
+        self.context.clear()
+        self._duplicate_detector.clear()
+        self.todo_manager.clear()
+        self.smart_context = SmartContextManager(self.todo_manager)
+        self._last_token_count = 0
+        self._initialized = True
     
     def get_token_count(self) -> int:
         """Get estimated token count of current conversation."""

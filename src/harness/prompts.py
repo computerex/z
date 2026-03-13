@@ -30,15 +30,21 @@ def load_agent_rules(workspace_path: str) -> str:
 def get_system_prompt(workspace_path: str, shell: Optional[str] = None,
                       project_map: str = "") -> str:
     """Generate a Cline-style system prompt with XML tool formatting.
-    
+
     Args:
         workspace_path: Absolute path to the workspace root.
         shell: Override shell name (auto-detected if None).
         project_map: Pre-built project file index summary to embed.
     """
-    
-    os_name = platform.system()
-    os_version = platform.release()
+    # Use sys.platform instead of platform.system() to avoid potential blocking on Windows
+    import sys as _sys_prompts
+    if _sys_prompts.platform == 'win32':
+        os_name = 'Windows'
+    elif _sys_prompts.platform == 'darwin':
+        os_name = 'Darwin'
+    else:
+        os_name = 'Linux'
+    os_version = "11" if os_name == 'Windows' else "unknown"
     
     if os_name == 'Windows':
         shell = shell or 'PowerShell'
@@ -47,11 +53,11 @@ def get_system_prompt(workspace_path: str, shell: Optional[str] = None,
         shell = shell or os.path.basename(os.environ.get('SHELL', 'bash'))
         home_dir = os.environ.get('HOME', '')
     global_config_path = str(Path(home_dir) / ".z.json") if home_dir else "~/.z.json"
-    
+
     # Load project-level agent rules
     agent_rules = load_agent_rules(workspace_path)
-    
-    return f'''You are Cline, a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
+
+    result = f'''You are Cline, a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
 
 ====
 
@@ -302,3 +308,4 @@ Use this map to navigate directly to files instead of calling list_files on ever
 
 Work iteratively: understand the task, create todos to track steps, gather information, execute step by step. Be direct — no "Great!", no ending with questions. When answering a question, write your full answer as visible text.
 '''
+    return result

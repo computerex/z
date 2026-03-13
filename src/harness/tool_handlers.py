@@ -1330,7 +1330,9 @@ class ToolHandlers:
         with PowerShell syntax (the system prompt advertises PowerShell).
         Set HARNESS_WINDOWS_SHELL=cmd to force legacy cmd.exe behavior.
         """
-        if platform.system() == "Windows":
+        # Use sys.platform instead of platform.system() to avoid potential blocking on Windows
+        import sys as _sys_tool_handlers
+        if _sys_tool_handlers.platform == 'win32':
             win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
             if win_shell != "cmd":
                 # Use EncodedCommand to avoid quote/escape issues through cmd.exe.

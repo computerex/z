@@ -83,7 +83,7 @@ _mark("import_config")
 from harness.cline_agent import ClineAgent
 _mark("import_cline_agent")
 from harness.cost_tracker import get_global_tracker, reset_global_tracker
-from harness.logger import init_logging, get_logger, log_exception, truncate
+from harness.logger import init_logging, get_logger, log_exception, truncate, enable_debug
 _mark("import_harness_core")
 from rich.console import Console
 from rich.panel import Panel
@@ -2085,6 +2085,7 @@ def main():
         default="auto",
         help="Policy replay embedding backend: auto | semantic_scorer | hash | hf:<model-id>",
     )
+    parser.add_argument("--debug", "-d", action="store_true", help="Enable debug mode with verbose logging")
     args = parser.parse_args()
     
     # Install mode - run setup wizard
@@ -2144,6 +2145,8 @@ def main():
     # Initialise logging FIRST so every subsequent action is captured
     _mark("pre_init_logging")
     init_logging(workspace=workspace, session_id=args.session)
+    if args.debug:
+        enable_debug()
     _mark("init_logging")
     log.info("=== Harness starting === workspace=%s session=%s new=%s",
              workspace, args.session, args.new)
