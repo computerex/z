@@ -358,7 +358,13 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         if end == -1 or end < start:
             continue
         value = inner[start + len(open_tag):end]
-        value = value.strip('\n')
+        # Only strip leading/trailing newlines for complex content, preserve internal structure
+        if param_name in complex_param_names:
+            # For complex content like file content, preserve internal structure but clean edges
+            value = value.strip('\n')
+        else:
+            # For simple params, strip all whitespace
+            value = value.strip()
         params[param_name] = value
     
     return ParsedToolCall(name=tool_name, parameters=params)
@@ -422,10 +428,9 @@ class ClineAgent:
         self.workspace_path = str(Path.cwd().resolve())
         self.cost_tracker = get_global_tracker()
         
-        # Reasoning mode switching
+        # Provider management and Claude CLI config
         self.providers = providers or {}
         self.claude_cli_config = claude_cli_config or {}
-        self.reasoning_mode = "normal"  # default boot mode
         
         # Conversation history
         self.messages: List[StreamingMessage] = []
@@ -732,29 +737,6 @@ class ClineAgent:
         )
         return result
     
-    def _handle_set_reasoning_mode(self, params: Dict[str, str]) -> str:
-        """Switch the underlying LLM provider based on reasoning mode."""
-        mode = (params.get("mode") or "").strip().lower()
-        if mode not in ("fast", "normal"):
-            return f"Error: mode must be 'fast' or 'normal'. Got '{mode}'."
-        
-        provider = self.providers.get(mode)
-        if not provider:
-            available = list(self.providers.keys()) or ["(none configured)"]
-            return f"Error: provider '{mode}' not configured in models.json. Available: {available}"
-        
-        old_mode = self.reasoning_mode
-        if old_mode == mode:
-            return f"Already in '{mode}' mode (model: {provider['model']})."
-        
-        self.reasoning_mode = mode
-        self.config = Config(
-            api_url=provider["api_url"],
-            api_key=provider["api_key"],
-            model=provider["model"],
-        )
-        log.info("Reasoning mode changed: %s -> %s (model: %s)", old_mode, mode, provider["model"])
-        return f"Reasoning mode changed: {old_mode} -> {mode} (model: {provider['model']})"
     
     def _handle_update_agent_rules(self, params: Dict[str, str]) -> str:
         """Append a rule/preference to the workspace agent.md file."""
@@ -1203,8 +1185,8 @@ class ClineAgent:
             log_input = user_content
         else:
             log_input = user_label or "[multimodal message]"
-        log.info("agent.run START reasoning_mode=%s interrupt=%s msg_count=%d input=%s",
-                 self.reasoning_mode, enable_interrupt, len(self.messages),
+        log.info("agent.run START interrupt=%s msg_count=%d input=%s",
+                 enable_interrupt, len(self.messages),
                  log_truncate(log_input, 150))
         
         # Initialize system prompt if first run
@@ -1237,11 +1219,10 @@ class ClineAgent:
         
         try:
             result = await self._run_loop()
-            log.info("agent.run DONE reasoning_mode=%s result_len=%d",
-                     self.reasoning_mode, len(result or ""))
+            log.info("agent.run DONE result_len=%d", len(result or ""))
             return result
         except Exception as exc:
-            log_exception(log, f"agent.run FAILED reasoning_mode={self.reasoning_mode}", exc)
+            log_exception(log, "agent.run FAILED", exc)
             raise
         finally:
             self.status.clear()
@@ -1293,12 +1274,12 @@ class ClineAgent:
             _hidden_only_retry_count = 0
             _hidden_only_retry_max = 2
             for iteration in range(self.max_iterations):
-                # (Re)create client if config changed (e.g. after set_reasoning_mode)
+                # (Re)create client if needed
                 await _ensure_client()
                 _, max_allowed = get_model_limits(self.config.model)
 
-                log.debug("_run_loop iteration=%d/%d reasoning_mode=%s tokens=%d msgs=%d",
-                          iteration + 1, self.max_iterations, self.reasoning_mode,
+                log.debug("_run_loop iteration=%d/%d tokens=%d msgs=%d",
+                          iteration + 1, self.max_iterations,
                           estimate_messages_tokens(self.messages), len(self.messages))
                 self.status.set_iterations(iteration + 1, self.max_iterations)
                 
@@ -1856,6 +1837,17 @@ class ClineAgent:
                         content=full_content,
                         provider_blocks=getattr(response, "provider_content_blocks", None),
                     ))
+
+                    # Warn if model produced empty or thinking-only response
+                    if not display_text or len(display_text) < 20:
+                        thinking_len = len(response.thinking) if response.thinking else 0
+                        if thinking_len > 50:
+                            self.console.print("\n  [yellow]⚠[/yellow] [dim]Model sent only thinking content ({} chars) with no actual output.[/dim]")
+                            self.console.print("  [dim]This may indicate the model is stuck or the task is unclear. Try rephrasing your request.[/dim]\n")
+                        elif not display_text:
+                            log.warning("Model returned empty response (thinking_len=%d, content_len=%d)",
+                                       thinking_len, len(full_content))
+
                     return full_content
                 
                 # Execute tool(s) — if multiple calls found, run them all
@@ -1891,20 +1883,6 @@ class ClineAgent:
                     else:
                         tool_results_combined.append(tc_result)
                     
-                    # If reasoning mode just changed, the remaining tool calls
-                    # were generated by the OLD model — discard them and let
-                    # the new model decide what to do next.
-                    if tc.name == "set_reasoning_mode" and "changed" in tc_result:
-                        remaining = len(all_tool_calls) - tc_idx - 1
-                        if remaining > 0:
-                            log.info("Mode switched mid-batch — discarding %d remaining tool calls from old model", remaining)
-                            self.console.print(f"[dim][!] Mode switched — re-planning with new model ({remaining} queued calls discarded)[/dim]")
-                            tool_results_combined.append(
-                                f"[SYSTEM: Reasoning mode changed. {remaining} tool call(s) from the previous model were discarded. "
-                                f"You are now running on the new model. Re-assess what to do next.]"
-                            )
-                        _mode_switched = True
-                        break
                 
                 tool_result = "\n\n".join(tool_results_combined)
 
@@ -2109,10 +2087,6 @@ class ClineAgent:
                 self.console.print(f"  [dim]•[/dim] [cyan]List processes[/cyan]")
                 result = await self.tool_handlers.list_background_processes(tool.parameters)
             
-            elif tool.name == "set_reasoning_mode":
-                mode = tool.parameters.get("mode", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Mode[/yellow] [dim]→ {mode}[/dim]")
-                result = self._handle_set_reasoning_mode(tool.parameters)
                 
             elif tool.name == "create_plan":
                 prompt = tool.parameters.get("prompt", "")

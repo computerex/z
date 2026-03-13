@@ -47,15 +47,24 @@ class ToolDef:
 TOOL_DEFS: List[ToolDef] = [
     # --- File operations ---
     ToolDef("read_file",       category="file",
+            description="Reads a file from the local filesystem. You can access any file directly. "
+                        "Read before editing. Use start_line/end_line for large files.",
             params=[ToolParam("path", required=True),
                     ToolParam("start_line"), ToolParam("end_line")]),
     ToolDef("write_to_file",   category="file", complex_content=True,
+            description="Writes a file to the local filesystem. Use for creating NEW files. "
+                        "Prefer replace_in_file for modifying existing files. "
+                        "MUST read existing files before overwriting.",
             params=[ToolParam("path", required=True),
                     ToolParam("content", required=True)]),
     ToolDef("replace_in_file", category="file", complex_content=True,
+            description="Performs exact string replacements in files using SEARCH/REPLACE blocks. "
+                        "You MUST read the file first. SEARCH must match EXACTLY.",
             params=[ToolParam("path", required=True),
                     ToolParam("diff", required=True)]),
     ToolDef("replace_between_anchors", category="file", complex_content=True,
+            description="Replace everything BETWEEN two exact anchor strings in an existing file. "
+                        "Use when replace_in_file is brittle (delimiter collisions, large corrupted regions).",
             params=[ToolParam("path", required=True),
                     ToolParam("start_anchor", required=True),
                     ToolParam("end_anchor", required=True),
@@ -63,61 +72,93 @@ TOOL_DEFS: List[ToolDef] = [
 
     # --- Shell / process ---
     ToolDef("execute_command",          category="shell",
+            description="Executes a given shell command and returns its output. "
+                        "Avoid using for find/grep/cat/sed — use dedicated tools instead. "
+                        "Use background=true for servers and long-running processes.",
             params=[ToolParam("command", required=True),
                     ToolParam("background")]),
-    ToolDef("list_background_processes", category="shell"),
+    ToolDef("list_background_processes", category="shell",
+            description="List all background processes (ID, PID, status, elapsed, command)."),
     ToolDef("check_background_process", category="shell",
+            description="Check status and recent logs of a background process. "
+                        "Don't poll in a loop — check once, do other work, check later.",
             params=[ToolParam("id", required=True), ToolParam("lines")]),
     ToolDef("stop_background_process",  category="shell",
+            description="Terminate a background process. ONLY use when the user explicitly asks.",
             params=[ToolParam("id", required=True)]),
 
     # --- Search / exploration ---
     ToolDef("list_files",   category="search",
+            description="Fast file listing tool that works with any codebase size. "
+                        "Use this tool when you need to find files by directory structure.",
             params=[ToolParam("path", required=True), ToolParam("recursive")]),
     ToolDef("search_files", category="search",
+            description="A powerful content search tool built on ripgrep. "
+                        "ALWAYS use this for content search tasks. NEVER invoke grep or rg "
+                        "as an execute_command command. Supports full regex syntax.",
             params=[ToolParam("path", required=True),
                     ToolParam("regex", required=True),
                     ToolParam("file_pattern")]),
 
     # --- External / vision / web ---
     ToolDef("analyze_image", category="external",
+            description="Analyze an image file (jpg, png, gif, webp) using a vision model.",
             params=[ToolParam("path", required=True), ToolParam("question")]),
     ToolDef("web_search",    category="external",
+            description="Search the web for real-time information. Use for up-to-date information "
+                        "that might not be available in training data.",
             params=[ToolParam("query", required=True), ToolParam("count")]),
     ToolDef("mcp_search_tools", category="external",
+            description="Semantically search tools exposed by a configured MCP server. "
+                        "Use this FIRST when you do not know the exact tool name.",
             params=[ToolParam("server", required=True),
                     ToolParam("query", required=True),
                     ToolParam("limit")]),
     ToolDef("mcp_list_tools", category="external",
+            description="List all tools exposed by a configured MCP server, "
+                        "including required fields. Use to confirm tool input schema before calling.",
             params=[ToolParam("server", required=True)]),
     ToolDef("mcp_call_tool", category="external", complex_content=True,
+            description="Call a specific tool on a configured MCP server. "
+                        "Always invoke MCP tools via this tool, not as direct XML tags.",
             params=[ToolParam("server", required=True),
                     ToolParam("tool", required=True),
                     ToolParam("arguments", required=True)]),
 
     # --- Context management ---
-    ToolDef("list_context",        category="context"),
+    ToolDef("list_context",        category="context",
+            description="List all items currently loaded in the working context."),
     ToolDef("remove_from_context", category="context",
+            description="Remove items from the working context by ID or source.",
             params=[ToolParam("id"), ToolParam("source")]),
     ToolDef("retrieve_tool_result", category="context",
+            description="Retrieve a stored tool result by its ID. Use this to access "
+                       "the output of previous tool executions that have been stored in the context. "
+                       "Provide the result_id to get the complete tool output and metadata.",
             params=[ToolParam("result_id", required=True,
                     description="The ID of the stored tool result (e.g., res_abc123_456)")]),
 
     # --- Agent meta ---
     ToolDef("manage_todos",     category="agent",
+            description="Track goals and progress with a structured task list. "
+                        "Persists across context compaction — your permanent memory. "
+                        "For complex tasks: break into todos FIRST.",
             params=[ToolParam("action", required=True),
                     ToolParam("id"), ToolParam("title"),
                     ToolParam("description"), ToolParam("status"),
                     ToolParam("parent_id"), ToolParam("notes"),
                     ToolParam("context_refs")]),
-    ToolDef("set_reasoning_mode", category="agent",
-            params=[ToolParam("mode", required=True)]),
     ToolDef("create_plan",        category="agent",
+            description="Delegate complex reasoning to a planning sub-agent with full tool access. "
+                        "Expensive — only for hard architectural decisions or difficult debugging.",
             params=[ToolParam("prompt", required=True)]),
     ToolDef("update_agent_rules", category="agent",
+            description="Append a rule/preference to the workspace agent.md file.",
             params=[ToolParam("rule", required=True),
                     ToolParam("category")]),
     ToolDef("introspect",          category="agent",
+            description="Dedicated deep-thinking tool. Makes a separate API call with no tools "
+                        "available so the model can reason freely.",
             params=[ToolParam("focus")]),
 ]
 

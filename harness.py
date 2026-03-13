@@ -391,12 +391,10 @@ def _get_legacy_global_models_path() -> Path:
     return Path.home() / ".z" / "models.json"
 
 
-def load_providers(workspace: str) -> Dict[str, dict]:
-    """Load provider configs from ~/.z.json (single-file config).
 
-    Supports both old key names (low/orchestrator) and new (fast/normal).
-    Migrates providers from legacy ~/.z.json on first read.
-    """
+
+def load_providers(workspace: str) -> Dict[str, dict]:
+    """Load provider configs from ~/.z.json (single-file config)."""
     import json
 
     cfg_path = _get_global_config_path()
@@ -422,12 +420,6 @@ def load_providers(workspace: str) -> Dict[str, dict]:
                     cfg_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except Exception:
                 pass
-
-    # Normalise old key names
-    if "low" in providers and "fast" not in providers:
-        providers["fast"] = providers.pop("low")
-    if "orchestrator" in providers and "normal" not in providers:
-        providers["normal"] = providers.pop("orchestrator")
 
     return providers
 
@@ -2202,7 +2194,7 @@ def main():
         claude_cli_config=claude_cli_config,
     )
     _mark("agent_created")
-    log.info("Agent created: reasoning_mode=%s", agent.reasoning_mode)
+    log.info("Agent created")
     
     # Session management
     current_session = args.session

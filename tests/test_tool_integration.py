@@ -606,47 +606,6 @@ class TestToolDispatch:
         assert "Error" in result
         assert "Unknown action" in result
 
-    def test_dispatch_set_reasoning_mode(self):
-        """set_reasoning_mode should change the agent's reasoning mode."""
-        agent = self._make_agent()
-        # Set up providers so mode switching works
-        agent.providers = {
-            "fast": {"api_url": "http://fast.invalid", "api_key": "fk", "model": "fast-model"},
-            "normal": {"api_url": "http://normal.invalid", "api_key": "nk", "model": "normal-model"},
-        }
-        assert agent.reasoning_mode == "normal"
-        
-        tool = ParsedToolCall(
-            name="set_reasoning_mode",
-            parameters={"mode": "fast"},
-        )
-        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
-        assert "fast" in result
-        assert agent.reasoning_mode == "fast"
-        assert agent.config.model == "fast-model"
-    
-    def test_dispatch_set_reasoning_mode_invalid(self):
-        """Invalid mode should return an error."""
-        agent = self._make_agent()
-        tool = ParsedToolCall(
-            name="set_reasoning_mode",
-            parameters={"mode": "ultra"},
-        )
-        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
-        assert "Error" in result
-    
-    def test_dispatch_set_reasoning_mode_already_set(self):
-        """Switching to current mode should return 'already in' message."""
-        agent = self._make_agent()
-        agent.providers = {
-            "normal": {"api_url": "http://n.invalid", "api_key": "k", "model": "m"},
-        }
-        tool = ParsedToolCall(
-            name="set_reasoning_mode",
-            parameters={"mode": "normal"},
-        )
-        result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
-        assert "Already" in result
 
     def test_dispatch_execute_command_missing_command_param(self):
         """Malformed execute_command without <command> should be rejected."""
@@ -656,8 +615,7 @@ class TestToolDispatch:
             parameters={},
         )
         result = asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool))
-        assert "Error: malformed <execute_command> call" in result
-        assert "missing required parameter(s): command" in result
+        assert "Error: execute_command requires a non-empty <command> parameter" in result
 
 
 # ============================================================
@@ -936,7 +894,7 @@ class TestPromptIntegration:
             "execute_command", "list_files", "search_files",
             "web_search", "list_context", "remove_from_context",
             "manage_todos",
-            "set_reasoning_mode", "create_plan",
+            "create_plan",
         ]
         for tool in required_tools:
             assert f"## {tool}" in prompt, f"System prompt missing tool definition: {tool}"
@@ -953,18 +911,19 @@ class TestPromptIntegration:
         from harness.prompts import get_system_prompt
         prompt = get_system_prompt("/test/workspace")
         
-        # Extract ## tool_name from prompt
-        prompt_tools = set(re.findall(r'^## (\w+)', prompt, re.MULTILINE))
+        # Extract ## tool_name from prompt (exclude section headers like "When")
+        prompt_tools = set(re.findall(r'^## ([a-z_][a-z0-9_]*)', prompt, re.MULTILINE))
         
         # These tools are defined in parse_xml_tool
         parser_tools = {
-            'read_file', 'write_to_file', 'replace_in_file',
+            'read_file', 'write_to_file', 'replace_in_file', 'replace_between_anchors',
             'execute_command', 'list_files', 'search_files',
             'check_background_process', 'stop_background_process', 
             'list_background_processes',
             'list_context', 'remove_from_context', 'analyze_image', 
-            'web_search', 'manage_todos',
-            'set_reasoning_mode', 'create_plan', 'update_agent_rules',
+            'web_search', 'manage_todos', 'retrieve_tool_result',
+            'mcp_search_tools', 'mcp_list_tools', 'mcp_call_tool',
+            'create_plan', 'update_agent_rules', 'introspect',
         }
         
         # Every tool in the prompt should be parseable
@@ -1085,77 +1044,11 @@ class TestContextDump:
 
 
 # ============================================================
-# Reasoning Mode Tests
+# XML Parsing Tests
 # ============================================================
 
-class TestSetReasoningMode:
-    """Test the set_reasoning_mode tool and mode switching."""
-
-    def _make_agent(self):
-        config = Config(
-            api_url="http://normal.invalid",
-            api_key="normal-key",
-            model="normal-model",
-        )
-        providers = {
-            "fast": {"api_url": "http://fast.invalid", "api_key": "fast-key", "model": "fast-model"},
-            "normal": {"api_url": "http://normal.invalid", "api_key": "normal-key", "model": "normal-model"},
-        }
-        agent = ClineAgent(config=config, max_iterations=1, providers=providers)
-        return agent
-
-    def test_default_mode_is_normal(self):
-        agent = self._make_agent()
-        assert agent.reasoning_mode == "normal"
-
-    def test_switch_to_fast(self):
-        agent = self._make_agent()
-        result = agent._handle_set_reasoning_mode({"mode": "fast"})
-        assert "fast" in result
-        assert agent.reasoning_mode == "fast"
-        assert agent.config.model == "fast-model"
-        assert agent.config.api_url == "http://fast.invalid"
-
-    def test_switch_back_to_normal(self):
-        agent = self._make_agent()
-        agent._handle_set_reasoning_mode({"mode": "fast"})
-        result = agent._handle_set_reasoning_mode({"mode": "normal"})
-        assert "normal" in result
-        assert agent.reasoning_mode == "normal"
-        assert agent.config.model == "normal-model"
-
-    def test_invalid_mode_returns_error(self):
-        agent = self._make_agent()
-        result = agent._handle_set_reasoning_mode({"mode": "turbo"})
-        assert "Error" in result
-        assert agent.reasoning_mode == "normal"  # unchanged
-
-    def test_already_in_mode(self):
-        agent = self._make_agent()
-        result = agent._handle_set_reasoning_mode({"mode": "normal"})
-        assert "Already" in result
-
-    def test_no_provider_configured(self):
-        config = Config(api_url="http://test.invalid", api_key="k", model="m")
-        agent = ClineAgent(config=config, max_iterations=1, providers={})
-        result = agent._handle_set_reasoning_mode({"mode": "fast"})
-        assert "Error" in result
-        assert "not configured" in result
-
-
-class TestParseReasoningModeXml:
-    """Test that parse_xml_tool correctly handles set_reasoning_mode and create_plan XML."""
-
-    def test_parse_set_reasoning_mode(self):
-        content = """I'll switch to fast mode for bulk file reads.
-
-<set_reasoning_mode>
-<mode>fast</mode>
-</set_reasoning_mode>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "set_reasoning_mode"
-        assert result.parameters["mode"] == "fast"
+class TestParseCreatePlanXml:
+    """Test that parse_xml_tool correctly handles create_plan XML."""
 
     def test_parse_create_plan(self):
         content = """This requires deep reasoning. Let me delegate to Claude.
