@@ -1576,6 +1576,8 @@ class ClineAgent:
                     """Handle a (possibly multi-char) streaming chunk."""
                     nonlocal full_content, first_token, _payload_next_report, _payload_announced
                     full_content += chunk
+                    if len(full_content) % 5000 == 0:
+                        log.debug("on_chunk: accumulated content_len=%d chunk_len=%d", len(full_content), len(chunk))
                     _stream_process_chunk(chunk)
                     if first_token:
                         # If native reasoning already started, don't repaint the
@@ -1641,6 +1643,8 @@ class ClineAgent:
                     if not chunk:
                         return
                     full_reasoning += chunk
+                    if len(full_reasoning) % 3000 == 0:
+                        log.debug("on_reasoning: accumulated reasoning_len=%d chunk_len=%d", len(full_reasoning), len(chunk))
                     if not _thinking_started and not chunk.strip():
                         return
                     if not _thinking_started:
@@ -1685,6 +1689,10 @@ class ClineAgent:
                 log.info("API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d reasoning_len=%d",
                          response.finish_reason, response.interrupted, api_elapsed,
                          len(full_content), len(full_reasoning))
+                log.debug("Response object details: raw_json_len=%s thinking_len=%s usage=%s",
+                          len(response.raw_json) if response.raw_json else 0,
+                          len(response.thinking) if response.thinking else 0,
+                          response.usage)
 
                 _sf_flush()  # Flush any trailing buffered content
                 _stream_emit_payload_line(force=True)
