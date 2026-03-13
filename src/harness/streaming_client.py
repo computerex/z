@@ -780,6 +780,28 @@ class StreamingJSONClient:
                                 delta.get("reasoning_content", "")
                                 or delta.get("reasoning", "")
                             )
+
+                            # Handle content parts (OpenRouter, Anthropic native format)
+                            if isinstance(content, list):
+                                # Content parts may include text, thinking, images, etc.
+                                text_parts = []
+                                thinking_parts = []
+                                for part in content:
+                                    if isinstance(part, dict):
+                                        part_type = part.get("type")
+                                        part_text = part.get("text", "")
+
+                                        if part_type == "thinking":
+                                            # Claude extended thinking content
+                                            thinking_parts.append(part_text)
+                                        elif part_type == "text" or part_type is None:
+                                            # Regular text content
+                                            text_parts.append(part_text)
+                                        # Other types (images, etc.) are ignored for now
+
+                                content = "".join(text_parts)
+                                if thinking_parts:
+                                    reasoning = reasoning + "".join(thinking_parts)
                             if not reasoning:
                                 rd_full = self._extract_reasoning_details_text(delta.get("reasoning_details"))
                                 if not rd_full:
@@ -1094,19 +1116,32 @@ class StreamingJSONClient:
                             choice = choices[0]
                             delta = choice.get("delta", {})
                             content = delta.get("content", "")
-                            if isinstance(content, list):
-                                # OpenRouter/other providers may emit content parts.
-                                joined = []
-                                for part in content:
-                                    if isinstance(part, dict):
-                                        txt = part.get("text")
-                                        if isinstance(txt, str):
-                                            joined.append(txt)
-                                content = "".join(joined)
                             reasoning = (
                                 delta.get("reasoning_content", "")
                                 or delta.get("reasoning", "")
                             )
+
+                            # Handle content parts (OpenRouter, Anthropic native format)
+                            if isinstance(content, list):
+                                # Content parts may include text, thinking, images, etc.
+                                text_parts = []
+                                thinking_parts = []
+                                for part in content:
+                                    if isinstance(part, dict):
+                                        part_type = part.get("type")
+                                        part_text = part.get("text", "")
+
+                                        if part_type == "thinking":
+                                            # Claude extended thinking content
+                                            thinking_parts.append(part_text)
+                                        elif part_type == "text" or part_type is None:
+                                            # Regular text content
+                                            text_parts.append(part_text)
+                                        # Other types (images, etc.) are ignored for now
+
+                                content = "".join(text_parts)
+                                if thinking_parts:
+                                    reasoning = reasoning + "".join(thinking_parts)
                             if not reasoning:
                                 rd_full = self._extract_reasoning_details_text(delta.get("reasoning_details"))
                                 if not rd_full:
