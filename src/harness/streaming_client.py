@@ -676,20 +676,22 @@ class StreamingJSONClient:
                     "POST", url, headers=self._get_headers(), json=payload
                 ) as response:
                     response.raise_for_status()
-                    
+
                     line_buffer = ""
+                    stream_done = False
                     async for chunk in response.aiter_bytes():
                         line_buffer += chunk.decode('utf-8', errors='ignore')
-                        
+
                         while '\n' in line_buffer:
                             line, line_buffer = line_buffer.split('\n', 1)
                             line = line.strip()
-                            
+
                             if not line or not line.startswith("data: "):
                                 continue
-                            
+
                             data_str = line[6:]
                             if data_str.strip() == "[DONE]":
+                                stream_done = True
                                 break
                             
                             try:
@@ -731,7 +733,10 @@ class StreamingJSONClient:
                             
                             if content:
                                 extractor.feed(content, on_content)
-                
+
+                        if stream_done:
+                            break
+
                 # Parse final result
                 result = StreamingChatResponse(raw_json=extractor.buffer, usage=usage, finish_reason=finish_reason)
                 parsed = extractor.get_json()
@@ -862,6 +867,7 @@ class StreamingJSONClient:
                     response.raise_for_status()
                     
                     line_buffer = ""
+                    stream_done = False
                     # Use polling loop instead of 'async for' so we can
                     # check for interrupt every 300ms even when the server
                     # is slow to emit tokens (e.g. during initial thinking).
@@ -910,6 +916,7 @@ class StreamingJSONClient:
                             
                             data_str = line[6:]
                             if data_str.strip() == "[DONE]":
+                                stream_done = True
                                 break
                             
                             try:
@@ -968,6 +975,9 @@ class StreamingJSONClient:
                                 full_content += content
                                 if on_content:
                                     on_content(content)
+
+                        if stream_done:
+                            break
                 except asyncio.CancelledError:
                     interrupted = True
                     finish_reason = "interrupted"
