@@ -98,51 +98,20 @@ def sanitize_terminal_output(text: str) -> str:
     return text
 
 
-_PS_CLIXML_STR_RE = re.compile(r'<S(?:\s+S="[^"]+")?>(.*?)</S>')
+_PS_CLIXML_STR_RE = re.compile(r'<S(?:\s+S="[^"]+")?>(.*?)</S>', re.DOTALL)
 _PS_CLIXML_HEX_ESCAPE_RE = re.compile(r'_x([0-9A-Fa-f]{4})_')
-
-# Tokenizer for rewriting bash && / || into PowerShell 5.1 compatible forms.
-# We tokenize the command string so we don't accidentally rewrite operators
-# that appear inside single- or double-quoted strings.
-_PS_TOKEN_RE = re.compile(
-    r"('(?:[^'\\]|\\.)*')"   # single-quoted string
-    r'|("(?:[^"\\]|\\.)*")'  # double-quoted string
-    r'|( && )'               # bash AND operator (with spaces)
-    r'|( \|\| )'             # bash OR operator (with spaces)
-    r'|([^ \|&\'"]+)'         # other non-operator token
-    r'|(.)'                  # any other single char
+# Match an entire CLIXML block: #< CLIXML\n<Objs ...>...</Objs>
+_PS_CLIXML_BLOCK_RE = re.compile(
+    r'#< CLIXML\s*\n\s*<Objs[^>]*>.*?</Objs>',
+    re.DOTALL,
 )
 
 
-def _rewrite_bash_operators_for_ps5(command: str) -> str:
-    """Rewrite bash-style && and || operators to PowerShell 5.1 equivalents.
-
-    PowerShell 5.1 does not support && or || as pipeline chain operators
-    (those were added in PowerShell 7). This function converts:
-      cmd1 && cmd2   →  cmd1; if ($?) { cmd2 }
-      cmd1 || cmd2   →  cmd1; if (-not $?) { cmd2 }
-    while leaving operators that appear inside quoted strings untouched.
-    """
-    parts = []
-    for m in _PS_TOKEN_RE.finditer(command):
-        sq, dq, and_op, or_op, other, misc = m.groups()
-        if and_op:
-            parts.append("; if ($?) { ")
-        elif or_op:
-            parts.append("; if (-not $?) { ")
-        else:
-            parts.append(m.group(0))
-
-    result = "".join(parts)
-    # Close any opened braces: count how many { we added vs }
-    open_braces = result.count("{ ") - result.count(" }")
-    if open_braces > 0:
-        result = result + " }" * open_braces
-    return result
-
-
 def _decode_powershell_clixml(text: str) -> str:
-    """Best-effort decode of PowerShell CLIXML error/progress output to plain text."""
+    """Best-effort decode of PowerShell CLIXML error/progress output to plain text.
+
+    Handles both single-line fragments and multi-line CLIXML blocks.
+    """
     if not text:
         return text
     t = text
@@ -159,6 +128,21 @@ def _decode_powershell_clixml(text: str) -> str:
     decoded = html.unescape(decoded)
     decoded = _PS_CLIXML_HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), decoded)
     return decoded.strip("\r\n")
+
+
+def _decode_clixml_in_text(text: str) -> str:
+    """Replace all CLIXML blocks in *text* with their decoded plain-text form.
+
+    Non-CLIXML content passes through unchanged.  This is the main entry point
+    for cleaning up raw log files that may contain a mix of normal output and
+    CLIXML error/progress fragments.
+    """
+    if not text or "CLIXML" not in text:
+        return text
+    return _PS_CLIXML_BLOCK_RE.sub(
+        lambda m: _decode_powershell_clixml(m.group(0)),
+        text,
+    )
 
 
 
@@ -1369,8 +1353,6 @@ class ToolHandlers:
         if platform.system() == "Windows":
             win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
             if win_shell != "cmd":
-                # Rewrite bash-style && / || to PS5-compatible forms before encoding.
-                command = _rewrite_bash_operators_for_ps5(command)
                 # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
                 ps_command = "$ProgressPreference='SilentlyContinue'; " + command
                 encoded = base64.b64encode(ps_command.encode("utf-16le")).decode("ascii")
@@ -1397,6 +1379,9 @@ class ToolHandlers:
                 new_data = f.read()
                 new_pos = f.tell()
             if new_data:
+                # Decode any CLIXML blocks before splitting into lines so
+                # multi-line XML fragments are cleaned up as a unit.
+                new_data = _decode_clixml_in_text(new_data)
                 for line in new_data.splitlines():
                     decoded_line = _decode_powershell_clixml(line)
                     if not decoded_line.strip():
@@ -1418,7 +1403,8 @@ class ToolHandlers:
         """Read the entire contents of a log file."""
         try:
             raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
-            decoded = _decode_powershell_clixml(raw)
+            cleaned = _decode_clixml_in_text(raw)
+            decoded = _decode_powershell_clixml(cleaned)
             return decoded or raw
         except Exception:
             return ""
@@ -1629,6 +1615,7 @@ class ToolHandlers:
         initial_output = []
         try:
             data = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            data = _decode_clixml_in_text(data)
             initial_output = data.splitlines()[-10:]
             for line in initial_output:
                 safe_line = sanitize_terminal_output(line)
