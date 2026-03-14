@@ -101,6 +101,45 @@ def sanitize_terminal_output(text: str) -> str:
 _PS_CLIXML_STR_RE = re.compile(r'<S(?:\s+S="[^"]+")?>(.*?)</S>')
 _PS_CLIXML_HEX_ESCAPE_RE = re.compile(r'_x([0-9A-Fa-f]{4})_')
 
+# Tokenizer for rewriting bash && / || into PowerShell 5.1 compatible forms.
+# We tokenize the command string so we don't accidentally rewrite operators
+# that appear inside single- or double-quoted strings.
+_PS_TOKEN_RE = re.compile(
+    r"('(?:[^'\\]|\\.)*')"   # single-quoted string
+    r'|("(?:[^"\\]|\\.)*")'  # double-quoted string
+    r'|( && )'               # bash AND operator (with spaces)
+    r'|( \|\| )'             # bash OR operator (with spaces)
+    r'|([^ \|&\'"]+)'         # other non-operator token
+    r'|(.)'                  # any other single char
+)
+
+
+def _rewrite_bash_operators_for_ps5(command: str) -> str:
+    """Rewrite bash-style && and || operators to PowerShell 5.1 equivalents.
+
+    PowerShell 5.1 does not support && or || as pipeline chain operators
+    (those were added in PowerShell 7). This function converts:
+      cmd1 && cmd2   →  cmd1; if ($?) { cmd2 }
+      cmd1 || cmd2   →  cmd1; if (-not $?) { cmd2 }
+    while leaving operators that appear inside quoted strings untouched.
+    """
+    parts = []
+    for m in _PS_TOKEN_RE.finditer(command):
+        sq, dq, and_op, or_op, other, misc = m.groups()
+        if and_op:
+            parts.append("; if ($?) { ")
+        elif or_op:
+            parts.append("; if (-not $?) { ")
+        else:
+            parts.append(m.group(0))
+
+    result = "".join(parts)
+    # Close any opened braces: count how many { we added vs }
+    open_braces = result.count("{ ") - result.count(" }")
+    if open_braces > 0:
+        result = result + " }" * open_braces
+    return result
+
 
 def _decode_powershell_clixml(text: str) -> str:
     """Best-effort decode of PowerShell CLIXML error/progress output to plain text."""
@@ -1330,6 +1369,8 @@ class ToolHandlers:
         if platform.system() == "Windows":
             win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
             if win_shell != "cmd":
+                # Rewrite bash-style && / || to PS5-compatible forms before encoding.
+                command = _rewrite_bash_operators_for_ps5(command)
                 # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
                 ps_command = "$ProgressPreference='SilentlyContinue'; " + command
                 encoded = base64.b64encode(ps_command.encode("utf-16le")).decode("ascii")

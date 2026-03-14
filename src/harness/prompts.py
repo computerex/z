@@ -232,8 +232,7 @@ While execute_command can do similar things, it's better to use the built-in too
  - Commands >120s are auto-backgrounded. Large outputs are spilled to .harness_output/ — use read_file to inspect.
  - Use background=true for servers and long-running processes. You do not need to use '&' at the end of the command when using this parameter.
  - When issuing multiple commands:
-  - If the commands depend on each other and must run sequentially, use a single execute_command call with '&&' to chain them together.
-  - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail.
+  - If the commands depend on each other and must run sequentially, use a single execute_command call with ';' to chain them (PowerShell 5 does not support '&&'). The harness automatically stops on failure.
   - DO NOT use newlines to separate commands (newlines are ok in quoted strings).
  - For git commands:
   - Prefer to create a new commit rather than amending an existing commit.
