@@ -17,13 +17,13 @@ import psutil
 
 from .context_management import truncate_file_content, truncate_output
 from .logger import get_logger, log_exception, truncate as log_truncate
+from .streaming_client import desanitize_think_tokens
 
 try:
     from mcp import ClientSession, StdioServerParameters  # type: ignore
     from mcp.client.stdio import stdio_client  # type: ignore
     from mcp.client.streamable_http import streamablehttp_client  # type: ignore
     from mcp.client.sse import sse_client  # type: ignore
-
     HAS_MCP_SDK = True
 except Exception:
     ClientSession = None
@@ -38,7 +38,7 @@ log = get_logger("tools")
 
 def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
     """Kill a process and all its descendants, cross-platform.
-
+    
     Uses psutil to walk the process tree and kill children first,
     then the parent. Works on Windows, Linux, and macOS.
     """
@@ -46,27 +46,27 @@ def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
         parent = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return
-
+    
     # Collect all children recursively before killing anything
     children = []
     try:
         children = parent.children(recursive=True)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
-
+    
     # Kill children first (leaf-to-root order)
     for child in reversed(children):
         try:
             child.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-
+    
     # Kill the parent
     try:
         parent.kill()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
-
+    
     # Wait for all to die
     gone, alive = psutil.wait_procs(children + [parent], timeout=timeout)
     for p in alive:
@@ -78,30 +78,28 @@ def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
 
 # Regex to strip ANSI escape sequences that could trigger terminal responses
 # Matches: CSI sequences (\x1b[...), OSC sequences (\x1b]...), and other escape sequences
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
-)
+_ANSI_ESCAPE_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))')
 
 # Control chars that should not be printed to terminal (keeps tab, newline, carriage return)
-_DANGEROUS_CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+_DANGEROUS_CTRL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]')
 
 
 def sanitize_terminal_output(text: str) -> str:
     """Strip ANSI escape sequences and dangerous control characters from text.
-
+    
     This prevents binary/garbage output from commands from being interpreted
     by the terminal as query sequences (e.g. \x1b[6n Device Status Report),
     which would cause the terminal to echo response bytes back into the console
     input buffer. The keyboard monitor (msvcrt.getch on Windows) would then
     read those bytes and misinterpret them as user keystrokes (Escape = interrupt).
     """
-    text = _ANSI_ESCAPE_RE.sub("", text)
-    text = _DANGEROUS_CTRL_CHARS.sub("\ufffd", text)
+    text = _ANSI_ESCAPE_RE.sub('', text)
+    text = _DANGEROUS_CTRL_CHARS.sub('\ufffd', text)
     return text
 
 
 _PS_CLIXML_STR_RE = re.compile(r'<S(?:\s+S="[^"]+")?>(.*?)</S>')
-_PS_CLIXML_HEX_ESCAPE_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+_PS_CLIXML_HEX_ESCAPE_RE = re.compile(r'_x([0-9A-Fa-f]{4})_')
 
 
 def _decode_powershell_clixml(text: str) -> str:
@@ -124,27 +122,11 @@ def _decode_powershell_clixml(text: str) -> str:
     return decoded.strip("\r\n")
 
 
-def parse_search_replace_blocks(diff: str) -> List[Tuple[str, str]]:
-    """Parse SEARCH/REPLACE blocks from diff string."""
-    blocks = []
-
-    # Normalize line endings first
-    diff = diff.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Pattern: <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE
-    # Allow optional whitespace and be flexible with newlines
-    pattern = r"<{7}\s*SEARCH\s*\n(.*?)\n={7}\s*\n(.*?)\n>{7}\s*REPLACE"
-
-    for m in re.finditer(pattern, diff, re.DOTALL):
-        search, replace = m.groups()
-        blocks.append((search, replace))
-
-    return blocks
 
 
 class ToolHandlers:
     """Handles execution of all tools for ClineAgent."""
-
+    
     def __init__(
         self,
         config,
@@ -152,10 +134,10 @@ class ToolHandlers:
         workspace_path: str,
         context,
         duplicate_detector,
-        context_manager=None,
+        context_manager=None
     ):
         """Initialize tool handlers with required dependencies.
-
+        
         Args:
             config: Config object with API settings
             console: Rich console for output
@@ -170,12 +152,12 @@ class ToolHandlers:
         self.context = context
         self._duplicate_detector = duplicate_detector
         self._context_manager = context_manager
-
+        
         # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
         self._background_procs: Dict[int, dict] = {}
         self._next_bg_id = 1
         self._next_cmd_id = 1  # For unique command log files
-
+        
         # Directory for spilled command output files
         self._output_dir = os.path.join(workspace_path, ".harness_output")
         os.makedirs(self._output_dir, exist_ok=True)
@@ -184,20 +166,20 @@ class ToolHandlers:
         # Keeps browser/tool state across turns (critical for Playwright MCP refs).
         self._mcp_sessions: Dict[str, Dict[str, Any]] = {}
         self._mcp_locks: Dict[str, asyncio.Lock] = {}
-
+    
     # -- Output spill helpers --------------------------------------------------
-
+    
     # Threshold in estimated tokens above which output is spilled to a file.
     OUTPUT_SPILL_TOKEN_THRESHOLD = 3000  # ~12,000 chars
-
+    
     # Maximum tokens to include inline when output is spilled.
-    OUTPUT_INLINE_PREVIEW_TOKENS = 300  # ~1,200 chars — enough for LLM to understand
+    OUTPUT_INLINE_PREVIEW_TOKENS = 300   # ~1,200 chars — enough for LLM to understand
     LARGE_WRITE_FEEDBACK_THRESHOLD = 256 * 1024  # chars
     LARGE_WRITE_CHUNK_SIZE = 128 * 1024  # chars
-
+    
     def spill_output_to_file(self, output: str, label: str) -> str:
         """Write large output to a file and return a compact reference.
-
+        
         Returns the original output unchanged if it's below threshold,
         otherwise writes to .harness_output/ and returns a truncated preview
         with the file path so the model can read_file to inspect details.
@@ -205,30 +187,24 @@ class ToolHandlers:
         est_tokens = len(output) // 4
         if est_tokens <= self.OUTPUT_SPILL_TOKEN_THRESHOLD:
             return output
-
+        
         # Write full output to a file
         import hashlib
-
-        safe_label = re.sub(r"[^\w\-.]", "_", label)[:60]
+        safe_label = re.sub(r'[^\w\-.]', '_', label)[:60]
         ts = int(time.time())
         filename = f"{safe_label}_{ts}.txt"
         os.makedirs(self._output_dir, exist_ok=True)
         filepath = os.path.join(self._output_dir, filename)
         Path(filepath).write_text(output, encoding="utf-8")
-        log.info(
-            "Output spilled to file: %s (%d tokens, %d chars)",
-            filepath,
-            est_tokens,
-            len(output),
-        )
-
+        log.info("Output spilled to file: %s (%d tokens, %d chars)", filepath, est_tokens, len(output))
+        
         # Build compact inline result
         lines = output.splitlines()
         total_lines = len(lines)
         preview_chars = self.OUTPUT_INLINE_PREVIEW_TOKENS * 4
-        head = output[: preview_chars // 2]
-        tail = output[-(preview_chars // 2) :]
-
+        head = output[:preview_chars // 2]
+        tail = output[-(preview_chars // 2):]
+        
         return (
             f"[OUTPUT SPILLED TO FILE — {est_tokens:,} tokens, {total_lines} lines]\n"
             f"Full output saved to: {filepath}\n"
@@ -236,19 +212,19 @@ class ToolHandlers:
             f"--- First lines ---\n{head}\n\n"
             f"--- Last lines ---\n{tail}"
         )
-
+    
     def _get_bg_log_path(self, proc_id: int) -> str:
         """Get the log file path for a background process."""
         os.makedirs(self._output_dir, exist_ok=True)
         return os.path.join(self._output_dir, f"bg_process_{proc_id}.log")
-
+    
     def _get_cmd_log_path(self) -> str:
         """Get a unique log file path for a foreground command."""
         os.makedirs(self._output_dir, exist_ok=True)
         cmd_id = self._next_cmd_id
         self._next_cmd_id += 1
         return os.path.join(self._output_dir, f"cmd_{cmd_id}.log")
-
+    
     def _resolve_path(self, path: str) -> Path:
         """Resolve a path relative to workspace."""
         p = Path(path)
@@ -421,9 +397,7 @@ class ToolHandlers:
                 }
                 return session
 
-            cm = streamablehttp_client(
-                url, headers=headers, timeout=20, sse_read_timeout=300
-            )
+            cm = streamablehttp_client(url, headers=headers, timeout=20, sse_read_timeout=300)
             read_stream, write_stream, _get_session_id = await cm.__aenter__()
             session_cm = ClientSession(read_stream, write_stream)
             session = await session_cm.__aenter__()
@@ -469,7 +443,6 @@ class ToolHandlers:
         if err:
             return f"Error: {err}"
         try:
-
             async def _do(session):
                 return await session.list_tools()
 
@@ -483,14 +456,8 @@ class ToolHandlers:
                 return f"MCP server '{name}' returned no tools."
             lines = [f"MCP tools on '{name}':"]
             for t in tools[:200]:
-                tn = str(
-                    getattr(t, "name", "")
-                    or (t.get("name", "") if isinstance(t, dict) else "")
-                )
-                td = str(
-                    getattr(t, "description", "")
-                    or (t.get("description", "") if isinstance(t, dict) else "")
-                ).strip()
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")).strip()
                 req_fields: List[str] = []
                 schema = getattr(t, "inputSchema", None)
                 if schema is None and isinstance(t, dict):
@@ -520,7 +487,6 @@ class ToolHandlers:
         if err:
             return f"Error: {err}"
         try:
-
             async def _do(session):
                 return await session.list_tools()
 
@@ -536,14 +502,8 @@ class ToolHandlers:
 
             scored: List[Tuple[float, dict]] = []
             for t in tools:
-                tn = str(
-                    getattr(t, "name", "")
-                    or (t.get("name", "") if isinstance(t, dict) else "")
-                )
-                td = str(
-                    getattr(t, "description", "")
-                    or (t.get("description", "") if isinstance(t, dict) else "")
-                )
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else ""))
                 hay = f"{tn} {td}".lower()
                 hay_tokens = {x for x in re.split(r"[^a-z0-9]+", hay) if x}
                 overlap = 0.0
@@ -563,14 +523,8 @@ class ToolHandlers:
 
             lines = [f"Top MCP tools on '{name}' for '{query}' (limit={limit}):"]
             for t in top:
-                tn = str(
-                    getattr(t, "name", "")
-                    or (t.get("name", "") if isinstance(t, dict) else "")
-                )
-                td = str(
-                    getattr(t, "description", "")
-                    or (t.get("description", "") if isinstance(t, dict) else "")
-                ).strip()
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")).strip()
                 req_fields: List[str] = []
                 schema = getattr(t, "inputSchema", None)
                 if schema is None and isinstance(t, dict):
@@ -605,7 +559,6 @@ class ToolHandlers:
         if err:
             return f"Error: {err}"
         try:
-
             async def _do(session):
                 # Schema-aware argument aliasing: if caller provided a generic
                 # "query" field but the MCP tool requires e.g. "search_query",
@@ -618,10 +571,7 @@ class ToolHandlers:
                     if isinstance(listed_tools, list):
                         match = None
                         for t in listed_tools:
-                            tname = str(
-                                getattr(t, "name", "")
-                                or (t.get("name", "") if isinstance(t, dict) else "")
-                            )
+                            tname = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
                             if tname == tool:
                                 match = t
                                 break
@@ -632,17 +582,11 @@ class ToolHandlers:
                             if isinstance(schema, dict):
                                 required = schema.get("required", [])
                                 if isinstance(required, list):
-                                    missing = [
-                                        r
-                                        for r in required
-                                        if isinstance(r, str) and r not in arguments
-                                    ]
+                                    missing = [r for r in required if isinstance(r, str) and r not in arguments]
                                     if "query" in arguments:
                                         query_val = arguments.get("query")
                                         for r in missing:
-                                            if isinstance(
-                                                query_val, str
-                                            ) and r.endswith("query"):
+                                            if isinstance(query_val, str) and r.endswith("query"):
                                                 arguments[r] = query_val
                 except Exception:
                     pass
@@ -680,34 +624,19 @@ class ToolHandlers:
         except Exception:
             return str(path)
 
-    async def _write_text_with_feedback(
-        self, path: Path, content: str, action: str = "Writing"
-    ) -> None:
+    async def _write_text_with_feedback(self, path: Path, content: str, action: str = "Writing") -> None:
         """Write text with visible progress for large payloads."""
-        import os
-
         total = len(content)
         if total < self.LARGE_WRITE_FEEDBACK_THRESHOLD:
             path.write_text(content, encoding="utf-8")
-            # Force OS to flush buffers to disk (prevents stale reads on Windows)
-            try:
-                fd = os.open(path, os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            except Exception:
-                pass  # Non-critical, don't fail the write
             return
 
-        self.console.print(
-            f"[dim]   {action} {self._display_path(path)} ({total:,} chars)[/dim]"
-        )
+        self.console.print(f"[dim]   {action} {self._display_path(path)} ({total:,} chars)[/dim]")
         next_report = 10
         written = 0
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline="") as f:
             for i in range(0, total, self.LARGE_WRITE_CHUNK_SIZE):
-                chunk = content[i : i + self.LARGE_WRITE_CHUNK_SIZE]
+                chunk = content[i:i + self.LARGE_WRITE_CHUNK_SIZE]
                 f.write(chunk)
                 written += len(chunk)
                 pct = int((written * 100) / max(total, 1))
@@ -715,26 +644,19 @@ class ToolHandlers:
                     self.console.print(f"[dim]     ... {pct}%[/dim]")
                     next_report += 10
                     await asyncio.sleep(0)
-            # Explicit flush and sync to ensure write completes before return
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass  # Non-critical
         self.console.print("[dim]     ... 100%[/dim]")
-
-    async def _background_log_tailer(
-        self, bg_id: int, proc: asyncio.subprocess.Process, log_path: str
-    ):
+    
+    async def _background_log_tailer(self, bg_id: int, proc: asyncio.subprocess.Process,
+                                      log_path: str):
         """Continuously tail a log file for a background process.
-
+        
         Since the process output is shell-redirected to log_path, this task
         just keeps reading new content and caching it in memory.
         """
         info = self._background_procs.get(bg_id)
         if not info:
             return
-
+        
         file_pos = 0
         try:
             while proc.returncode is None:
@@ -752,12 +674,12 @@ class ToolHandlers:
                     pass
                 except Exception:
                     pass
-
+                
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=0.5)
                 except asyncio.TimeoutError:
                     pass
-
+            
             # Post-exit grace period: keep reading in case a detached child
             # process (e.g. GUI app) is still writing to the log file via
             # inherited file handles.  Stop after 5s of no new content.
@@ -781,7 +703,7 @@ class ToolHandlers:
                     idle_elapsed += 0.5
         except Exception:
             pass
-
+    
     async def cleanup_background_procs_async(self) -> None:
         """Async version - properly waits for processes to terminate."""
         for pid, info in list(self._background_procs.items()):
@@ -808,7 +730,7 @@ class ToolHandlers:
             except Exception:
                 pass
         self._background_procs.clear()
-
+    
     def cleanup_background_procs(self) -> None:
         """Terminate all background processes safely (sync wrapper)."""
         for pid, info in list(self._background_procs.items()):
@@ -824,7 +746,7 @@ class ToolHandlers:
             except Exception:
                 pass
         self._background_procs.clear()
-
+    
     def list_background_procs(self) -> list:
         """List all background processes with their status."""
         result = []
@@ -835,57 +757,42 @@ class ToolHandlers:
                 try:
                     # asyncio.subprocess.Process doesn't have poll(), but
                     # checking the underlying transport can update returncode
-                    if (
-                        proc._transport is not None
-                        and proc._transport.get_returncode() is not None
-                    ):
+                    if proc._transport is not None and proc._transport.get_returncode() is not None:
                         proc._returncode = proc._transport.get_returncode()
                 except Exception:
                     pass
             elapsed = time.time() - info["started"]
-            status = (
-                "running" if proc.returncode is None else f"exited ({proc.returncode})"
-            )
-            result.append(
-                {
-                    "id": bg_id,
-                    "pid": proc.pid,
-                    "command": info["command"][:50],
-                    "elapsed": elapsed,
-                    "status": status,
-                }
-            )
+            status = "running" if proc.returncode is None else f"exited ({proc.returncode})"
+            result.append({
+                "id": bg_id,
+                "pid": proc.pid,
+                "command": info["command"][:50],
+                "elapsed": elapsed,
+                "status": status
+            })
         return result
-
+    
     # Maximum lines allowed for a full-file read without line range params.
     # Files exceeding this return an error telling the model to use start_line/end_line.
     MAX_FULL_READ_LINES = 2000
 
     async def read_file(self, params: Dict[str, str]) -> str:
         """Read a file and return its contents, with optional line range.
-
+        
         If the file exceeds MAX_FULL_READ_LINES and no start_line/end_line
         are provided, returns an error instructing the model to use line
         range parameters instead.
         """
         path = self._resolve_path(params.get("path", ""))
-        log.debug(
-            "read_file: path=%s start_line=%s end_line=%s",
-            path,
-            params.get("start_line"),
-            params.get("end_line"),
-        )
-
+        log.debug("read_file: path=%s start_line=%s end_line=%s",
+                  path, params.get("start_line"), params.get("end_line"))
+        
         if not path.exists():
             log.warning("read_file: file not found: %s", path)
             return f"Error: File not found: {path}"
-
-        rel_path = (
-            str(path.relative_to(self.workspace_path))
-            if str(path).startswith(self.workspace_path)
-            else str(path)
-        )
-
+        
+        rel_path = str(path.relative_to(self.workspace_path)) if str(path).startswith(self.workspace_path) else str(path)
+        
         # Parse optional line range parameters (1-based, inclusive)
         # Accept aliases: offset→start_line, limit→end_line (some models prefer these)
         start_line = params.get("start_line") or params.get("offset")
@@ -910,11 +817,9 @@ class ToolHandlers:
         range_key = f"{rel_path}:{start_line or ''}-{end_line or ''}"
         prev_index = self._duplicate_detector.was_read_before(range_key)
         if prev_index is not None:
-            self.console.print(
-                f"[dim]   (duplicate read - will be consolidated during compaction)[/dim]"
-            )
+            self.console.print(f"[dim]   (duplicate read - will be consolidated during compaction)[/dim]")
         self._duplicate_detector.record_read(range_key, 0)
-
+        
         content = path.read_text(encoding="utf-8", errors="replace")
         all_lines = content.splitlines()
         total_lines = len(all_lines)
@@ -938,59 +843,53 @@ class ToolHandlers:
                 return f"Error: start_line {start_line} is beyond end of file ({total_lines} lines)"
             selected = all_lines[start_idx:end_idx]
             # Number lines with their actual position in the file
-            numbered = [
-                f"{start_idx + i + 1:4d} | {line}" for i, line in enumerate(selected)
-            ]
+            numbered = [f"{start_idx + i + 1:4d} | {line}" for i, line in enumerate(selected)]
         else:
             # Small file — return entire contents
-            numbered = [f"{i + 1:4d} | {line}" for i, line in enumerate(all_lines)]
-
+            numbered = [f"{i+1:4d} | {line}" for i, line in enumerate(all_lines)]
+        
         result = "\n".join(numbered)
-
+        
         # Still apply byte-level truncation as a safety net
         result = truncate_file_content(result)
-
+        
         # Add to context container
         ctx_id = self.context.add("file", rel_path, result)
-
+        
         return f"[Context ID: {ctx_id}]\n{result}"
-
+    
     async def write_file(self, params: Dict[str, str]) -> str:
         """Write content to a new file."""
         path = self._resolve_path(params.get("path", ""))
-        content = params.get("content", "")
+        content = desanitize_think_tokens(params.get("content", ""))
         log.info("write_file: path=%s content_len=%d", path, len(content))
-
+        
         # Clean up invalid backtick escapes in Go files
         # Models sometimes generate \` or \`\`\` which are invalid in Go raw strings
-        if path.suffix == ".go":
+        if path.suffix == '.go':
             original_len = len(content)
             # Remove escaped backticks like \` (invalid in Go)
-            content = re.sub(r"\\`", "`", content)
+            content = re.sub(r'\\`', '`', content)
             # Remove triple-backtick markdown fences that might be in raw strings
             # These often appear as ```go or ``` which break Go compilation
-            content = re.sub(r"```\w*\n?", "", content)
+            content = re.sub(r'```\w*\n?', '', content)
             if len(content) != original_len:
-                self.console.print(
-                    f"[dim]   (cleaned {original_len - len(content)} invalid backtick chars)[/dim]"
-                )
-
+                self.console.print(f"[dim]   (cleaned {original_len - len(content)} invalid backtick chars)[/dim]")
+        
         # Warn if overwriting existing file (should use replace_in_file instead)
         was_overwrite = path.exists()
         if was_overwrite:
             old_size = path.stat().st_size
-            self.console.print(
-                f"[yellow]Warning: Overwriting existing file ({old_size} bytes). Consider replace_in_file for edits.[/yellow]"
-            )
-
+            self.console.print(f"[yellow]Warning: Overwriting existing file ({old_size} bytes). Consider replace_in_file for edits.[/yellow]")
+        
         path.parent.mkdir(parents=True, exist_ok=True)
         await self._write_text_with_feedback(path, content, action="Writing")
-
+        
         # DEBUG: Verify write
         if os.environ.get("HARNESS_DEBUG"):
             actual_size = path.stat().st_size
             print(f"[DEBUG write_file] written! actual_size={actual_size}", flush=True)
-
+        
         if was_overwrite:
             return f"Successfully wrote to {path}\nNote: This file already existed. For future edits to existing files, please use replace_in_file instead of write_to_file."
         return f"Successfully wrote to {path}"
@@ -998,8 +897,8 @@ class ToolHandlers:
     async def replace_between_anchors(self, params: Dict[str, str]) -> str:
         """Replace content between two exact anchors, preserving the anchors.
 
-        Designed for cases where `replace_in_file` is brittle, especially when
-        the file contains SEARCH/REPLACE delimiters like `=======` literally.
+        Useful for large-block replacements where you want to keep the
+        boundary lines intact and replace everything between them.
         """
         path = self._resolve_path(params.get("path", ""))
         start_anchor = params.get("start_anchor", "")
@@ -1007,10 +906,7 @@ class ToolHandlers:
         replacement = params.get("replacement", "")
         log.info(
             "replace_between_anchors: path=%s start_len=%d end_len=%d repl_len=%d",
-            path,
-            len(start_anchor),
-            len(end_anchor),
-            len(replacement),
+            path, len(start_anchor), len(end_anchor), len(replacement)
         )
 
         if not path.exists():
@@ -1041,9 +937,7 @@ class ToolHandlers:
         body_start = start_idx + len(start_anchor)
         old_segment = content[body_start:end_idx]
         new_content = content[:body_start] + replacement + content[end_idx:]
-        await self._write_text_with_feedback(
-            path, new_content, action="Writing updated file"
-        )
+        await self._write_text_with_feedback(path, new_content, action="Writing updated file")
 
         old_lines = old_segment.count("\n") + (1 if old_segment else 0)
         new_lines = replacement.count("\n") + (1 if replacement else 0)
@@ -1051,10 +945,10 @@ class ToolHandlers:
             f"Successfully replaced content between anchors in {path}\n"
             f"Anchors preserved. Replaced ~{old_lines} line(s) with ~{new_lines} line(s)."
         )
-
+    
     async def replace_in_file(self, params: Dict[str, str]) -> str:
-        """Replace sections of content in an existing file.
-
+        """Replace a section of text in an existing file.
+        
         Matching strategy (in order):
         1. Exact string match
         2. Trailing-whitespace-normalized match
@@ -1063,268 +957,217 @@ class ToolHandlers:
         5. Fail with a helpful diagnostic showing the closest section in the file
         """
         path = self._resolve_path(params.get("path", ""))
-        diff = params.get("diff", "")
-        log.info("replace_in_file: path=%s diff_len=%d", path, len(diff))
-
+        search = desanitize_think_tokens(params.get("old_text", ""))
+        replace = desanitize_think_tokens(params.get("new_text", ""))
+        log.info("replace_in_file: path=%s old_len=%d new_len=%d", path, len(search), len(replace))
+        
         if not path.exists():
             log.warning("replace_in_file: file not found: %s", path)
             return f"Error: File not found: {path}"
-
+        
+        if not search:
+            return "Error: old_text is required (the text to find and replace)."
+        
         content = path.read_text(encoding="utf-8")
-        blocks = parse_search_replace_blocks(diff)
-
-        if not blocks:
-            return "Error: No valid SEARCH/REPLACE blocks found"
-
+        
         def normalize_trailing(s: str) -> str:
             """Normalize line endings and trailing whitespace."""
-            lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-            return "\n".join(line.rstrip() for line in lines)
-
+            lines = s.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            return '\n'.join(line.rstrip() for line in lines)
+        
         def strip_indent(s: str) -> list:
             """Return (stripped_lines, indent_per_line) for indentation-agnostic compare."""
-            lines = s.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            lines = s.replace('\r\n', '\n').replace('\r', '\n').split('\n')
             stripped = [line.lstrip() for line in lines]
-            indents = [line[: len(line) - len(line.lstrip())] for line in lines]
+            indents = [line[:len(line) - len(line.lstrip())] for line in lines]
             return stripped, indents
-
+        
         def find_best_fuzzy_match(content_text: str, search_text: str):
             """Find the best fuzzy match for search_text within content_text.
-
+            
             Returns (start_line_idx, end_line_idx, similarity_ratio) or None.
+            
+            Capped at 30 search lines to avoid O(n³) blowup on large blocks
+            (e.g. model sends entire <style> block as old_text).  Large blocks
+            should always be found by exact / whitespace / indent strategies.
             """
             import difflib
-
-            search_lines = search_text.replace("\r\n", "\n").split("\n")
-            content_lines = content_text.replace("\r\n", "\n").split("\n")
+            search_lines = search_text.replace('\r\n', '\n').split('\n')
+            content_lines = content_text.replace('\r\n', '\n').split('\n')
             search_len = len(search_lines)
-
+            
             if search_len == 0 or len(content_lines) == 0:
                 return None
-
+            
+            # Skip fuzzy matching for large blocks — too expensive and
+            # unlikely to produce a useful result.
+            if search_len > 30:
+                return None
+            
             best_ratio = 0.0
             best_start = 0
-
+            best_window = search_len
+            
             # Slide a window of size search_len (±30%) across content_lines
             min_window = max(1, int(search_len * 0.7))
             max_window = int(search_len * 1.3) + 1
-
-            for window_size in range(
-                min_window, min(max_window, len(content_lines) + 1)
-            ):
+            
+            # Pre-filter threshold: at least 40% of lines must match exactly
+            min_shared = max(2, int(search_len * 0.4))
+            
+            for window_size in range(min_window, min(max_window, len(content_lines) + 1)):
                 for i in range(len(content_lines) - window_size + 1):
-                    candidate = content_lines[i : i + window_size]
-                    # Quick pre-filter: at least some lines must share content
-                    shared = sum(
-                        1
-                        for a, b in zip(search_lines, candidate)
-                        if a.strip() == b.strip()
-                    )
-                    if shared < min(3, search_len * 0.3):
+                    candidate = content_lines[i:i + window_size]
+                    # Quick pre-filter: require a meaningful fraction of exact-match lines
+                    shared = sum(1 for a, b in zip(search_lines, candidate)
+                                 if a.strip() == b.strip())
+                    if shared < min_shared:
                         continue
-
+                    
                     ratio = difflib.SequenceMatcher(
                         None,
-                        "\n".join(search_lines),
-                        "\n".join(candidate),
+                        '\n'.join(search_lines),
+                        '\n'.join(candidate),
                     ).ratio()
-
+                    
                     if ratio > best_ratio:
                         best_ratio = ratio
                         best_start = i
                         best_window = window_size
-
+            
             if best_ratio > 0.4:
                 return best_start, best_start + best_window, best_ratio
             return None
-
+        
         def build_diagnostic(content_text: str, search_text: str) -> str:
             """Build a helpful error message showing the closest match."""
             match_info = find_best_fuzzy_match(content_text, search_text)
-
-            search_lines = search_text.replace("\r\n", "\n").split("\n")
-            content_lines = content_text.replace("\r\n", "\n").split("\n")
-
+            
+            search_lines = search_text.replace('\r\n', '\n').split('\n')
+            content_lines = content_text.replace('\r\n', '\n').split('\n')
+            
             msg_parts = [
-                f"Error: SEARCH block not found in file.",
+                f"Error: old_text not found in file.",
                 f"",
-                f"SEARCH block ({len(search_lines)} lines):",
+                f"old_text ({len(search_lines)} lines):",
                 f"  {chr(10).join('  ' + l for l in search_lines[:5])}",
             ]
             if len(search_lines) > 5:
                 msg_parts.append(f"  ... ({len(search_lines) - 5} more lines)")
-
+            
             if match_info:
                 start, end, ratio = match_info
                 msg_parts.append(f"")
-                msg_parts.append(
-                    f"Closest match in file (lines {start + 1}-{end}, {ratio:.0%} similar):"
-                )
+                msg_parts.append(f"Closest match in file (lines {start+1}-{end}, {ratio:.0%} similar):")
                 for i in range(start, min(end, start + 10)):
-                    msg_parts.append(f"  {i + 1:4d} | {content_lines[i]}")
+                    msg_parts.append(f"  {i+1:4d} | {content_lines[i]}")
                 if end - start > 10:
                     msg_parts.append(f"  ... ({end - start - 10} more lines)")
                 msg_parts.append(f"")
-                msg_parts.append(
-                    f"Tip: Re-read the file around lines {start + 1}-{end} and retry with the exact content."
-                )
+                msg_parts.append(f"Tip: Re-read the file around lines {start+1}-{end} and retry with the exact content.")
             else:
-                # Show first few lines of each search line in context
                 first_search = search_lines[0].strip() if search_lines else ""
                 if first_search:
                     near = [i for i, l in enumerate(content_lines) if first_search in l]
                     if near:
                         msg_parts.append(f"")
-                        msg_parts.append(
-                            f"First search line found near line(s): {', '.join(str(n + 1) for n in near[:5])}"
-                        )
+                        msg_parts.append(f"First line of old_text found near line(s): {', '.join(str(n+1) for n in near[:5])}")
                         ctx_start = max(0, near[0] - 2)
                         ctx_end = min(len(content_lines), near[0] + 5)
                         for i in range(ctx_start, ctx_end):
-                            msg_parts.append(f"  {i + 1:4d} | {content_lines[i]}")
+                            msg_parts.append(f"  {i+1:4d} | {content_lines[i]}")
                 msg_parts.append(f"")
-                msg_parts.append(
-                    f"Tip: Use read_file with start_line/end_line to see the exact content, then retry."
-                )
-
-            return "\n".join(msg_parts)
-
-        changes = 0
-        for search, replace in blocks:
-            # Strategy 1: Exact match
-            if search in content:
-                content = content.replace(search, replace, 1)
-                changes += 1
-                continue
-
-            # Strategy 2: Trailing-whitespace-normalized match
-            norm_content = normalize_trailing(content)
-            norm_search = normalize_trailing(search)
-
-            if norm_search in norm_content:
-                search_lines = norm_search.split("\n")
-                content_lines = content.replace("\r\n", "\n").split("\n")
-
-                for i in range(len(content_lines) - len(search_lines) + 1):
-                    match = True
-                    for j, search_line in enumerate(search_lines):
-                        if content_lines[i + j].rstrip() != search_line:
-                            match = False
-                            break
-                    if match:
-                        replace_lines = replace.replace("\r\n", "\n").split("\n")
-                        content_lines = (
-                            content_lines[:i]
-                            + replace_lines
-                            + content_lines[i + len(search_lines) :]
-                        )
-                        content = "\n".join(content_lines)
-                        changes += 1
+                msg_parts.append(f"Tip: Use read_file with start_line/end_line to see the exact content, then retry.")
+            
+            return '\n'.join(msg_parts)
+        
+        # Strategy 1: Exact match
+        if search in content:
+            content = content.replace(search, replace, 1)
+            await self._write_text_with_feedback(path, content, action="Writing updated file")
+            return f"Successfully replaced text in {path}"
+        
+        # Strategy 2: Trailing-whitespace-normalized match
+        norm_content = normalize_trailing(content)
+        norm_search = normalize_trailing(search)
+        
+        if norm_search in norm_content:
+            search_lines = norm_search.split('\n')
+            content_lines = content.replace('\r\n', '\n').split('\n')
+            
+            for i in range(len(content_lines) - len(search_lines) + 1):
+                match = True
+                for j, search_line in enumerate(search_lines):
+                    if content_lines[i + j].rstrip() != search_line:
+                        match = False
                         break
-                else:
-                    return build_diagnostic(content, search)
-                continue
-
-            # Strategy 3: Indentation-agnostic match
-            search_stripped, _ = strip_indent(search)
-            content_lines_raw = content.replace("\r\n", "\n").split("\n")
-            content_stripped = [l.lstrip() for l in content_lines_raw]
-            indent_match_found = False
-
-            for i in range(len(content_stripped) - len(search_stripped) + 1):
-                if all(
-                    content_stripped[i + j] == search_stripped[j]
-                    for j in range(len(search_stripped))
-                ):
-                    # Content matches but indentation differs.
-                    # Determine the indentation offset and apply it to the replacement.
-                    file_indent = content_lines_raw[i][
-                        : len(content_lines_raw[i]) - len(content_lines_raw[i].lstrip())
-                    ]
-                    search_indent = search.replace("\r\n", "\n").split("\n")[0]
-                    search_indent = search_indent[
-                        : len(search_indent) - len(search_indent.lstrip())
-                    ]
-
-                    replace_lines_raw = replace.replace("\r\n", "\n").split("\n")
-                    # Adjust each replacement line: remove search's base indent, add file's base indent
-                    adjusted_replace = []
-                    for rl in replace_lines_raw:
-                        if rl.startswith(search_indent):
-                            adjusted_replace.append(
-                                file_indent + rl[len(search_indent) :]
-                            )
-                        else:
-                            adjusted_replace.append(rl)
-
-                    content_lines_raw = (
-                        content_lines_raw[:i]
-                        + adjusted_replace
-                        + content_lines_raw[i + len(search_stripped) :]
-                    )
-                    content = "\n".join(content_lines_raw)
-                    changes += 1
-                    indent_match_found = True
-                    self.console.print(
-                        f"[dim]   (matched with indentation adjustment)[/dim]"
-                    )
-                    break
-
-            if indent_match_found:
-                continue
-
-            # Strategy 4: Fuzzy match — apply if similarity ≥ 0.6
-            fuzzy = find_best_fuzzy_match(content, search)
-            if fuzzy and fuzzy[2] >= 0.6:
-                start, end, ratio = fuzzy
-                content_lines_raw = content.replace("\r\n", "\n").split("\n")
-                replace_lines = replace.replace("\r\n", "\n").split("\n")
-                content_lines_raw = (
-                    content_lines_raw[:start] + replace_lines + content_lines_raw[end:]
-                )
-                content = "\n".join(content_lines_raw)
-                changes += 1
-                self.console.print(
-                    f"[dim]   (fuzzy match {ratio:.0%} at lines {start + 1}-{end})[/dim]"
-                )
-                continue
-
-            # Strategy 5: Fail with helpful diagnostic
+                if match:
+                    replace_lines = replace.replace('\r\n', '\n').split('\n')
+                    content_lines = content_lines[:i] + replace_lines + content_lines[i + len(search_lines):]
+                    content = '\n'.join(content_lines)
+                    await self._write_text_with_feedback(path, content, action="Writing updated file")
+                    return f"Successfully replaced text in {path}"
             return build_diagnostic(content, search)
+        
+        # Strategy 3: Indentation-agnostic match
+        search_stripped, _ = strip_indent(search)
+        content_lines_raw = content.replace('\r\n', '\n').split('\n')
+        content_stripped = [l.lstrip() for l in content_lines_raw]
+        
+        for i in range(len(content_stripped) - len(search_stripped) + 1):
+            if all(content_stripped[i + j] == search_stripped[j]
+                   for j in range(len(search_stripped))):
+                file_indent = content_lines_raw[i][:len(content_lines_raw[i]) - len(content_lines_raw[i].lstrip())]
+                search_indent = search.replace('\r\n', '\n').split('\n')[0]
+                search_indent = search_indent[:len(search_indent) - len(search_indent.lstrip())]
+                
+                replace_lines_raw = replace.replace('\r\n', '\n').split('\n')
+                adjusted_replace = []
+                for rl in replace_lines_raw:
+                    if rl.startswith(search_indent):
+                        adjusted_replace.append(file_indent + rl[len(search_indent):])
+                    else:
+                        adjusted_replace.append(rl)
+                
+                content_lines_raw = content_lines_raw[:i] + adjusted_replace + content_lines_raw[i + len(search_stripped):]
+                content = '\n'.join(content_lines_raw)
+                await self._write_text_with_feedback(path, content, action="Writing updated file")
+                self.console.print(f"[dim]   (matched with indentation adjustment)[/dim]")
+                return f"Successfully replaced text in {path}"
+        
+        # Strategy 4: Fuzzy match — apply if similarity ≥ 0.6
+        # Guard: also reject if ANY single line diverges too much from the
+        # corresponding file line (catches reasoning-text contamination where
+        # the model's thinking leaks into old_text string arguments).
+        fuzzy = find_best_fuzzy_match(content, search)
+        if fuzzy and fuzzy[2] >= 0.6:
+            start, end, ratio = fuzzy
+            content_lines_raw = content.replace('\r\n', '\n').split('\n')
+            search_lines_check = search.replace('\r\n', '\n').split('\n')
+            candidate_lines = content_lines_raw[start:end]
 
-        await self._write_text_with_feedback(
-            path, content, action="Writing updated file"
-        )
+            # Per-line similarity floor: every aligned line pair must be ≥ 0.5
+            min_line_ratio = 1.0
+            for sl, cl in zip(search_lines_check, candidate_lines):
+                lr = difflib.SequenceMatcher(None, sl.strip(), cl.strip()).ratio()
+                min_line_ratio = min(min_line_ratio, lr)
 
-        # Verify the write succeeded by reading back and checking content
-        try:
-            # Small delay to allow filesystem to settle (Windows caching issue)
-            await asyncio.sleep(0.05)
-            verify_content = path.read_text(encoding="utf-8")
-            if verify_content != content:
-                # Write verification failed - content mismatch
-                log.warning(
-                    "File write verification failed for %s - content mismatch, retrying",
-                    path,
-                )
-                # Retry the write once
-                await self._write_text_with_feedback(
-                    path, content, action="Retrying write"
-                )
-                await asyncio.sleep(0.05)
-                verify_content = path.read_text(encoding="utf-8")
-                if verify_content != content:
-                    log.error("File write verification failed twice for %s", path)
-                    return f"Error: File write verification failed for {path}"
-        except Exception as e:
-            log.warning("Could not verify file write for %s: %s", path, e)
-            # Don't fail here - the write may have succeeded but we can't verify
-
-        return f"Successfully made {changes} replacement(s) in {path}"
-
+            if min_line_ratio >= 0.5:
+                replace_lines = replace.replace('\r\n', '\n').split('\n')
+                content_lines_raw = content_lines_raw[:start] + replace_lines + content_lines_raw[end:]
+                content = '\n'.join(content_lines_raw)
+                await self._write_text_with_feedback(path, content, action="Writing updated file")
+                self.console.print(f"[dim]   (fuzzy match {ratio:.0%} at lines {start+1}-{end})[/dim]")
+                return f"Successfully replaced text in {path}"
+            else:
+                log.info("replace_in_file: fuzzy match rejected — per-line min ratio %.2f < 0.5 (possible contamination)", min_line_ratio)
+        
+        # Strategy 5: Fail with helpful diagnostic
+        return build_diagnostic(content, search)
+    
     async def execute_command(self, params: Dict[str, str]) -> str:
         """Execute a shell command with live output display and interrupt support.
-
+        
         All commands are launched with stdout/stderr redirected to a log file
         (not piped to Python).  An async tail loop reads the log file for live
         console output.  This unified approach means GUI applications can create
@@ -1332,25 +1175,21 @@ class ToolHandlers:
         their output displayed and recorded.
         """
         from .interrupt import is_interrupted, is_background_requested, reset_background
-
+        
         command = params.get("command", "")
         background = params.get("background", "").lower() == "true"
         timeout_secs = 120  # Auto-background after this many seconds
         if not command.strip():
             return "Error: execute_command requires a non-empty <command> parameter."
-        log.info(
-            "execute_command: cmd=%s bg=%s", log_truncate(command, 200), background
-        )
-
+        log.info("execute_command: cmd=%s bg=%s", log_truncate(command, 200), background)
+        
         mode_indicator = "[bg] " if background else ""
-        cmd_short = command.split("\n")[0][:120]  # First line, truncated
-        self.console.print(
-            f"  [dim]•[/dim] [bold]Running[/bold] [dim]{mode_indicator}{cmd_short}[/dim]"
-        )
-
+        cmd_short = command.split('\n')[0][:120]  # First line, truncated
+        self.console.print(f"  [dim]•[/dim] [bold]Running[/bold] [dim]{mode_indicator}{cmd_short}[/dim]")
+        
         if background:
             return await self._run_background_command(command)
-
+        
         # ── Launch with file redirect ──────────────────────────────────
         cmd_log_path = self._get_cmd_log_path()
 
@@ -1374,66 +1213,54 @@ class ToolHandlers:
             cwd=self.workspace_path,
         )
         log.info("Process launched: PID=%d log=%s", proc.pid, cmd_log_path)
-
+        
         # ── Tail loop: read log file for live output ───────────────────
         output_lines: List[str] = []
         start_time = time.time()
         hint_shown = False
         file_pos = 0
-
+        
         try:
             while proc.returncode is None:
                 elapsed = time.time() - start_time
-
+                
                 # Check for interrupt (Esc)
                 if is_interrupted():
                     self._kill_proc(proc)
                     self.console.print(f"    [yellow]interrupted[/yellow]")
                     raw_output = self._read_log_file(cmd_log_path)
                     output = self.spill_output_to_file(
-                        raw_output,
-                        f"interrupted_{command.split()[0] if command else 'cmd'}",
-                    )
-                    return (
-                        f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}"
-                        if output
-                        else "Command interrupted (no output)"
-                    )
-
+                        raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
+                    return f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}" if output else "Command interrupted (no output)"
+                
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
                     reset_background()
                     self.console.print(f"    [cyan]→ background[/cyan]")
-                    return self._promote_to_background(
-                        proc, command, start_time, cmd_log_path, output_lines
-                    )
-
+                    return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
+                
                 # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
                     self.console.print(f"    [dim]Ctrl+B background · Esc stop[/dim]")
                     hint_shown = True
-
+                
                 # Auto-background after timeout.  Use a shorter timeout for
                 # commands producing no output — likely GUI apps (e.g. notepad)
                 # that block cmd.exe but have no console output to tail.
                 effective_timeout = 10 if not output_lines else timeout_secs
                 if elapsed > effective_timeout:
-                    self.console.print(
-                        f"    [cyan]→ background[/cyan] [dim](no output for {elapsed:.0f}s)[/dim]"
-                    )
-                    return self._promote_to_background(
-                        proc, command, start_time, cmd_log_path, output_lines
-                    )
-
+                    self.console.print(f"    [cyan]→ background[/cyan] [dim](no output for {elapsed:.0f}s)[/dim]")
+                    return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
+                
                 # Read new content from log file
                 file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
-
+                
                 # Poll process exit (non-blocking)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=0.15)
                 except asyncio.TimeoutError:
                     pass
-
+            
             # Process has exited — do one final read to catch any trailing output
             await asyncio.sleep(0.1)  # Brief pause for OS to flush file buffers
             file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
@@ -1445,107 +1272,67 @@ class ToolHandlers:
             # promote to background so the standard log tailer keeps monitoring.
             elapsed_so_far = time.time() - start_time
             if elapsed_so_far < 2.0 and len(output_lines) < 3:
-                log.info(
-                    "Fast exit with little output (%.1fs, %d lines) — "
-                    "checking for detached GUI app",
-                    elapsed_so_far,
-                    len(output_lines),
-                )
+                log.info("Fast exit with little output (%.1fs, %d lines) — "
+                         "checking for detached GUI app", elapsed_so_far, len(output_lines))
                 await asyncio.sleep(1.0)
                 file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
                 if output_lines:
                     # Log file is growing — a detached app is still running.
                     # Promote to background so the log tailer keeps reading.
-                    self.console.print(
-                        f"    [cyan]→ background[/cyan] [dim](detached process)[/dim]"
-                    )
-                    return self._promote_to_background(
-                        proc, command, start_time, cmd_log_path, output_lines
-                    )
+                    self.console.print(f"    [cyan]→ background[/cyan] [dim](detached process)[/dim]")
+                    return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
 
             exit_code = proc.returncode
             elapsed_cmd = time.time() - start_time
-            log.info(
-                "execute_command finished: cmd=%s exit=%d elapsed=%.1fs output_lines=%d",
-                log_truncate(command, 80),
-                exit_code,
-                elapsed_cmd,
-                len(output_lines),
-            )
+            log.info("execute_command finished: cmd=%s exit=%d elapsed=%.1fs output_lines=%d",
+                     log_truncate(command, 80), exit_code, elapsed_cmd, len(output_lines))
             # Show collapsed line count if output was truncated
             n_lines = len(output_lines)
             if n_lines > self._MAX_LIVE_DISPLAY:
-                self.console.print(
-                    f"    [dim]… +{n_lines - self._MAX_LIVE_DISPLAY} lines[/dim]"
-                )
-
+                self.console.print(f"    [dim]… +{n_lines - self._MAX_LIVE_DISPLAY} lines[/dim]")
+            
             if exit_code == 0:
                 self.console.print(f"    [dim](exit 0, {elapsed_cmd:.1f}s)[/dim]")
             else:
-                log.warning(
-                    "Command failed: exit=%d cmd=%s",
-                    exit_code,
-                    log_truncate(command, 120),
-                )
-                self.console.print(
-                    f"    [red]✗ exit {exit_code}[/red] [dim]({elapsed_cmd:.1f}s)[/dim]"
-                )
-
+                log.warning("Command failed: exit=%d cmd=%s", exit_code, log_truncate(command, 120))
+                self.console.print(f"    [red]✗ exit {exit_code}[/red] [dim]({elapsed_cmd:.1f}s)[/dim]")
+            
             # Build raw output and spill to file if huge
             raw_output = self._read_log_file(cmd_log_path) or "(no output)"
-            output = truncate_output(
-                raw_output, max_lines=300, keep_start=80, keep_end=80
-            )
-            output = self.spill_output_to_file(
-                output, f"cmd_{command.split()[0] if command else 'cmd'}"
-            )
-
+            output = truncate_output(raw_output, max_lines=300, keep_start=80, keep_end=80)
+            output = self.spill_output_to_file(output, f"cmd_{command.split()[0] if command else 'cmd'}")
+            
             # Add to context if significant output
             if len(output_lines) > 3:
                 ctx_id = self.context.add("command_output", command, output)
                 return f"[Context ID: {ctx_id}]\n{output}"
             return output
-
+            
         except Exception as e:
-            log_exception(
-                log, f"execute_command exception: {log_truncate(command, 80)}", e
-            )
+            log_exception(log, f"execute_command exception: {log_truncate(command, 80)}", e)
             self._kill_proc(proc)
             raw_output = self._read_log_file(cmd_log_path)
-            output = (
-                self.spill_output_to_file(raw_output, "cmd_error") if raw_output else ""
-            )
-            return (
-                f"Error: {str(e)}\nOutput captured:\n{output}"
-                if output
-                else f"Error: {str(e)}"
-            )
-
+            output = self.spill_output_to_file(raw_output, "cmd_error") if raw_output else ""
+            return f"Error: {str(e)}\nOutput captured:\n{output}" if output else f"Error: {str(e)}"
+    
     # ── Helpers for file-redirect execution ─────────────────────────────
-
+    
     # Maximum lines to show live before collapsing (show first N, then summarize)
     _MAX_LIVE_DISPLAY = 10
 
     def _wrap_shell_command(self, command: str, log_path: str) -> str:
         """Build platform shell wrapper for a command with file redirection.
-
+        
         On Windows, default to PowerShell execution for deterministic behavior
         with PowerShell syntax (the system prompt advertises PowerShell).
         Set HARNESS_WINDOWS_SHELL=cmd to force legacy cmd.exe behavior.
         """
-        # Use sys.platform instead of platform.system() to avoid potential blocking on Windows
-        import sys as _sys_tool_handlers
-
-        if _sys_tool_handlers.platform == "win32":
-            win_shell = (
-                os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
-            )
+        if platform.system() == "Windows":
+            win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
             if win_shell != "cmd":
                 # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
                 ps_command = "$ProgressPreference='SilentlyContinue'; " + command
-                encoded = base64.b64encode(ps_command.encode("utf-16le")).decode(
-                    "ascii"
-                )
+                encoded = base64.b64encode(ps_command.encode("utf-16le")).decode("ascii")
                 launcher = (
                     "powershell -NoProfile -NonInteractive "
                     "-InputFormat Text -OutputFormat Text "
@@ -1555,11 +1342,9 @@ class ToolHandlers:
                 return f'{launcher} > "{log_path}" 2>&1'
         return f'{command} > "{log_path}" 2>&1'
 
-    def _tail_log_file(
-        self, log_path: str, file_pos: int, output_lines: List[str]
-    ) -> int:
+    def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:
         """Read new content from a log file starting at file_pos.
-
+        
         Displays new lines in the console and appends to output_lines.
         After _MAX_LIVE_DISPLAY lines, suppresses further live display —
         the final summary is printed by execute_command on completion.
@@ -1587,7 +1372,7 @@ class ToolHandlers:
             return file_pos
         except Exception:
             return file_pos
-
+    
     def _read_log_file(self, log_path: str) -> str:
         """Read the entire contents of a log file."""
         try:
@@ -1596,36 +1381,26 @@ class ToolHandlers:
             return decoded or raw
         except Exception:
             return ""
-
+    
     def _kill_proc(self, proc: asyncio.subprocess.Process) -> None:
         """Kill a process and its entire process tree."""
         kill_process_tree(proc.pid)
-
-    def _promote_to_background(
-        self,
-        proc,
-        command: str,
-        start_time: float,
-        log_path: str,
-        output_lines: List[str],
-    ) -> str:
+    
+    def _promote_to_background(self, proc, command: str, start_time: float,
+                                log_path: str, output_lines: List[str]) -> str:
         """Promote a foreground process to a tracked background process."""
         proc_id = self._next_bg_id
         self._next_bg_id += 1
-
+        
         self._background_procs[proc_id] = {
             "proc": proc,
             "command": command,
             "started": start_time,
             "logs": output_lines.copy()[-200:],
             "log_file": log_path,
-            "task": asyncio.create_task(
-                self._background_log_tailer(proc_id, proc, log_path)
-            ),
+            "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
-        self.console.print(
-            f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]"
-        )
+        self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
         recent = "\n".join(output_lines[-30:])
         return (
             f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
@@ -1634,13 +1409,11 @@ class ToolHandlers:
             f"Output so far:\n{recent}"
         )
 
-    async def create_plan(
-        self, params: Dict[str, str], context_summary: str = ""
-    ) -> str:
+    async def create_plan(self, params: Dict[str, str], context_summary: str = "") -> str:
         """Delegate a complex reasoning task to Claude CLI (Opus 4.6).
-
+        
         Auto-attaches context summary (todos, recent files, workspace info).
-
+        
         NOTE: This does NOT go through execute_command.  The prompt may contain
         newlines, quotes, pipes, angle brackets, etc. that would be mangled by
         shell quoting / redirect.  Instead we launch the claude CLI directly
@@ -1650,55 +1423,43 @@ class ToolHandlers:
         prompt = params.get("prompt", "").strip()
         if not prompt:
             return "Error: 'prompt' is required for create_plan."
-
+        
         # Build full prompt with context
         full_prompt = prompt
         if context_summary:
             full_prompt = f"CONTEXT:\n{context_summary}\n\nTASK:\n{prompt}"
-
+        
         # Write prompt to a temp file to avoid all shell quoting issues.
         # Claude CLI reads -p from the command line, but we can pipe via stdin
         # using the '-' convention or just pass a sanitized file reference.
         # Safest approach: write to file, pass via stdin with --pipe flag.
         import tempfile
-
         prompt_file = None
         try:
             # Write prompt to temp file
             prompt_file = tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".txt",
-                prefix="harness_plan_",
-                dir=self._output_dir,
-                delete=False,
-                encoding="utf-8",
+                mode='w', suffix='.txt', prefix='harness_plan_',
+                dir=self._output_dir, delete=False, encoding='utf-8'
             )
             prompt_file.write(full_prompt)
             prompt_file.close()
             prompt_path = prompt_file.name
-
+            
             # Build args: claude reads prompt from stdin via -p "$(cat file)"
             # Actually simplest: use -p @file or just pipe stdin.
             # Claude CLI supports: echo "prompt" | claude -p -
             # But safest: claude -p with the file contents piped via stdin
             args = ["claude", "-p", "-", "--dangerously-skip-permissions"]
-
+            
             # Use configured model if available
-            claude_model = getattr(self, "_claude_model", None)
+            claude_model = getattr(self, '_claude_model', None)
             if claude_model:
                 args.extend(["--model", claude_model])
-
-            log.info(
-                "create_plan: launching Claude CLI with %d-char prompt via stdin",
-                len(full_prompt),
-            )
-            self.console.print(
-                f"[bold yellow]{'─' * 4} create_plan (Claude CLI) {'─' * 25}[/bold yellow]"
-            )
-            self.console.print(
-                f"[dim]  Prompt: {len(full_prompt)} chars | Model: {claude_model or 'default'}[/dim]"
-            )
-
+            
+            log.info("create_plan: launching Claude CLI with %d-char prompt via stdin", len(full_prompt))
+            self.console.print(f"[bold yellow]{'─' * 4} create_plan (Claude CLI) {'─' * 25}[/bold yellow]")
+            self.console.print(f"[dim]  Prompt: {len(full_prompt)} chars | Model: {claude_model or 'default'}[/dim]")
+            
             # Launch directly (no shell) with stdin pipe for the prompt
             # and stdout/stderr piped for capture
             proc = await asyncio.create_subprocess_exec(
@@ -1708,16 +1469,16 @@ class ToolHandlers:
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=self.workspace_path,
             )
-
+            
             # Send prompt via stdin and collect output
             output_chunks = []
             start_time = time.time()
-
+            
             # Write prompt to stdin, then close it
-            proc.stdin.write(full_prompt.encode("utf-8"))
+            proc.stdin.write(full_prompt.encode('utf-8'))
             await proc.stdin.drain()
             proc.stdin.close()
-
+            
             # Read output line by line with live display
             while True:
                 try:
@@ -1727,57 +1488,40 @@ class ToolHandlers:
                         break
                     # Check for interrupt
                     from .interrupt import is_interrupted
-
                     if is_interrupted():
                         self._kill_proc(proc)
-                        self.console.print(
-                            f"\n[yellow][STOP] create_plan interrupted[/yellow]"
-                        )
+                        self.console.print(f"\n[yellow][STOP] create_plan interrupted[/yellow]")
                         partial = "\n".join(output_chunks)
                         return f"create_plan interrupted after {time.time() - start_time:.0f}s.\nPartial output:\n{partial}"
                     continue
-
+                
                 if not line:
                     break
-
-                decoded = line.decode("utf-8", errors="replace").rstrip()
+                
+                decoded = line.decode('utf-8', errors='replace').rstrip()
                 output_chunks.append(decoded)
                 safe_line = sanitize_terminal_output(decoded)
                 self.console.print(f"[dim]  {safe_line}[/dim]")
-
+            
             await proc.wait()
             elapsed = time.time() - start_time
             exit_code = proc.returncode
-
-            self.console.print(
-                f"[bold yellow]{'─' * 4} create_plan done {'─' * 32}[/bold yellow]"
-            )
-
+            
+            self.console.print(f"[bold yellow]{'─' * 4} create_plan done {'─' * 32}[/bold yellow]")
+            
             raw_output = "\n".join(output_chunks)
-
+            
             if exit_code != 0:
-                log.warning(
-                    "create_plan failed: exit=%d elapsed=%.1fs output_len=%d",
-                    exit_code,
-                    elapsed,
-                    len(raw_output),
-                )
+                log.warning("create_plan failed: exit=%d elapsed=%.1fs output_len=%d",
+                           exit_code, elapsed, len(raw_output))
                 self.console.print(f"[red][X] Claude CLI exit code: {exit_code}[/red]")
-                return (
-                    f"Error: Claude CLI failed (exit code {exit_code}).\nOutput:\n{raw_output}"
-                    if raw_output
-                    else f"Error: Claude CLI failed (exit code {exit_code}, no output)"
-                )
-
-            log.info(
-                "create_plan success: elapsed=%.1fs output_len=%d",
-                elapsed,
-                len(raw_output),
-            )
-
+                return f"Error: Claude CLI failed (exit code {exit_code}).\nOutput:\n{raw_output}" if raw_output else f"Error: Claude CLI failed (exit code {exit_code}, no output)"
+            
+            log.info("create_plan success: elapsed=%.1fs output_len=%d", elapsed, len(raw_output))
+            
             if not raw_output.strip():
                 return "Error: Claude CLI returned empty output."
-
+            
             # Save plan to persistent file for audit trail
             plan_dir = os.path.join(self._output_dir, "plans")
             os.makedirs(plan_dir, exist_ok=True)
@@ -1789,15 +1533,13 @@ class ToolHandlers:
                 f"**Elapsed**: {elapsed:.1f}s\n\n"
                 f"## Prompt\n\n{full_prompt}\n\n"
                 f"## Response\n\n{raw_output}\n",
-                encoding="utf-8",
+                encoding='utf-8'
             )
             log.info("Plan saved to: %s", plan_path)
             self.console.print(f"[dim]  Plan saved: {plan_path}[/dim]")
-
+            
             # Truncate for context if very large
-            output = truncate_output(
-                raw_output, max_lines=300, keep_start=80, keep_end=80
-            )
+            output = truncate_output(raw_output, max_lines=300, keep_start=80, keep_end=80)
             output = self.spill_output_to_file(output, "create_plan")
 
             # Prepend plan file path so the agent can read the full output
@@ -1808,7 +1550,7 @@ class ToolHandlers:
                 ctx_id = self.context.add("command_output", "create_plan", output)
                 return f"[Context ID: {ctx_id}]\n{output}"
             return output
-
+            
         finally:
             # Clean up temp prompt file
             if prompt_file and os.path.exists(prompt_file.name):
@@ -1816,13 +1558,13 @@ class ToolHandlers:
                     os.unlink(prompt_file.name)
                 except Exception:
                     pass
-
+    
     async def _run_background_command(self, command: str) -> str:
         """Run a command in background with output redirected to a log file."""
         log.info("_run_background_command: cmd=%s", log_truncate(command, 120))
         if not command.strip():
             return "Error: execute_command requires a non-empty <command> parameter."
-
+        
         proc_id = self._next_bg_id
         self._next_bg_id += 1
         log_path = self._get_bg_log_path(proc_id)
@@ -1832,7 +1574,7 @@ class ToolHandlers:
 
         # Shell-level redirect to log file (no cmd /c wrapper — see execute_command)
         wrapped = self._wrap_shell_command(command, log_path)
-
+        
         proc = await asyncio.create_subprocess_shell(
             wrapped,
             stdin=asyncio.subprocess.DEVNULL,
@@ -1840,7 +1582,7 @@ class ToolHandlers:
             stderr=asyncio.subprocess.DEVNULL,
             cwd=self.workspace_path,
         )
-
+        
         # Brief pause to capture initial output
         await asyncio.sleep(0.5)
         initial_output = []
@@ -1852,21 +1594,17 @@ class ToolHandlers:
                 self.console.print(f"[dim]  {safe_line}[/dim]")
         except Exception:
             pass
-
+        
         self._background_procs[proc_id] = {
             "proc": proc,
             "command": command,
             "started": time.time(),
             "logs": initial_output.copy(),
             "log_file": log_path,
-            "task": asyncio.create_task(
-                self._background_log_tailer(proc_id, proc, log_path)
-            ),
+            "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
-
-        self.console.print(
-            f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]"
-        )
+        
+        self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
         return (
             f"Command started in background (ID: {proc_id}, PID: {proc.pid}).\n"
             f"Log file: {log_path}\n"
@@ -1874,45 +1612,36 @@ class ToolHandlers:
             f"Use check_background_process for status and recent output.\n"
             f"Initial output:\n" + "\n".join(initial_output)
         )
-
+    
+    
     async def list_files(self, params: Dict[str, str]) -> str:
         """List files in a directory."""
         path = self._resolve_path(params.get("path", "."))
         recursive = params.get("recursive", "").lower() == "true"
-
+        
         if not path.exists():
             return f"Error: Directory not found: {path}"
-
+        
         # Skip directories starting with . or common junk, unless user explicitly requested them
         user_path = params.get("path", ".")
         user_requested_hidden = user_path.startswith(".") and user_path != "."
-        skip_dirs = {
-            "node_modules",
-            "__pycache__",
-            "venv",
-            "dist",
-            "build",
-            "target",
-            "vendor",
-            "obj",
-            "bin",
-        }
-
+        skip_dirs = {'node_modules', '__pycache__', 'venv', 'dist', 'build', 'target', 'vendor', 'obj', 'bin'}
+        
         def should_skip(p: Path) -> bool:
             if user_requested_hidden:
                 return False
             for part in p.relative_to(path).parts:
                 # Skip dotfiles/dotdirs (except current dir)
-                if part.startswith(".") and part != ".":
+                if part.startswith('.') and part != '.':
                     return True
                 if part in skip_dirs:
                     return True
             return False
-
+        
         items = []
         truncated = False
         max_items = 100 if recursive else 50
-
+        
         try:
             if recursive:
                 for p in sorted(path.rglob("*")):
@@ -1932,61 +1661,47 @@ class ToolHandlers:
                     truncated = True
         except PermissionError:
             return "Error: Permission denied"
-
+        
         result = "\n".join(items) or "(empty directory)"
         if truncated:
-            result += (
-                f"\n\n... (truncated at {max_items} items, use more specific path)"
-            )
-
+            result += f"\n\n... (truncated at {max_items} items, use more specific path)"
+        
         return result
-
+    
     async def search_files(self, params: Dict[str, str]) -> str:
         """Search for patterns in files."""
         path = self._resolve_path(params.get("path", "."))
         regex = params.get("regex", "")
         file_pattern = params.get("file_pattern", "*")
-        log.debug(
-            "search_files: path=%s regex=%s file_pattern=%s", path, regex, file_pattern
-        )
-
+        log.debug("search_files: path=%s regex=%s file_pattern=%s", path, regex, file_pattern)
+        
         if not path.exists():
             return f"Error: Directory not found: {path}"
-
+        
         try:
             pattern = re.compile(regex, re.IGNORECASE)
         except re.error as e:
             return f"Error: Invalid regex: {e}"
-
+        
         # Skip directories starting with . or common junk, unless user explicitly requested
         user_path = params.get("path", ".")
         user_requested_hidden = user_path.startswith(".") and user_path != "."
-        skip_dirs = {
-            "node_modules",
-            "__pycache__",
-            "venv",
-            "dist",
-            "build",
-            "target",
-            "vendor",
-            "obj",
-            "bin",
-        }
-
+        skip_dirs = {'node_modules', '__pycache__', 'venv', 'dist', 'build', 'target', 'vendor', 'obj', 'bin'}
+        
         def should_skip(p: Path) -> bool:
             if user_requested_hidden:
                 return False
             for part in p.relative_to(path).parts:
-                if part.startswith(".") and part != ".":
+                if part.startswith('.') and part != '.':
                     return True
                 if part in skip_dirs:
                     return True
             return False
-
+        
         results = []
         files_scanned = 0
         max_files = 2000  # Safety limit
-
+        
         for file in path.rglob(file_pattern):
             if should_skip(file):
                 continue
@@ -2009,22 +1724,22 @@ class ToolHandlers:
                     pass
             if len(results) >= 100:
                 break
-
+        
         if not results:
             return "(no matches)"
-
+        
         result = "\n".join(results)
         # Add to context if significant results
         if len(results) > 5:
             ctx_id = self.context.add("search_result", regex, result)
             return f"[Context ID: {ctx_id}]\n{result}"
         return result
-
+    
     async def check_background_process(self, params: Dict[str, str]) -> str:
         """Check status and logs of a background process."""
         bg_id_str = params.get("id", "")
         lines = int(params.get("lines", "50"))
-
+        
         try:
             bg_id = int(bg_id_str)
         except ValueError:
@@ -2034,37 +1749,32 @@ class ToolHandlers:
                 return "No background processes running."
             result = "Background processes:\n"
             for p in procs:
-                elapsed_min = p["elapsed"] / 60
+                elapsed_min = p['elapsed'] / 60
                 result += f"  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}\n"
             result += "\nUse check_background_process with id parameter to see logs."
             return result
-
+        
         if bg_id not in self._background_procs:
             return f"Error: No background process with ID {bg_id}"
-
+        
         info = self._background_procs[bg_id]
         proc = info["proc"]
         elapsed = time.time() - info["started"]
         # Poll to get updated returncode
         if proc.returncode is None:
             try:
-                if (
-                    proc._transport is not None
-                    and proc._transport.get_returncode() is not None
-                ):
+                if proc._transport is not None and proc._transport.get_returncode() is not None:
                     proc._returncode = proc._transport.get_returncode()
             except Exception:
                 pass
-        status = (
-            "running" if proc.returncode is None else f"exited (code {proc.returncode})"
-        )
+        status = "running" if proc.returncode is None else f"exited (code {proc.returncode})"
         logs = info.get("logs", [])
-
+        
         # Get last N lines
         recent_logs = logs[-lines:] if logs else []
-
+        
         log_file = info.get("log_file", "")
-
+        
         result = f"Background Process [{bg_id}]\n"
         result += f"Command: {info['command']}\n"
         result += f"PID: {proc.pid}\n"
@@ -2073,109 +1783,95 @@ class ToolHandlers:
         result += f"Total log lines (in memory): {len(logs)}\n"
         if log_file:
             result += f"Full log file: {log_file}\n"
-            result += (
-                f"(Use read_file on this path to inspect the full output at any time)\n"
-            )
+            result += f"(Use read_file on this path to inspect the full output at any time)\n"
         result += f"\n--- Last {len(recent_logs)} lines ---\n"
         result += "\n".join(recent_logs) if recent_logs else "(no output yet)"
-
+        
         # Add guidance to prevent spam checking
         if proc.returncode is None:
-            if not recent_logs or len(logs) == info.get("_last_check_lines", 0):
+            if not recent_logs or len(logs) == info.get('_last_check_lines', 0):
                 result += "\n\n[!] Process still running with no new output. Continue with other tasks instead of re-checking immediately."
-            info["_last_check_lines"] = len(logs)
-
+            info['_last_check_lines'] = len(logs)
+        
         return result
-
+    
     async def stop_background_process(self, params: Dict[str, str]) -> str:
         """Stop a background process by ID."""
         bg_id_str = params.get("id", "")
-
+        
         try:
             bg_id = int(bg_id_str)
         except ValueError:
             return "Error: ID must be a number"
-
+        
         if bg_id not in self._background_procs:
             return f"Error: No background process with ID {bg_id}"
-
+        
         info = self._background_procs[bg_id]
         proc = info["proc"]
-
+        
         if proc.returncode is not None:
             return f"Process [{bg_id}] already exited with code {proc.returncode}"
-
+        
         kill_process_tree(proc.pid)
         try:
             await asyncio.wait_for(proc.wait(), timeout=3.0)
         except (asyncio.TimeoutError, Exception):
             pass
-
+        
         # Cancel log tailer
         if "task" in info and info["task"]:
             info["task"].cancel()
-
+        
         return f"Stopped background process [{bg_id}] (PID: {proc.pid})"
-
+    
     async def list_background_processes(self, params: Dict[str, str]) -> str:
         """List all background processes."""
         procs = self.list_background_procs()
         if not procs:
             return "No background processes."
-
+        
         result = "Background processes:\n"
         for p in procs:
-            elapsed_min = p["elapsed"] / 60
+            elapsed_min = p['elapsed'] / 60
             result += f"  [{p['id']}] PID {p['pid']} - {p['status']} - {elapsed_min:.1f}m - {p['command']}\n"
         return result
-
+    
     async def analyze_image(self, params: Dict[str, str]) -> str:
         """Analyze an image using GLM-4.6V vision model via coding endpoint."""
         import base64
         import httpx
         from urllib.parse import urlparse
-
+        
         path_str = params.get("path", "")
-        question = params.get(
-            "question",
-            "Describe this image in detail. Note any text, UI elements, errors, or important visual details.",
-        )
-
+        question = params.get("question", "Describe this image in detail. Note any text, UI elements, errors, or important visual details.")
+        
         path = self._resolve_path(path_str)
         if not path.exists():
             return f"Error: Image not found: {path}"
-
+        
         # Check file extension
         ext = path.suffix.lower()
-        if ext not in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
-            return (
-                f"Error: Unsupported image format: {ext}. Use jpg, png, gif, or webp."
-            )
-
+        if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+            return f"Error: Unsupported image format: {ext}. Use jpg, png, gif, or webp."
+        
         # Read and encode image as base64
         try:
             img_data = path.read_bytes()
-            img_base64 = base64.b64encode(img_data).decode("utf-8")
+            img_base64 = base64.b64encode(img_data).decode('utf-8')
         except Exception as e:
             return f"Error reading image: {e}"
-
+        
         # Determine mime type
-        mime_map = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-        }
-        mime_type = mime_map.get(ext, "image/png")
-
+        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', 
+                    '.gif': 'image/gif', '.webp': 'image/webp'}
+        mime_type = mime_map.get(ext, 'image/png')
+        
         # Use the Coding endpoint which properly supports vision with base64
         # https://api.z.ai/api/coding/paas/v4/chat/completions
         parsed = urlparse(self.config.api_url)
-        vision_url = (
-            f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
-        )
-
+        vision_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
+        
         # OpenAI format with data URI base64
         vision_messages = [
             {
@@ -2183,13 +1879,18 @@ class ToolHandlers:
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{img_base64}"},
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{img_base64}"
+                        }
                     },
-                    {"type": "text", "text": question},
-                ],
+                    {
+                        "type": "text",
+                        "text": question
+                    }
+                ]
             }
         ]
-
+        
         payload = {
             "model": "glm-4.6v",  # Vision model
             "messages": vision_messages,
@@ -2199,50 +1900,44 @@ class ToolHandlers:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
         }
-
+        
         try:
             async with httpx.AsyncClient(timeout=120.0) as http_client:
-                response = await http_client.post(
-                    vision_url, headers=headers, json=payload
-                )
+                response = await http_client.post(vision_url, headers=headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
-
+                
                 # Extract OpenAI response format
                 if "choices" in data and len(data["choices"]) > 0:
                     content = data["choices"][0].get("message", {}).get("content", "")
                     if content:
                         # Add to context
                         ctx_id = self.context.add("image_analysis", str(path), content)
-                        return (
-                            f"[Context ID: {ctx_id}]\n\nImage: {path_str}\n\n{content}"
-                        )
+                        return f"[Context ID: {ctx_id}]\n\nImage: {path_str}\n\n{content}"
                     return "Vision model returned empty response."
                 return f"Unexpected response format: {data}"
-
+                
         except httpx.HTTPStatusError as e:
             return f"Error calling vision API: {e.response.status_code} - {e.response.text[:200]}"
         except Exception as e:
             return f"Error analyzing image: {e}"
-
+    
     async def web_search(self, params: Dict[str, str]) -> str:
         """Search the web using Z.AI's built-in web search via chat completions."""
         import httpx
         from urllib.parse import urlparse
-
+        
         query = params.get("query", "")
         if not query:
             return "Error: search query is required"
-
+        
         count = int(params.get("count", "5"))
         count = max(1, min(10, count))  # Clamp to 1-10
-
+        
         # Use chat completion with web_search tool enabled
         parsed = urlparse(self.config.api_url)
-        search_url = (
-            f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
-        )
-
+        search_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
+        
         def _build_payload(q: str, attempt: int) -> dict:
             msg = f"Search the web for: {q}"
             # Retry hint when the model returns unresolved function metadata.
@@ -2258,25 +1953,22 @@ class ToolHandlers:
                 "temperature": 0.4 if attempt > 0 else 0.7,
                 "max_tokens": 2048,
                 "stream": False,
-                "tools": [
-                    {
-                        "type": "web_search",
-                        "web_search": {
-                            "enable": True,
-                            "search_engine": "search-prime",
-                            "search_result": True,
-                            "count": str(count),
-                        },
+                "tools": [{
+                    "type": "web_search",
+                    "web_search": {
+                        "enable": True,
+                        "search_engine": "search-prime",
+                        "search_result": True,
+                        "count": str(count),
                     }
-                ],
+                }]
             }
-
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
-            "Accept-Language": "en-US,en",
+            "Accept-Language": "en-US,en"
         }
-
+        
         try:
             async with httpx.AsyncClient(timeout=120.0) as http_client:
                 data = {}
@@ -2285,18 +1977,14 @@ class ToolHandlers:
                 raw_fc_content = ""
                 for attempt in range(2):
                     payload = _build_payload(query, attempt)
-                    response = await http_client.post(
-                        search_url, headers=headers, json=payload
-                    )
+                    response = await http_client.post(search_url, headers=headers, json=payload)
                     response.raise_for_status()
                     data = response.json()
 
                     results = data.get("web_search", [])
                     content = ""
                     if "choices" in data and data["choices"]:
-                        content = (
-                            data["choices"][0].get("message", {}).get("content", "")
-                        )
+                        content = data["choices"][0].get("message", {}).get("content", "")
 
                     # Some responses occasionally return unresolved function-call JSON
                     # like {"function":"google_search","arguments":"..."} in content.
@@ -2307,11 +1995,7 @@ class ToolHandlers:
                         if ct.startswith("{") and ct.endswith("}"):
                             try:
                                 parsed = json.loads(ct)
-                                if (
-                                    isinstance(parsed, dict)
-                                    and "function" in parsed
-                                    and "arguments" in parsed
-                                ):
+                                if isinstance(parsed, dict) and "function" in parsed and "arguments" in parsed:
                                     unresolved_fc = True
                                     raw_fc_content = ct
                             except Exception:
@@ -2330,10 +2014,10 @@ class ToolHandlers:
                         "Please retry once.\n\n"
                         f"Raw content: {raw_fc_content[:300]}"
                     )
-
+                
                 # Format results
                 output = [f"Web Search Results for: {query}\n"]
-
+                
                 if results:
                     output.append(f"Found {len(results)} sources:\n")
                     for i, r in enumerate(results, 1):
@@ -2342,7 +2026,7 @@ class ToolHandlers:
                         media = r.get("media", "")
                         date = r.get("publish_date", "")
                         snippet = r.get("content", "")[:200]
-
+                        
                         output.append(f"[{i}] {title}")
                         if media:
                             output.append(f"    Source: {media}")
@@ -2353,46 +2037,45 @@ class ToolHandlers:
                         if link:
                             output.append(f"    URL: {link}")
                         output.append("")
-
+                
                 if content:
                     output.append(f"\nSummary:\n{content}")
-
+                
                 result_text = "\n".join(output)
-
+                
                 # Add to context
                 ctx_id = self.context.add("web_search", query, result_text)
                 return f"[Context ID: {ctx_id}]\n\n{result_text}"
-
+                
         except httpx.HTTPStatusError as e:
             return f"Error calling search API: {e.response.status_code} - {e.response.text[:200]}"
         except httpx.TimeoutException:
             return f"Error: Search request timed out after 120 seconds"
         except Exception as e:
             import traceback
-
             tb = traceback.format_exc()
             return f"Error searching web: {type(e).__name__}: {e}\n{tb}"
-
+    
     async def retrieve_tool_result(self, params: Dict[str, str]) -> str:
         """Retrieve the full content of a previously compacted tool result.
-
+        
         When tool results are compacted to save context space, they're stored
         with a unique ID. Use this tool to retrieve the full result when needed.
-
+        
         Args:
             result_id: The ID of the stored result (e.g., res_abc123_456)
-
+            
         Returns:
             The full tool result content, or an error message if not found
         """
         result_id = params.get("result_id", "").strip()
         if not result_id:
             return "Error: result_id is required. Example: res_abc123_456"
-
+        
         # Check if context_manager is available
         if not self._context_manager:
             return "Error: Context manager not available for result retrieval"
-
+        
         # Retrieve the stored result
         stored = self._context_manager.result_storage.get_result(result_id)
         if not stored:
@@ -2400,28 +2083,21 @@ class ToolHandlers:
                 f"Error: Result {result_id} not found. "
                 f"It may have been evicted due to age or memory limits."
             )
-
+        
         # Format the result with metadata
         age_seconds = time.time() - stored.timestamp
-        age_str = (
-            f"{age_seconds:.0f}s" if age_seconds < 60 else f"{age_seconds / 60:.0f}m"
-        )
-
+        age_str = f"{age_seconds:.0f}s" if age_seconds < 60 else f"{age_seconds/60:.0f}m"
+        
         result = (
             f"[Retrieved tool result: {stored.tool_name}]\n"
             f"Result ID: {result_id}\n"
             f"Age: {age_str} ago\n"
             f"Size: {stored.tokens:,} tokens (~{len(stored.original_content):,} chars)\n"
-            f"{'=' * 60}\n"
+            f"{'='*60}\n"
             f"{stored.original_content}"
         )
-
-        log.info(
-            "retrieve_tool_result: result_id=%s tool=%s tokens=%d age=%s",
-            result_id,
-            stored.tool_name,
-            stored.tokens,
-            age_str,
-        )
-
+        
+        log.info("retrieve_tool_result: result_id=%s tool=%s tokens=%d age=%s",
+                 result_id, stored.tool_name, stored.tokens, age_str)
+        
         return result

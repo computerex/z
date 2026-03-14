@@ -226,9 +226,12 @@ class ParsedToolCall:
 
 
 def strip_thinking_blocks(content: str) -> str:
-    """Remove <thinking> blocks and orphaned </thinking> tags from content."""
+    """Remove <thinking>/<think> reasoning blocks and orphaned </thinking> tags from content."""
     content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL)
     content = re.sub(r"</thinking>\s*", "", content)
+    # Also strip <think>...</think> blocks (used by many open-source reasoning models)
+    # but do NOT strip orphaned </think> — those may be legitimate user content
+    content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
     return content
 
 
@@ -1355,6 +1358,8 @@ class ClineAgent:
         try:
             _hidden_only_retry_count = 0
             _hidden_only_retry_max = 2
+            _empty_nudge_count = 0
+            _EMPTY_NUDGE_MAX = 3  # max consecutive empty-response nudges
             for iteration in range(self.max_iterations):
                 log.info("[WATCHDOG] Starting iteration %d", iteration + 1)
 
@@ -1620,10 +1625,10 @@ class ClineAgent:
                 # to on_chunk, so we iterate char-by-char internally.
                 _sf_tool_names = set(get_tool_names()) | {"tool_call"}
                 _sf_thinking_tags = {
-                    "thinking"
-                }  # Removed "think" to allow </think> in content
+                    "thinking", "think"
+                }  # Both variants: models use <think> or <thinking> for reasoning
                 _sf_suppressing: Optional[str] = None  # tool block being eaten
-                _sf_thinking_suppress = False  # eating content inside <thinking>
+                _sf_thinking_suppress = False  # eating content inside <thinking>/<think>
                 _sf_tag_buf = ""
                 _sf_in_tag = False
                 _sf_had_visible = False
@@ -1689,10 +1694,12 @@ class ClineAgent:
                                     return
                                 elif tag in _sf_thinking_tags:
                                     if is_close:
-                                        _sf_tag_buf = ""
+                                        # Orphaned close tag outside a thinking block
+                                        # — display it as-is (may be user content)
+                                        _sf_flush()
                                     else:
                                         _sf_thinking_suppress = True
-                                    _sf_tag_buf = ""
+                                        _sf_tag_buf = ""
                                     _sf_in_tag = False
                                     return
                             _sf_flush()
@@ -2020,6 +2027,7 @@ class ClineAgent:
 
                 if all_tool_calls:
                     _hidden_only_retry_count = 0
+                    _empty_nudge_count = 0
                     log.info(
                         "Tools parsed: %d call(s) — %s",
                         len(all_tool_calls),
@@ -2094,18 +2102,23 @@ class ClineAgent:
                             self.console.print()
                             self.console.print(Markdown(display_text))
 
-                    # Check for empty or thinking-only response and auto-retry with guidance
-                    if not display_text or len(display_text) < 20:
+                    # Check for truly empty response and auto-retry with guidance.
+                    # Only nudge when display_text is completely empty — short but
+                    # non-empty responses (e.g. "yes", "42", "repeat this") are valid.
+                    if not display_text:
                         thinking_len = (
                             len(response.thinking) if response.thinking else 0
                         )
 
                         # Model produced thinking-only or empty response
-                        if thinking_len > 50 or not display_text:
+                        if (thinking_len > 50 or not display_text) and _empty_nudge_count < _EMPTY_NUDGE_MAX:
+                            _empty_nudge_count += 1
                             log.warning(
-                                "Model returned empty response (thinking_len=%d, content_len=%d) - sending guidance nudge",
+                                "Model returned empty response (thinking_len=%d, content_len=%d, nudge=%d/%d) - sending guidance nudge",
                                 thinking_len,
                                 len(full_content),
+                                _empty_nudge_count,
+                                _EMPTY_NUDGE_MAX,
                             )
 
                             # Add the assistant's response (even if empty/thinking-only) to history
@@ -2134,6 +2147,36 @@ class ClineAgent:
 
                             # Continue to next iteration to try again
                             continue
+
+                    # If the model tried native function calling (tool_calls finish_reason)
+                    # but no XML tool calls were found, nudge it to use XML format.
+                    if response.finish_reason == "tool_calls" and not all_tool_calls:
+                        log.warning(
+                            "Model used native tool_calls instead of XML — sending format nudge"
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(
+                                    response, "provider_content_blocks", None
+                                ),
+                            )
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="user",
+                                content=(
+                                    "[SYSTEM: You used native function calling, but this system requires XML tool format. "
+                                    "Re-issue your tool call as XML. Example:\n"
+                                    "<read_file>\n<path>filename</path>\n</read_file>"
+                                ),
+                            )
+                        )
+                        self.console.print(
+                            "\n  [dim]→ Model used native tool calling. Nudging to use XML format...[/dim]\n"
+                        )
+                        continue
 
                     # No tool call — final response to user
                     self.messages.append(

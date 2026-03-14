@@ -3,6 +3,7 @@
 import json
 import asyncio
 import os
+import re
 import time
 import base64
 import httpx
@@ -12,6 +13,63 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .logger import get_logger, log_exception
+
+# ── Think-token sanitisation ────────────────────────────────────────────
+# Many reasoning-model tokenizers (DeepSeek, Qwen, Kimi, …) treat <think>
+# and </think> as special control tokens.  When these appear in user or
+# tool-result content they get silently swallowed, making the model unable
+# to "see" file contents that contain them.
+#
+# Fix: insert an invisible zero-width space (U+200B) between '<' and the
+# tag name right before we build the API payload.  This breaks the
+# tokenizer match while remaining visually identical.
+#   </think>  →  <\u200b/think>
+#   <think>   →  <\u200bthink>
+# The escaping is transport-only – it never touches self.messages.
+_THINK_ZWS = '\u200b'
+_THINK_TAG_RE = re.compile(r'<(/?)think>')
+
+
+def _sanitize_think_tokens(text: str) -> str:
+    """Escape <think> and </think> with a zero-width space to bypass tokenizer."""
+    return _THINK_TAG_RE.sub(lambda m: f'<{_THINK_ZWS}{m.group(1)}think>', text)
+
+
+def _sanitize_messages_for_api(
+    messages_dict: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return a *shallow copy* of messages_dict with think tokens escaped.
+
+    Modifies only the content strings; everything else is shared.
+    """
+    out: List[Dict[str, Any]] = []
+    for msg in messages_dict:
+        content = msg.get('content')
+        if isinstance(content, str):
+            sanitized = _sanitize_think_tokens(content)
+            if sanitized is not content:  # identity check – skip copy when unchanged
+                msg = {**msg, 'content': sanitized}
+        elif isinstance(content, list):
+            new_parts = []
+            changed = False
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get('text'), str):
+                    new_text = _sanitize_think_tokens(part['text'])
+                    if new_text is not part['text']:
+                        part = {**part, 'text': new_text}
+                        changed = True
+                new_parts.append(part)
+            if changed:
+                msg = {**msg, 'content': new_parts}
+        out.append(msg)
+    return out
+
+
+def desanitize_think_tokens(text: str) -> str:
+    """Reverse the ZWS escaping applied by _sanitize_think_tokens."""
+    return text.replace(f'<{_THINK_ZWS}/think>', '</think>').replace(
+        f'<{_THINK_ZWS}think>', '<think>'
+    )
 
 try:
     from anthropic import AsyncAnthropic  # type: ignore
@@ -452,6 +510,11 @@ class StreamingJSONClient:
                 blocks = [dict(b) for b in msg.provider_blocks]
             else:
                 blocks = self._to_anthropic_text_blocks(msg.content)
+            # Sanitize <think>/<​/think> tokens in text blocks to prevent
+            # tokenizer from treating them as special reasoning tokens.
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
+                    b["text"] = _sanitize_think_tokens(b["text"])
             # Recompute prompt-caching breakpoints per request. Replayed assistant
             # provider blocks may carry old cache_control markers that can push us
             # over Anthropic's 4-marker request limit.
@@ -770,7 +833,9 @@ class StreamingJSONClient:
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": _sanitize_messages_for_api(
+                [m.to_dict() for m in messages]
+            ),
             "response_format": {"type": "json_object"},
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -1074,7 +1139,9 @@ class StreamingJSONClient:
             est_chars,
             enable_web_search,
         )
-        messages_dict = [m.to_dict() for m in messages]
+        messages_dict = _sanitize_messages_for_api(
+            [m.to_dict() for m in messages]
+        )
 
         payload = {
             "model": self.model,
@@ -1137,6 +1204,9 @@ class StreamingJSONClient:
                 interrupted = False
                 web_search_data = []  # Collect web search results
                 raw_chunks = []  # For debug logging
+
+                chunk_count = 0
+                line_count = 0
 
                 stream_cm = self._client.stream(
                     "POST", url, headers=self._get_headers(), json=payload
