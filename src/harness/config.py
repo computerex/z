@@ -49,7 +49,7 @@ def _merge_non_empty(base: dict, overlay: dict) -> dict:
 @dataclass
 class Config:
     """Configuration for the agentic harness."""
-    
+
     api_url: str = ""
     api_key: str = ""
     model: str = "glm-4.7"
@@ -58,7 +58,8 @@ class Config:
     workspace_path: Path = field(default_factory=lambda: Path.cwd())
     max_context_tokens: int = 32000
     embedding_model: str = "all-MiniLM-L6-v2"
-    
+    compaction_threshold: float = 0.85  # Start compaction at 85% of max_tokens
+
     @classmethod
     def from_json(
         cls,
@@ -73,14 +74,14 @@ class Config:
         """
         # Start with defaults
         config_data = {}
-        
+
         # Load global config
         global_config = load_json_config(get_global_config_path())
         config_data = _merge_non_empty(config_data, global_config)
-        
+
         if overrides:
             config_data = _merge_non_empty(config_data, overrides)
-        
+
         return cls(
             api_url=config_data.get("api_url", ""),
             api_key=config_data.get("api_key", ""),
@@ -89,8 +90,9 @@ class Config:
             temperature=float(config_data.get("temperature", 0.7)),
             workspace_path=workspace or Path.cwd(),
             max_context_tokens=int(config_data.get("max_context_tokens", 32000)),
+            compaction_threshold=float(config_data.get("compaction_threshold", 0.85)),
         )
-    
+
     @classmethod
     def from_env(
         cls,
@@ -102,11 +104,15 @@ class Config:
         The env_path parameter is accepted but ignored (legacy compat).
         """
         return cls.from_json(workspace)
-    
+
     def validate(self) -> bool:
         """Validate the configuration."""
         if not self.api_url:
-            raise ValueError("API URL is required. Run 'python harness.py --install' to configure.")
+            raise ValueError(
+                "API URL is required. Run 'python harness.py --install' to configure."
+            )
         if not self.api_key:
-            raise ValueError("API key is required. Run 'python harness.py --install' to configure.")
+            raise ValueError(
+                "API key is required. Run 'python harness.py --install' to configure."
+            )
         return True

@@ -12,7 +12,7 @@ _log = get_logger("prompts")
 
 def load_agent_rules(workspace_path: str) -> str:
     """Load the agent.md file from the workspace root, if it exists.
-    
+
     Returns the file content, or empty string if the file is missing/empty.
     """
     agent_md = Path(workspace_path) / "agent.md"
@@ -20,15 +20,18 @@ def load_agent_rules(workspace_path: str) -> str:
         try:
             content = agent_md.read_text(encoding="utf-8").strip()
             if content:
-                _log.debug("Loaded agent.md (%d chars) from %s", len(content), workspace_path)
+                _log.debug(
+                    "Loaded agent.md (%d chars) from %s", len(content), workspace_path
+                )
                 return content
         except Exception as e:
             _log.warning("Failed to read agent.md: %s", e)
     return ""
 
 
-def get_system_prompt(workspace_path: str, shell: Optional[str] = None,
-                      project_map: str = "") -> str:
+def get_system_prompt(
+    workspace_path: str, shell: Optional[str] = None, project_map: str = ""
+) -> str:
     """Generate the system prompt with XML tool formatting.
 
     Args:
@@ -38,24 +41,25 @@ def get_system_prompt(workspace_path: str, shell: Optional[str] = None,
     """
     debug_print("get_system_prompt: START")
     import sys as _sys_prompts
+
     debug_print("get_system_prompt: detecting OS...")
-    if _sys_prompts.platform == 'win32':
-        os_name = 'Windows'
-    elif _sys_prompts.platform == 'darwin':
-        os_name = 'Darwin'
+    if _sys_prompts.platform == "win32":
+        os_name = "Windows"
+    elif _sys_prompts.platform == "darwin":
+        os_name = "Darwin"
     else:
-        os_name = 'Linux'
+        os_name = "Linux"
     debug_print(f"get_system_prompt: os_name={os_name} (detected via sys.platform)")
     debug_print("get_system_prompt: getting os_version...")
-    os_version = "11" if os_name == 'Windows' else "unknown"
+    os_version = "11" if os_name == "Windows" else "unknown"
     debug_print(f"get_system_prompt: os_version={os_version}")
 
-    if os_name == 'Windows':
-        shell = shell or 'PowerShell'
-        home_dir = os.environ.get('USERPROFILE', '')
+    if os_name == "Windows":
+        shell = shell or "PowerShell"
+        home_dir = os.environ.get("USERPROFILE", "")
     else:
-        shell = shell or os.path.basename(os.environ.get('SHELL', 'bash'))
-        home_dir = os.environ.get('HOME', '')
+        shell = shell or os.path.basename(os.environ.get("SHELL", "bash"))
+        home_dir = os.environ.get("HOME", "")
     global_config_path = str(Path(home_dir) / ".z.json") if home_dir else "~/.z.json"
 
     debug_print("get_system_prompt: loading agent_rules...")
@@ -64,7 +68,8 @@ def get_system_prompt(workspace_path: str, shell: Optional[str] = None,
 
     debug_print("get_system_prompt: building prompt string...")
 
-    result = f'''You are a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
+    result = (
+        f"""You are a highly skilled software engineer with extensive knowledge in many programming languages, frameworks, design patterns, and best practices.
 
 You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
 
@@ -441,33 +446,7 @@ Delegate complex reasoning to a planning sub-agent. Expensive — only for hard 
 Parameters: prompt (required) — detailed description of what to reason about
 IMPORTANT: create_plan delegates to a sub-agent with FULL tool access — it can read, edit, and run commands. After create_plan returns, ALWAYS read the plan output file (path shown in the result) to see exactly what the planner did. The planner may have already implemented the changes. If it did, do NOT re-apply them — verify the work instead (build, test). If it only produced a plan without implementing, then apply the changes yourself.
 
-## list_context
-List all items currently stored in the context management system.
 
-No parameters required.
-
-Usage:
-- Shows all context items with their IDs, types, and summaries
-- Use this to see what information is available in your context
-- Context items persist across conversation turns and help maintain state
-
-<list_context>
-</list_context>
-
-## remove_from_context
-Remove a specific item from the context management system.
-
-Parameters:
-- id: (required) The context item ID to remove
-
-Usage:
-- Use list_context first to see available items and their IDs
-- Remove items that are no longer needed to free up context space
-- Be careful not to remove items that might be needed later
-
-<remove_from_context>
-<id>context_item_123</id>
-</remove_from_context>
 
 ## retrieve_tool_result
 Retrieve a stored tool result by its ID. Use this to access the output of previous tool executions that have been stored in the context.
@@ -484,20 +463,6 @@ Usage:
 <result_id>tool_result_456</result_id>
 </retrieve_tool_result>
 
-## update_agent_rules
-Append a rule or preference to the workspace agent configuration file.
-
-Parameters:
-- rule: (required) The rule or preference to add
-
-Usage:
-- Add persistent rules that should apply to future agent sessions
-- Rules are stored in the workspace and persist across sessions
-- Use for user preferences, coding standards, or project-specific guidelines
-
-<update_agent_rules>
-<rule>Always use TypeScript strict mode for new files</rule>
-</update_agent_rules>
 
 ## introspect
 Dedicated deep-thinking tool. Makes a separate API call with no tools available so the model can reason freely.
@@ -559,13 +524,19 @@ When you encounter an obstacle, do not use destructive actions as a shortcut to 
 8. Use replace_between_anchors when replace_in_file is brittle (delimiter collisions like `=======`, large corrupted regions, repeated partial-match failures).
 9. ALWAYS read before editing. Copy exact text for SEARCH blocks.
 10. If an edit fails: re-read the target area, copy exact text, try again. After 3 failures, consider rewriting the file.
-''' + (f'''
+"""
+        + (
+            f"""
 ====
 
 AGENT RULES (from agent.md — follow these strictly)
 
 {agent_rules}
-''' if agent_rules else '') + f'''
+"""
+            if agent_rules
+            else ""
+        )
+        + f"""
 # Environment
 You have been invoked in the following environment: 
  - Primary working directory: {workspace_path}
@@ -578,16 +549,23 @@ You have been invoked in the following environment:
 When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.
 
 ====
-''' + (f'''
+"""
+        + (
+            f"""
 ====
 
 {project_map}
 
 Use this map to navigate directly to files instead of calling list_files on every directory.
-''' if project_map else '') + '''
+"""
+            if project_map
+            else ""
+        )
+        + """
 ====
 
 Work iteratively: understand the task, create todos to track steps, gather information, execute step by step. Be direct — no filler. When answering a question, write your full answer as visible text.
-'''
+"""
+    )
     debug_print("get_system_prompt: DONE, returning...")
     return result

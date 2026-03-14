@@ -126,11 +126,6 @@ TOOL_DEFS: List[ToolDef] = [
                     ToolParam("arguments", required=True)]),
 
     # --- Context management ---
-    ToolDef("list_context",        category="context",
-            description="List all items currently loaded in the working context."),
-    ToolDef("remove_from_context", category="context",
-            description="Remove items from the working context by ID or source.",
-            params=[ToolParam("id"), ToolParam("source")]),
     ToolDef("retrieve_tool_result", category="context",
             description="Retrieve a stored tool result by its ID. Use this to access "
                        "the output of previous tool executions that have been stored in the context. "
@@ -152,10 +147,6 @@ TOOL_DEFS: List[ToolDef] = [
             description="Delegate complex reasoning to a planning sub-agent with full tool access. "
                         "Expensive — only for hard architectural decisions or difficult debugging.",
             params=[ToolParam("prompt", required=True)]),
-    ToolDef("update_agent_rules", category="agent",
-            description="Append a rule/preference to the workspace agent.md file.",
-            params=[ToolParam("rule", required=True),
-                    ToolParam("category")]),
     ToolDef("introspect",          category="agent",
             description="Dedicated deep-thinking tool. Makes a separate API call with no tools "
                         "available so the model can reason freely.",

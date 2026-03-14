@@ -24,42 +24,22 @@ from typing import List, Optional, Dict, Tuple, Any, Set, TYPE_CHECKING
 from collections import Counter
 
 import time as _time_mod_sc
+
 _sc_t0 = _time_mod_sc.perf_counter()
 import numpy as np
+
 _sc_t1 = _time_mod_sc.perf_counter()
 
 from .context_management import estimate_tokens, estimate_messages_tokens
 from .logger import get_logger
 
-# Lazy-load sklearn to avoid ~1s import overhead at startup.
-# Only needed for the optional ML prior in _compute_score which runs
-# mid-session (not at startup), so deferring is safe.
-HAS_SKLEARN = None  # tri-state: None=untested, True/False=resolved
 
-def _ensure_sklearn():
-    """Lazy-import sklearn on first use. Returns (LogisticRegression, Pipeline, StandardScaler) or None."""
-    global HAS_SKLEARN
-    if HAS_SKLEARN is False:
-        return None
-    if HAS_SKLEARN is True:
-        return _ensure_sklearn._cached
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import StandardScaler
-        HAS_SKLEARN = True
-        _ensure_sklearn._cached = (LogisticRegression, Pipeline, StandardScaler)
-        return _ensure_sklearn._cached
-    except Exception:
-        HAS_SKLEARN = False
-        return None
-
-_ensure_sklearn._cached = None
 _sc_t2 = _time_mod_sc.perf_counter()
 
 import logging as _logging_sc
+
 _logging_sc.getLogger("harness.smart_context.boot").info(
-    "smart_context import: numpy=%.0fms sklearn=deferred total=%.0fms",
+    "smart_context import: numpy=%.0fms sklearn=disabled total=%.0fms",
     (_sc_t1 - _sc_t0) * 1000,
     (_sc_t2 - _sc_t0) * 1000,
 )
@@ -97,6 +77,7 @@ _LONG_ASSISTANT_COMPACT_CHARS = 3000
 # SemanticScorer — lazy-loaded embedding model for relevance scoring
 # ---------------------------------------------------------------------------
 
+
 class SemanticScorer:
     """Computes semantic similarity using a small bi-encoder embedding model.
 
@@ -133,12 +114,20 @@ class SemanticScorer:
         try:
             _t0_import = time.perf_counter()
             from sentence_transformers import SentenceTransformer
+
             _t1_import = time.perf_counter()
 
             # Some environments inject a broken loopback proxy (127.0.0.1:9),
             # which blocks model fetch even when network is otherwise available.
             # Temporarily clear only known-bad proxy values while loading.
-            proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+            proxy_keys = (
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            )
             old_proxy_vals: Dict[str, Optional[str]] = {}
             try:
                 for k in proxy_keys:
@@ -147,12 +136,13 @@ class SemanticScorer:
                     if v and ("127.0.0.1:9" in v or "localhost:9" in v):
                         os.environ.pop(k, None)
 
-                try:
-                    self._model = SentenceTransformer(
-                        "all-MiniLM-L6-v2", local_files_only=True,
-                    )
-                except OSError:
-                    self._model = SentenceTransformer("all-MiniLM-L6-v2")
+                # Only use locally cached model - NEVER download automatically
+                # Downloading can hang indefinitely with no timeout and blocks Ctrl+C
+                self._model = SentenceTransformer(
+                    "all-MiniLM-L6-v2",
+                    local_files_only=True,
+                )
+                # If we get here, model loaded successfully from cache
             finally:
                 for k, v in old_proxy_vals.items():
                     if v is None:
@@ -160,10 +150,12 @@ class SemanticScorer:
                     else:
                         os.environ[k] = v
             _t2_load = time.perf_counter()
-            log.info("SemanticScorer model ready: import=%.0fms load=%.0fms total=%.0fms",
-                     (_t1_import - _t0_import) * 1000,
-                     (_t2_load - _t1_import) * 1000,
-                     (_t2_load - _t0_import) * 1000)
+            log.info(
+                "SemanticScorer model ready: import=%.0fms load=%.0fms total=%.0fms",
+                (_t1_import - _t0_import) * 1000,
+                (_t2_load - _t1_import) * 1000,
+                (_t2_load - _t0_import) * 1000,
+            )
             return True
         except Exception:
             self._load_failed = True
@@ -216,8 +208,12 @@ class SemanticScorer:
 
         if to_encode:
             batch_texts = [t for _, t in to_encode]
-            vecs = self._model.encode(batch_texts, normalize_embeddings=True,
-                                      batch_size=32, show_progress_bar=False)
+            vecs = self._model.encode(
+                batch_texts,
+                normalize_embeddings=True,
+                batch_size=32,
+                show_progress_bar=False,
+            )
             for (idx, truncated), vec in zip(to_encode, vecs):
                 vec = np.asarray(vec, dtype=np.float32)
                 key = self._content_key(truncated)
@@ -254,7 +250,9 @@ class SemanticScorer:
             return self._keyword_fallback(content, query)
 
     def score_batch(
-        self, contents: List[str], query: str,
+        self,
+        contents: List[str],
+        query: str,
     ) -> List[float]:
         """Score multiple contents against a single query. Much faster than
         calling ``score_relevance`` in a loop because it batch-encodes.
@@ -278,13 +276,51 @@ class SemanticScorer:
         """Simple keyword overlap fallback when embedding is unavailable."""
         if not query:
             return 0.4  # neutral
-        query_words = set(re.findall(r'\b[a-zA-Z_]\w{2,}\b', query.lower()))
+        query_words = set(re.findall(r"\b[a-zA-Z_]\w{2,}\b", query.lower()))
         noise = {
-            "the", "and", "for", "this", "that", "with", "from", "are", "was",
-            "has", "have", "not", "but", "can", "all", "will", "use", "add",
-            "into", "also", "any", "each", "get", "set", "should", "would",
-            "need", "make", "like", "new", "see", "now", "just", "its", "our",
-            "file", "code", "test", "run", "check", "fix", "error", "result",
+            "the",
+            "and",
+            "for",
+            "this",
+            "that",
+            "with",
+            "from",
+            "are",
+            "was",
+            "has",
+            "have",
+            "not",
+            "but",
+            "can",
+            "all",
+            "will",
+            "use",
+            "add",
+            "into",
+            "also",
+            "any",
+            "each",
+            "get",
+            "set",
+            "should",
+            "would",
+            "need",
+            "make",
+            "like",
+            "new",
+            "see",
+            "now",
+            "just",
+            "its",
+            "our",
+            "file",
+            "code",
+            "test",
+            "run",
+            "check",
+            "fix",
+            "error",
+            "result",
         }
         query_words -= noise
         if not query_words:
@@ -298,12 +334,16 @@ class SemanticScorer:
 # Compaction trace — breadcrumb left when content is compacted
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CompactionTrace:
     """Breadcrumb left when content is compacted, enabling recovery."""
-    original_type: str       # 'file_read', 'command_output', 'search_result', 'assistant', ...
-    source: str              # file path, command string, or brief label
-    summary: str             # one-line description of what was there
+
+    original_type: (
+        str  # 'file_read', 'command_output', 'search_result', 'assistant', ...
+    )
+    source: str  # file path, command string, or brief label
+    summary: str  # one-line description of what was there
     tokens_freed: int = 0
     compacted_at: float = field(default_factory=time.time)
 
@@ -345,9 +385,11 @@ class CompactionTrace:
 # Context node metadata (persistent semantic breadcrumbs)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ContextNodeMeta:
     """Persistent metadata for a message fingerprint across turns."""
+
     node_id: str
     first_seen: float
     last_seen: float
@@ -363,9 +405,11 @@ class ContextNodeMeta:
 # Tool result storage — for retrieving compacted tool results
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class StoredToolResult:
     """A stored tool result that can be retrieved after compaction."""
+
     result_id: str
     tool_name: str
     original_content: str
@@ -376,24 +420,24 @@ class StoredToolResult:
 
 class ToolResultStorage:
     """Storage for tool results that have been compacted.
-    
+
     Allows the agent to retrieve full tool results after they've been
     abbreviated in the conversation context.
     """
-    
+
     # Maximum total bytes to store (100MB)
     MAX_TOTAL_BYTES = 100 * 1024 * 1024
-    
+
     # Maximum age for results (1 hour)
     MAX_AGE_SECONDS = 3600
-    
+
     def __init__(self, max_results: int = 100):
         self._results: Dict[str, StoredToolResult] = {}
         self._max_results = max_results
         self._access_order: List[str] = []  # For LRU eviction
         self._total_bytes = 0  # Track total bytes stored
         self._counter = 0  # For unique result IDs
-    
+
     def _evict_if_needed(self) -> None:
         """Evict old results if we exceed limits."""
         # Evict by count
@@ -403,52 +447,58 @@ class ToolResultStorage:
             rid = self._access_order.pop(0)
             result = self._results.pop(rid, None)
             if result:
-                self._total_bytes -= len(result.original_content.encode("utf-8", errors="replace"))
-        
+                self._total_bytes -= len(
+                    result.original_content.encode("utf-8", errors="replace")
+                )
+
         # Evict by size
         while self._total_bytes > self.MAX_TOTAL_BYTES and self._access_order:
             rid = self._access_order.pop(0)
             result = self._results.pop(rid, None)
             if result:
-                self._total_bytes -= len(result.original_content.encode("utf-8", errors="replace"))
-    
+                self._total_bytes -= len(
+                    result.original_content.encode("utf-8", errors="replace")
+                )
+
     def _cleanup_old_results(self) -> int:
         """Clean up results older than MAX_AGE_SECONDS."""
         now = time.time()
         to_remove = [
-            rid for rid, result in self._results.items()
+            rid
+            for rid, result in self._results.items()
             if now - result.timestamp > self.MAX_AGE_SECONDS
         ]
         if not to_remove:
             return 0
-        
+
         # Use set for O(1) lookup instead of O(n) list.remove()
         to_remove_set = set(to_remove)
-        
+
         # Filter access_order in O(n) instead of O(n²)
-        self._access_order = [rid for rid in self._access_order if rid not in to_remove_set]
-        
+        self._access_order = [
+            rid for rid in self._access_order if rid not in to_remove_set
+        ]
+
         # Remove from results dict and update byte count
         for rid in to_remove:
             result = self._results.pop(rid, None)
             if result:
-                self._total_bytes -= len(result.original_content.encode("utf-8", errors="replace"))
-        
+                self._total_bytes -= len(
+                    result.original_content.encode("utf-8", errors="replace")
+                )
+
         return len(to_remove)
-    
+
     def store_result(
-        self,
-        tool_name: str,
-        content: str,
-        message_index: int = -1
+        self, tool_name: str, content: str, message_index: int = -1
     ) -> str:
         """Store a tool result and return its result_id.
-        
+
         Args:
             tool_name: Name of the tool that produced this result
             content: Full content of the tool result
             message_index: Index of the message in the conversation (optional, not used after compaction)
-            
+
         Returns:
             result_id: Unique identifier for this stored result
         """
@@ -456,37 +506,39 @@ class ToolResultStorage:
         content_bytes = len(content.encode("utf-8", errors="replace"))
         if content_bytes > 10 * 1024 * 1024:  # 10MB limit per result
             raise ValueError(f"Tool result too large to store: {content_bytes:,} bytes")
-        
+
         # Generate a unique result ID with counter to prevent collisions
-        content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:8]
+        content_hash = hashlib.md5(
+            content.encode("utf-8", errors="replace")
+        ).hexdigest()[:8]
         self._counter += 1
         result_id = f"res_{content_hash}_{self._counter}"
-        
+
         result = StoredToolResult(
             result_id=result_id,
             tool_name=tool_name,
             original_content=content,
             timestamp=time.time(),
             message_index=message_index,
-            tokens=estimate_tokens(content)
+            tokens=estimate_tokens(content),
         )
-        
+
         self._results[result_id] = result
         self._access_order.append(result_id)
         self._total_bytes += content_bytes
-        
+
         # Clean up old results and evict if needed
         self._cleanup_old_results()
         self._evict_if_needed()
-        
+
         return result_id
-    
+
     def get_result(self, result_id: str) -> Optional[StoredToolResult]:
         """Retrieve a stored tool result by ID.
-        
+
         Args:
             result_id: The ID of the stored result (format: res_<hash>_<counter>)
-            
+
         Returns:
             StoredToolResult if found, None otherwise
         """
@@ -494,9 +546,9 @@ class ToolResultStorage:
         if not result_id or not isinstance(result_id, str):
             return None
         # Expected format: res_<8_hex_chars>_<counter>
-        if not re.match(r'^res_[a-f0-9]{8}_\d+$', result_id):
+        if not re.match(r"^res_[a-f0-9]{8}_\d+$", result_id):
             return None
-        
+
         result = self._results.get(result_id)
         if result:
             # Update access order for LRU
@@ -504,13 +556,13 @@ class ToolResultStorage:
                 self._access_order.remove(result_id)
             self._access_order.append(result_id)
         return result
-    
+
     def list_results(self, tool_name: Optional[str] = None) -> List[StoredToolResult]:
         """List all stored results, optionally filtered by tool name.
-        
+
         Args:
             tool_name: If provided, only return results from this tool
-            
+
         Returns:
             List of stored results, ordered by most recently accessed
         """
@@ -519,21 +571,22 @@ class ToolResultStorage:
             results = [r for r in results if r.tool_name == tool_name]
         # Sort by access order (most recent first)
         result_order = {rid: i for i, rid in enumerate(reversed(self._access_order))}
-        results.sort(key=lambda r: result_order.get(r.result_id, float('inf')))
+        results.sort(key=lambda r: result_order.get(r.result_id, float("inf")))
         return results
-    
+
     def clear_old_results(self, max_age_seconds: float = 3600) -> int:
         """Clear results older than max_age_seconds.
-        
+
         Args:
             max_age_seconds: Maximum age in seconds (default: 1 hour)
-            
+
         Returns:
             Number of results cleared
         """
         now = time.time()
         to_remove = [
-            rid for rid, result in self._results.items()
+            rid
+            for rid, result in self._results.items()
             if now - result.timestamp > max_age_seconds
         ]
         for rid in to_remove:
@@ -546,6 +599,7 @@ class ToolResultStorage:
 # ---------------------------------------------------------------------------
 # SmartContextManager
 # ---------------------------------------------------------------------------
+
 
 class SmartContextManager:
     """Manages context by scoring and compacting messages to stay within budget.
@@ -572,7 +626,7 @@ class SmartContextManager:
         self.compaction_traces: List[CompactionTrace] = []
         self._max_traces = 50
         self._scorer = SemanticScorer.get()
-        
+
         # Storage for tool results that have been compacted
         self.result_storage = ToolResultStorage(max_results=100)
 
@@ -641,7 +695,11 @@ class SmartContextManager:
 
         log.debug(
             "compact_context start: current=%d budget=%d ratio=%.2f max=%d msgs=%d",
-            current_tokens, budget, self.budget_ratio, max_tokens, len(messages),
+            current_tokens,
+            budget,
+            self.budget_ratio,
+            max_tokens,
+            len(messages),
         )
 
         if current_tokens <= budget:
@@ -719,7 +777,7 @@ class SmartContextManager:
 
         # Trim trace history
         if len(self.compaction_traces) > self._max_traces:
-            self.compaction_traces = self.compaction_traces[-self._max_traces:]
+            self.compaction_traces = self.compaction_traces[-self._max_traces :]
 
         if compacted_count > 0:
             compact_freed = total_freed - dup_freed
@@ -727,7 +785,9 @@ class SmartContextManager:
                 f"Compacted {compacted_count} messages: -{compact_freed:,} tok"
             )
             if debug_scoring:
-                type_counts = Counter(t.original_type for t in self.compaction_traces[-compacted_count:])
+                type_counts = Counter(
+                    t.original_type for t in self.compaction_traces[-compacted_count:]
+                )
                 log.debug(
                     "compacted message types: %s",
                     ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items())),
@@ -768,10 +828,14 @@ class SmartContextManager:
                 current_tokens -= freed
                 total_freed += freed
                 compacted_count += 1
-                self.compaction_traces.append(CompactionTrace(
-                    original_type=msg_type, source=source,
-                    summary=summary, tokens_freed=freed,
-                ))
+                self.compaction_traces.append(
+                    CompactionTrace(
+                        original_type=msg_type,
+                        source=source,
+                        summary=summary,
+                        tokens_freed=freed,
+                    )
+                )
             if compacted_count > 0:
                 report_parts.append(
                     f"Emergency compacted {compacted_count} oversized messages"
@@ -826,17 +890,18 @@ class SmartContextManager:
                     role = msg.role if hasattr(msg, "role") else msg.get("role", "")
                     msg_type, source = self._classify(content, role)
                     summary = content.splitlines()[0][:100] if content else ""
-                    self.compaction_traces.append(CompactionTrace(
-                        original_type=msg_type,
-                        source=source,
-                        summary=summary,
-                        tokens_freed=freed,
-                    ))
+                    self.compaction_traces.append(
+                        CompactionTrace(
+                            original_type=msg_type,
+                            source=source,
+                            summary=summary,
+                            tokens_freed=freed,
+                        )
+                    )
 
             if evicted_indices:
                 messages = [
-                    m for i, m in enumerate(messages)
-                    if i not in evicted_indices
+                    m for i, m in enumerate(messages) if i not in evicted_indices
                 ]
                 report_parts.append(
                     f"Evicted {len(evicted_indices)} low-priority messages"
@@ -846,12 +911,14 @@ class SmartContextManager:
 
         # Trim trace history
         if len(self.compaction_traces) > self._max_traces:
-            self.compaction_traces = self.compaction_traces[-self._max_traces:]
+            self.compaction_traces = self.compaction_traces[-self._max_traces :]
 
         final_tokens = estimate_messages_tokens(messages)
         log.debug(
             "compact_context done: freed=%d final_tokens=%d report=%s",
-            total_freed, final_tokens, "; ".join(report_parts),
+            total_freed,
+            final_tokens,
+            "; ".join(report_parts),
         )
         return messages, total_freed, "; ".join(report_parts)
 
@@ -1037,13 +1104,15 @@ class SmartContextManager:
         for t in raw:
             # Handle both old format (token_count) and new (tokens_freed)
             tokens = t.get("tokens_freed", t.get("token_count", 0))
-            self.compaction_traces.append(CompactionTrace(
-                original_type=t["original_type"],
-                source=t["source"],
-                summary=t["summary"],
-                tokens_freed=tokens,
-                compacted_at=t.get("compacted_at", t.get("evicted_at", 0)),
-            ))
+            self.compaction_traces.append(
+                CompactionTrace(
+                    original_type=t["original_type"],
+                    source=t["source"],
+                    summary=t["summary"],
+                    tokens_freed=tokens,
+                    compacted_at=t.get("compacted_at", t.get("evicted_at", 0)),
+                )
+            )
         self.node_metadata = {}
         for m in data.get("node_metadata", []):
             try:
@@ -1067,9 +1136,7 @@ class SmartContextManager:
     # Phase 1: Duplicate consolidation
     # ------------------------------------------------------------------
 
-    def _consolidate_duplicates(
-        self, messages: List[Any]
-    ) -> Tuple[List[Any], int]:
+    def _consolidate_duplicates(self, messages: List[Any]) -> Tuple[List[Any], int]:
         """Keep only the latest read of each file, replace older reads."""
         file_reads: Dict[str, List[int]] = {}  # normalised path -> [indices]
 
@@ -1080,7 +1147,7 @@ class SmartContextManager:
             if not content or COMPACT_MARKER in content[:20]:
                 continue
 
-            match = re.match(r'\[read_file result\]\s*\n?(.+?)(?:\n|$)', content)
+            match = re.match(r"\[read_file result\]\s*\n?(.+?)(?:\n|$)", content)
             if match:
                 path = _normalize_path(match.group(1).strip())
                 file_reads.setdefault(path, []).append(i)
@@ -1098,7 +1165,8 @@ class SmartContextManager:
                 old_tokens = estimate_tokens(old_content)
 
                 trace = CompactionTrace(
-                    "duplicate_read", path,
+                    "duplicate_read",
+                    path,
                     f"Superseded read of {path}",
                     tokens_freed=old_tokens,
                 )
@@ -1225,7 +1293,11 @@ class SmartContextManager:
             candidates, relevance_scores
         ):
             score = self._compute_score(
-                msg_type, index, total, tokens, relevance,
+                msg_type,
+                index,
+                total,
+                tokens,
+                relevance,
             )
             base_scores.append(score)
             results.append((index, score, msg_type, source))
@@ -1240,7 +1312,7 @@ class SmartContextManager:
         )
         if learned_keep:
             blended: List[Tuple[int, float, str, str]] = []
-            for (index, base, msg_type, source) in results:
+            for index, base, msg_type, source in results:
                 ml_keep = learned_keep.get(index, base)
                 score = max(0.0, min(1.0, base * 0.65 + ml_keep * 0.35))
                 blended.append((index, score, msg_type, source))
@@ -1262,7 +1334,7 @@ class SmartContextManager:
         """
 
         # --- 1. Recency (0 = oldest non-protected, 1 = newest non-recent) ---
-        effective_start = max(PROTECTED_INDICES) + 1          # 3
+        effective_start = max(PROTECTED_INDICES) + 1  # 3
         effective_end = max(effective_start + 1, total - self.recent_window)
         recency = (
             (index - effective_start) / (effective_end - effective_start)
@@ -1273,20 +1345,20 @@ class SmartContextManager:
         # --- 2. Regeneration cost (how easy to get this content back?) ---
         # Increased costs for tool results to prevent aggressive spilling of recent work
         regen_costs = {
-            "file_read":          0.3,   # re-read the file
-            "command_output":     0.5,   # may contain important output, harder to reproduce
-            "search_result":      0.45,  # search results are valuable, harder to re-run
-            "assistant_analysis": 0.6,   # expensive — reasoning is non-deterministic
-            "assistant_tool_call":0.5,   # contains action context
-            "todo_result":        0.05,  # trivially regenerated
-            "context_result":     0.05,  # trivially regenerated
-            "introspect_result":  0.15,  # reasoning already absorbed into subsequent actions
-            "guidance_nudge":     0.01,  # lifecycle guidance should decay quickly
-            "other_tool_result":  0.4,
-            "other":              0.4,
+            "file_read": 0.3,  # re-read the file
+            "command_output": 0.5,  # may contain important output, harder to reproduce
+            "search_result": 0.45,  # search results are valuable, harder to re-run
+            "assistant_analysis": 0.6,  # expensive — reasoning is non-deterministic
+            "assistant_tool_call": 0.5,  # contains action context
+            "todo_result": 0.05,  # trivially regenerated
+            "context_result": 0.05,  # trivially regenerated
+            "introspect_result": 0.15,  # reasoning already absorbed into subsequent actions
+            "guidance_nudge": 0.01,  # lifecycle guidance should decay quickly
+            "other_tool_result": 0.4,
+            "other": 0.4,
         }
         regen_cost = regen_costs.get(msg_type, 0.4)
-        
+
         # --- 2.5: Fresh tool result protection ---
         # Don't compact very recent tool results (last 2 messages)
         # These are likely still being actively used by the model
@@ -1294,17 +1366,15 @@ class SmartContextManager:
             # If this is one of the last 2 non-protected messages, boost its score significantly
             messages_from_end = total - index
             if messages_from_end <= 2 and index > max(PROTECTED_INDICES):
-                regen_cost = min(1.0, regen_cost + 0.4)  # Boost to protect recent results
+                regen_cost = min(
+                    1.0, regen_cost + 0.4
+                )  # Boost to protect recent results
 
         # --- 3. Size pressure: larger messages are better targets ---
         size_pressure = min(0.15, tokens / 20_000)
 
         # --- Combine ---
-        score = (
-            recency * 0.30
-            + relevance * 0.35
-            + regen_cost * 0.35
-        ) - size_pressure
+        score = (recency * 0.30 + relevance * 0.35 + regen_cost * 0.35) - size_pressure
 
         return max(0.0, min(1.0, score))
 
@@ -1337,113 +1407,14 @@ class SmartContextManager:
     ) -> Dict[int, float]:
         """Return learned keep-scores keyed by message index.
 
-        Fits a lightweight logistic model on weak labels from candidate nodes
-        and converts class probabilities into a keep-priority expectation.
+        DISABLED: sklearn import causes Windows WMI hang.
+        Returns empty dict to use fallback keyword-based scoring.
         """
-        sklearn_classes = _ensure_sklearn()
-        if sklearn_classes is None or len(candidates) < 8:
-            self.last_policy_stats = {"used": False, "reason": "insufficient_data_or_no_sklearn"}
-            return {}
-        LogisticRegression, Pipeline, StandardScaler = sklearn_classes
-
-        # Build metadata features.
-        type_vocab = {
-            "file_read": 0,
-            "command_output": 1,
-            "search_result": 2,
-            "assistant_analysis": 3,
-            "assistant_tool_call": 4,
-            "todo_result": 5,
-            "context_result": 6,
-            "other_tool_result": 7,
-            "guidance_nudge": 8,
-            "introspect_result": 9,
-            "other": 10,
-        }
-        rows_meta: List[List[float]] = []
-        y_list: List[int] = []
-        for (index, content, tokens, msg_type, _source, role), relevance in zip(candidates, relevance_scores):
-            age_from_end = max(0, (total - 1) - index)
-            rows_meta.append(
-                [
-                    float(type_vocab.get(msg_type, 10)),
-                    float(tokens),
-                    float(age_from_end),
-                    float(relevance),
-                    1.0 if msg_type == "guidance_nudge" else 0.0,
-                    float(len(content) / 1000.0),
-                ]
-            )
-            y_list.append(self._policy_weak_label(msg_type, tokens, role))
-
-        y = np.asarray(y_list, dtype=np.int32)
-        classes = np.unique(y)
-        if len(classes) < 2:
-            self.last_policy_stats = {"used": False, "reason": "single_class"}
-            return {}
-
-        x_meta = np.asarray(rows_meta, dtype=np.float32)
-
-        # Add embedding features (same semantic scorer used elsewhere).
-        contents = [c[1][:_EMBED_MAX_CHARS] for c in candidates]
-        x_emb: np.ndarray
-        if self._scorer.available:
-            try:
-                embs = self._scorer._embed_batch(contents)
-                x_emb = np.asarray(embs, dtype=np.float32)
-            except Exception:
-                x_emb = np.zeros((len(candidates), 8), dtype=np.float32)
-        else:
-            # Lightweight lexical fallback to keep runtime deterministic.
-            fallback_rows: List[List[float]] = []
-            for _idx, content, _tok, _mt, _src, _role in candidates:
-                lower = content.lower()
-                fallback_rows.append(
-                    [
-                        float(lower.count("error")),
-                        float(lower.count("introspect")),
-                        float(lower.count("todo")),
-                        float(lower.count("<read_file>")),
-                        float(lower.count("<execute_command>")),
-                        1.0 if "result" in lower else 0.0,
-                        1.0 if query_text and any(k in lower for k in query_text.lower().split()) else 0.0,
-                        float(len(content) / 1200.0),
-                    ]
-                )
-            x_emb = np.asarray(fallback_rows, dtype=np.float32)
-
-        x = np.concatenate([x_meta, x_emb], axis=1)
-
-        # Robust logistic fit.
-        try:
-            model = Pipeline(
-                [
-                    ("scale", StandardScaler(with_mean=False)),
-                    ("clf", LogisticRegression(max_iter=1200, class_weight="balanced")),
-                ]
-            )
-            model.fit(x, y)
-            proba = model.predict_proba(x)
-            class_ids = [int(c) for c in model.named_steps["clf"].classes_]
-        except Exception as e:
-            self.last_policy_stats = {"used": False, "reason": f"fit_failed:{type(e).__name__}"}
-            return {}
-
-        keep_weights = {0: 1.0, 1: 0.65, 2: 0.35, 3: 0.0}
-        keep_scores: Dict[int, float] = {}
-        for row_idx, (index, *_rest) in enumerate(candidates):
-            expected_keep = 0.0
-            for col_idx, cls_id in enumerate(class_ids):
-                expected_keep += float(proba[row_idx, col_idx]) * keep_weights.get(cls_id, 0.5)
-            keep_scores[index] = max(0.0, min(1.0, expected_keep))
-
         self.last_policy_stats = {
-            "used": True,
-            "samples": len(candidates),
-            "features": int(x.shape[1]),
-            "classes": sorted(set(int(v) for v in y_list)),
+            "used": False,
+            "reason": "sklearn_disabled_due_to_wmi_hang",
         }
-        return keep_scores
+        return {}
 
     # ------------------------------------------------------------------
     # Classification
@@ -1470,7 +1441,7 @@ class SmartContextManager:
                 return "guidance_nudge", "error-analysis"
 
         # Tool results are stored as user messages: "[tool_name result]\n..."
-        tool_match = re.match(r'\[(\w+) result(?:\s*-[^\]]+)?\]', content)
+        tool_match = re.match(r"\[(\w+) result(?:\s*-[^\]]+)?\]", content)
         if tool_match:
             tool_name = tool_match.group(1)
 
@@ -1480,7 +1451,7 @@ class SmartContextManager:
                 return "file_read", path
 
             if tool_name == "execute_command":
-                cmd_match = re.search(r'\$\s*(.+?)(?:\n|$)', content)
+                cmd_match = re.search(r"\$\s*(.+?)(?:\n|$)", content)
                 cmd = cmd_match.group(1).strip()[:80] if cmd_match else "command"
                 return "command_output", cmd
 
@@ -1504,14 +1475,16 @@ class SmartContextManager:
 
         # Assistant messages
         if role == "assistant":
-            has_tool_xml = bool(re.search(
-                r'<(?:read_file|write_to_file|replace_in_file|execute_command'
-                r'|search_files|list_files|manage_todos'
-                r'|list_context|remove_from_context|analyze_image|web_search'
-                r'|check_background_process|stop_background_process'
-                r'|list_background_processes|introspect)\b',
-                content,
-            ))
+            has_tool_xml = bool(
+                re.search(
+                    r"<(?:read_file|write_to_file|replace_in_file|execute_command"
+                    r"|search_files|list_files|manage_todos"
+                    r"|list_context|remove_from_context|analyze_image|web_search"
+                    r"|check_background_process|stop_background_process"
+                    r"|list_background_processes|introspect)\b",
+                    content,
+                )
+            )
             if has_tool_xml:
                 return "assistant_tool_call", "tool_call"
             return "assistant_analysis", "analysis"
@@ -1523,7 +1496,11 @@ class SmartContextManager:
     # ------------------------------------------------------------------
 
     def _compact_message(
-        self, content: str, msg_type: str, source: str, message_index: int = -1,
+        self,
+        content: str,
+        msg_type: str,
+        source: str,
+        message_index: int = -1,
     ) -> Tuple[str, str]:
         """Create a compact replacement.
 
@@ -1540,9 +1517,7 @@ class SmartContextManager:
 
         if msg_type == "file_read":
             defs = _extract_definitions(lines)
-            summary = (
-                f"{', '.join(defs[:5])}" if defs else f"{line_count} lines"
-            )
+            summary = f"{', '.join(defs[:5])}" if defs else f"{line_count} lines"
             trace = CompactionTrace("file_read", source, summary)
             return trace.format_notice(), summary
 
@@ -1554,18 +1529,18 @@ class SmartContextManager:
                     summary += f" … {sig[-1][:40]}"
             else:
                 summary = f"{line_count} lines of output"
-            
+
             # Store full result before compacting (with error handling)
             result_id = None
             try:
                 result_id = self.result_storage.store_result(
                     tool_name="execute_command",
                     content=content,
-                    message_index=message_index
+                    message_index=message_index,
                 )
             except Exception as e:
                 log.warning(f"Failed to store command output for retrieval: {e}")
-            
+
             if result_id:
                 notice = (
                     f"[{COMPACT_MARKER} Command output: {summary}]\n"
@@ -1579,22 +1554,18 @@ class SmartContextManager:
             return notice, summary
 
         if msg_type == "search_result":
-            match_count = sum(
-                1 for l in lines if ":" in l and re.search(r":\d+:", l)
-            )
+            match_count = sum(1 for l in lines if ":" in l and re.search(r":\d+:", l))
             summary = f"{match_count} matches"
-            
+
             # Store full result before compacting (with error handling)
             result_id = None
             try:
                 result_id = self.result_storage.store_result(
-                    tool_name="search",
-                    content=content,
-                    message_index=message_index
+                    tool_name="search", content=content, message_index=message_index
                 )
             except Exception as e:
                 log.warning(f"Failed to store search results for retrieval: {e}")
-            
+
             if result_id:
                 notice = (
                     f"[{COMPACT_MARKER} Search results: {summary}]\n"
@@ -1610,11 +1581,11 @@ class SmartContextManager:
         if msg_type == "assistant_tool_call":
             # Keep the XML tool call, compress the reasoning before it.
             xml_match = re.search(
-                r'(<(?:read_file|write_to_file|replace_in_file|execute_command'
-                r'|search_files|list_files|manage_todos'
-                r'|list_context|remove_from_context|analyze_image|web_search'
-                r'|check_background_process|stop_background_process'
-                r'|list_background_processes)\b.*)',
+                r"(<(?:read_file|write_to_file|replace_in_file|execute_command"
+                r"|search_files|list_files|manage_todos"
+                r"|list_context|remove_from_context|analyze_image|web_search"
+                r"|check_background_process|stop_background_process"
+                r"|list_background_processes)\b.*)",
                 content,
                 re.DOTALL,
             )
@@ -1641,10 +1612,12 @@ class SmartContextManager:
                     result_id = self.result_storage.store_result(
                         tool_name="assistant_response",
                         content=content,
-                        message_index=message_index
+                        message_index=message_index,
                     )
                 except Exception as e:
-                    log.warning(f"Failed to store assistant response for retrieval: {e}")
+                    log.warning(
+                        f"Failed to store assistant response for retrieval: {e}"
+                    )
 
                 excerpt = _sample_start_middle_end(content)
                 summary_line = next(
@@ -1686,7 +1659,7 @@ class SmartContextManager:
             return trace.format_notice(), summary
 
         if msg_type == "introspect_result":
-            focus_match = re.search(r'FOCUS:\s*(.+?)(?:\n|$)', content)
+            focus_match = re.search(r"FOCUS:\s*(.+?)(?:\n|$)", content)
             focus_hint = focus_match.group(1).strip()[:80] if focus_match else ""
             first_lines = content.split("\n", 6)
             excerpt = " ".join(l.strip() for l in first_lines[2:6] if l.strip())[:200]
@@ -1702,20 +1675,18 @@ class SmartContextManager:
 
         if msg_type == "other_tool_result":
             # Extract tool name from content (format: [tool_name result])
-            tool_match = re.match(r'\[(\w+) result', content)
+            tool_match = re.match(r"\[(\w+) result", content)
             tool_name = tool_match.group(1) if tool_match else source
-            
+
             # Store full result before compacting (with error handling)
             result_id = None
             try:
                 result_id = self.result_storage.store_result(
-                    tool_name=tool_name,
-                    content=content,
-                    message_index=message_index
+                    tool_name=tool_name, content=content, message_index=message_index
                 )
             except Exception as e:
                 log.warning(f"Failed to store tool result for {tool_name}: {e}")
-            
+
             summary = lines[0][:80] if lines else f"{tool_name} result"
             if result_id:
                 notice = (
@@ -1768,21 +1739,24 @@ class SmartContextManager:
             _set_content(msg, notice)
             tokens_freed += freed
             compacted += 1
-            self.compaction_traces.append(CompactionTrace(
-                original_type="guidance_nudge",
-                source=source,
-                summary=summary,
-                tokens_freed=freed,
-            ))
+            self.compaction_traces.append(
+                CompactionTrace(
+                    original_type="guidance_nudge",
+                    source=source,
+                    summary=summary,
+                    tokens_freed=freed,
+                )
+            )
 
         if compacted and len(self.compaction_traces) > self._max_traces:
-            self.compaction_traces = self.compaction_traces[-self._max_traces:]
+            self.compaction_traces = self.compaction_traces[-self._max_traces :]
         return messages, tokens_freed, compacted
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_content(msg: Any) -> str:
     """Extract string content from a message (object or dict)."""
@@ -1803,7 +1777,9 @@ def _extract_definitions(lines: List[str], limit: int = 150) -> List[str]:
     defs: List[str] = []
     for line in lines[:limit]:
         s = line.strip()
-        if s.startswith(("def ", "class ", "func ", "function ", "export ", "type ", "interface ")):
+        if s.startswith(
+            ("def ", "class ", "func ", "function ", "export ", "type ", "interface ")
+        ):
             name = s.split("(")[0].split("{")[0].split(":")[0].strip()
             defs.append(name)
     return defs
@@ -1816,6 +1792,7 @@ def _normalize_path(path: str) -> str:
     and strips leading drive letters for comparison.
     """
     import os
+
     p = path.replace("\\", "/").strip()
     # Case-insensitive on Windows
     if os.name == "nt":
@@ -1834,7 +1811,7 @@ def _sample_start_middle_end(content: str, chunk_chars: int = 450) -> str:
     n = len(text)
     start = text[:chunk_chars].rstrip()
     mid_start = max(0, (n // 2) - (chunk_chars // 2))
-    middle = text[mid_start: mid_start + chunk_chars].strip()
+    middle = text[mid_start : mid_start + chunk_chars].strip()
     end = text[-chunk_chars:].lstrip()
 
     return (

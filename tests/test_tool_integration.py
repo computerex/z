@@ -193,23 +193,6 @@ class TestParseXmlTool:
         assert result.parameters["tool"] == "web_search"
         assert "Montgomery AL events March 2026" in result.parameters["arguments"]
 
-    def test_parse_list_context(self):
-        content = """Let me check what's in my context.
-
-<list_context>
-</list_context>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "list_context"
-
-    def test_parse_remove_from_context(self):
-        content = """<remove_from_context>
-<id>3</id>
-</remove_from_context>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "remove_from_context"
-        assert result.parameters["id"] == "3"
 
     def test_no_tool_call(self):
         """Plain text with no XML should return None."""
@@ -892,8 +875,7 @@ class TestPromptIntegration:
         required_tools = [
             "read_file", "write_to_file", "replace_in_file",
             "execute_command", "list_files", "search_files",
-            "web_search", "list_context", "remove_from_context",
-            "manage_todos",
+            "web_search", "manage_todos",
             "create_plan",
         ]
         for tool in required_tools:
@@ -920,10 +902,9 @@ class TestPromptIntegration:
             'execute_command', 'list_files', 'search_files',
             'check_background_process', 'stop_background_process', 
             'list_background_processes',
-            'list_context', 'remove_from_context', 'analyze_image', 
-            'web_search', 'manage_todos', 'retrieve_tool_result',
+            'analyze_image', 'web_search', 'manage_todos', 'retrieve_tool_result',
             'mcp_search_tools', 'mcp_list_tools', 'mcp_call_tool',
-            'create_plan', 'update_agent_rules', 'introspect',
+            'create_plan', 'introspect',
         }
         
         # Every tool in the prompt should be parseable

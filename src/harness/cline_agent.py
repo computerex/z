@@ -16,6 +16,7 @@ from rich.markup import escape as rich_escape
 from rich.markdown import Markdown
 
 import time as _time_mod_agent
+
 _agent_import_t0 = _time_mod_agent.perf_counter()
 
 from .streaming_client import StreamingJSONClient, StreamingMessage
@@ -23,28 +24,49 @@ from .config import Config
 from .prompts import get_system_prompt
 from .cost_tracker import get_global_tracker
 from .logger import debug_print
-from .interrupt import is_interrupted, is_background_requested, reset_interrupt, start_monitoring, stop_monitoring
-from .context_management import (
-    estimate_tokens, estimate_messages_tokens, get_model_limits,
-    truncate_conversation, truncate_output, truncate_file_content,
-    DuplicateDetector
+from .interrupt import (
+    is_interrupted,
+    is_background_requested,
+    reset_interrupt,
+    start_monitoring,
+    stop_monitoring,
 )
+from .context_management import (
+    estimate_tokens,
+    estimate_messages_tokens,
+    get_model_limits,
+    truncate_conversation,
+    truncate_output,
+    truncate_file_content,
+    DuplicateDetector,
+)
+
 _agent_t1 = _time_mod_agent.perf_counter()
 
 from .tool_handlers import ToolHandlers
+
 _agent_t2 = _time_mod_agent.perf_counter()
 
 from .todo_manager import TodoManager, TodoStatus
 from .smart_context import SmartContextManager
+
 _agent_t3 = _time_mod_agent.perf_counter()
 
 from .status_line import StatusLine
 from .workspace_index import WorkspaceIndex
-from .tool_registry import get_tool_names, get_complex_content_tools, get_metrics, get_tool_def, get_param_names
+from .tool_registry import (
+    get_tool_names,
+    get_complex_content_tools,
+    get_metrics,
+    get_tool_def,
+    get_param_names,
+)
 from .logger import get_logger, log_exception, truncate as log_truncate
+
 _agent_t4 = _time_mod_agent.perf_counter()
 
 import logging as _logging_mod
+
 _boot_logger = _logging_mod.getLogger("harness.agent.boot")
 _boot_logger.info(
     "cline_agent import breakdown: core=%.0fms tool_handlers=%.0fms smart_context=%.0fms rest=%.0fms total=%.0fms",
@@ -56,6 +78,7 @@ _boot_logger.info(
 )
 
 log = get_logger("agent")
+
 
 def _normalize_display_text(text: str) -> str:
     """Decode common escaped sequences for prettier terminal rendering.
@@ -103,28 +126,31 @@ def _normalize_display_text(text: str) -> str:
 @dataclass
 class ContextItem:
     """An item in the agent's context container."""
+
     id: int
     type: str  # 'file', 'fragment', 'command_output', 'search_result'
     source: str  # path or command
     content: str
     added_at: float = field(default_factory=time.time)
     line_range: Optional[Tuple[int, int]] = None  # for file fragments
-    
+
     def summary(self) -> str:
         """Return a short summary of this item."""
         lines = len(self.content.splitlines())
         size = len(self.content)
         age = int(time.time() - self.added_at)
-        age_str = f"{age}s" if age < 60 else f"{age//60}m"
-        
-        if self.type == 'file':
+        age_str = f"{age}s" if age < 60 else f"{age // 60}m"
+
+        if self.type == "file":
             if self.line_range:
                 return f"[{self.id}] file: {self.source} (L{self.line_range[0]}-{self.line_range[1]}, {lines}L, {size}B, {age_str} ago)"
             return f"[{self.id}] file: {self.source} ({lines}L, {size}B, {age_str} ago)"
-        elif self.type == 'command_output':
-            cmd_short = self.source[:40] + '...' if len(self.source) > 40 else self.source
+        elif self.type == "command_output":
+            cmd_short = (
+                self.source[:40] + "..." if len(self.source) > 40 else self.source
+            )
             return f"[{self.id}] cmd: {cmd_short} ({lines}L, {size}B, {age_str} ago)"
-        elif self.type == 'search_result':
+        elif self.type == "search_result":
             return f"[{self.id}] search: {self.source} ({lines} matches, {age_str} ago)"
         else:
             return f"[{self.id}] {self.type}: {self.source} ({lines}L, {age_str} ago)"
@@ -132,58 +158,60 @@ class ContextItem:
 
 class ContextContainer:
     """Manages the agent's working context."""
-    
+
     def __init__(self):
         self._items: Dict[int, ContextItem] = {}
         self._next_id = 1
-    
-    def add(self, type: str, source: str, content: str, line_range: Optional[Tuple[int, int]] = None) -> int:
+
+    def add(
+        self,
+        type: str,
+        source: str,
+        content: str,
+        line_range: Optional[Tuple[int, int]] = None,
+    ) -> int:
         """Add an item to context. Returns the item ID."""
         item_id = self._next_id
         self._next_id += 1
         self._items[item_id] = ContextItem(
-            id=item_id,
-            type=type,
-            source=source,
-            content=content,
-            line_range=line_range
+            id=item_id, type=type, source=source, content=content, line_range=line_range
         )
         return item_id
-    
+
     def remove(self, item_id: int) -> bool:
         """Remove an item from context."""
         if item_id in self._items:
             del self._items[item_id]
             return True
         return False
-    
+
     def remove_by_source(self, source: str) -> int:
         """Remove all items with matching source. Returns count removed."""
         to_remove = [id for id, item in self._items.items() if source in item.source]
         for id in to_remove:
             del self._items[id]
         return len(to_remove)
-    
+
     def get(self, item_id: int) -> Optional[ContextItem]:
         return self._items.get(item_id)
-    
+
     def list_items(self) -> List[ContextItem]:
         return list(self._items.values())
-    
+
     def total_size(self) -> int:
         """Total character count of all context items."""
         return sum(len(item.content) for item in self._items.values())
-    
+
     def summary(self) -> str:
         """Return a summary of all context items."""
         if not self._items:
             return "Context is empty."
-        
+
         lines = [f"Context ({len(self._items)} items, {self.total_size():,} chars):"]
         for item in sorted(self._items.values(), key=lambda x: x.added_at):
             lines.append(f"  {item.summary()}")
         return "\n".join(lines)
-    
+
     def clear(self):
         self._items.clear()
         self._next_id = 1
@@ -192,14 +220,15 @@ class ContextContainer:
 @dataclass
 class ParsedToolCall:
     """Parsed tool call from XML format."""
+
     name: str
     parameters: Dict[str, str]
 
 
 def strip_thinking_blocks(content: str) -> str:
     """Remove <thinking> blocks and orphaned </thinking> tags from content."""
-    content = re.sub(r'<thinking>.*?</thinking>\s*', '', content, flags=re.DOTALL)
-    content = re.sub(r'</thinking>\s*', '', content)
+    content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL)
+    content = re.sub(r"</thinking>\s*", "", content)
     return content
 
 
@@ -212,28 +241,30 @@ def _normalize_tool_xml(content: str) -> str:
     Into:     <tool_name>..params..</tool_name>
     """
     tool_names = get_tool_names()
-    tool_names_alt = '|'.join(re.escape(n) for n in tool_names)
-    pattern = rf'<tool_call>\s*({tool_names_alt})\s*>'
-    content = re.sub(pattern, lambda m: f'<{m.group(1)}>', content)
+    tool_names_alt = "|".join(re.escape(n) for n in tool_names)
+    pattern = rf"<tool_call>\s*({tool_names_alt})\s*>"
+    content = re.sub(pattern, lambda m: f"<{m.group(1)}>", content)
     return content
 
 
 def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     """Parse Cline-style XML tool call from content.
-    
+
     Uses smart matching to handle XML examples embedded in content.
     For tools with complex content (write_to_file, replace_in_file), uses
     greedy matching to get the full content including any nested examples.
     """
     content = strip_thinking_blocks(content)
     content = _normalize_tool_xml(content)
-    
+
     tool_names = get_tool_names()
 
     # Compatibility parser for shorthand style:
     # <tool_call>list_files path="." recursive="true" />
     shorthand_matches = []
-    shorthand_pattern = r'<tool_call>\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([^<]*?)(?:/>\s*|>\s*</tool_call>)'
+    shorthand_pattern = (
+        r"<tool_call>\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([^<]*?)(?:/>\s*|>\s*</tool_call>)"
+    )
     for m in re.finditer(shorthand_pattern, content, re.DOTALL):
         tool_name = m.group(1)
         if tool_name not in tool_names:
@@ -250,67 +281,73 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
             value = attr.group(2) or attr.group(3) or attr.group(4) or ""
             params[key] = html.unescape(value)
 
-        shorthand_matches.append((m.end(), ParsedToolCall(name=tool_name, parameters=params)))
+        shorthand_matches.append(
+            (m.end(), ParsedToolCall(name=tool_name, parameters=params))
+        )
 
     if shorthand_matches:
         shorthand_matches.sort(key=lambda x: x[0], reverse=True)
         return shorthand_matches[0][1]
-    
+
     # Tools that may have nested XML examples in their content
     complex_content_tools = set(get_complex_content_tools())
-    
+
     # Find ALL tool matches across ALL tool types, track by end position
     all_matches = []  # (end_pos, tool_name, match)
-    
+
     for tool_name in tool_names:
         if tool_name in complex_content_tools:
             # For complex tools with nested XML examples in content:
             # Find FIRST opening tag and LAST closing tag to get the outermost block
-            open_tag = f'<{tool_name}>'
-            close_tag = f'</{tool_name}>'
-            
+            open_tag = f"<{tool_name}>"
+            close_tag = f"</{tool_name}>"
+
             # Find the FIRST opening tag (the real tool call, not an inner example)
             first_open = content.find(open_tag)
             if first_open == -1:
                 continue
-            
+
             # Find the LAST closing tag (the real closing, not an inner example)
             last_close = content.rfind(close_tag)
             if last_close == -1 or last_close < first_open:
                 continue
-            
+
             # Create a match-like object
             inner_start = first_open + len(open_tag)
             inner_content = content[inner_start:last_close]
-            
+
             class FakeMatch:
                 def __init__(self, start_pos, end_pos, inner):
                     self._start = start_pos
                     self._end = end_pos
                     self._inner = inner
+
                 def end(self):
                     return self._end
+
                 def group(self, n):
-                    return self._inner if n == 1 else content[self._start:self._end]
-            
-            fake_match = FakeMatch(first_open, last_close + len(close_tag), inner_content)
+                    return self._inner if n == 1 else content[self._start : self._end]
+
+            fake_match = FakeMatch(
+                first_open, last_close + len(close_tag), inner_content
+            )
             all_matches.append((fake_match.end(), tool_name, fake_match))
         else:
             # For simple tools, use non-greedy matching
-            pattern = rf'<{tool_name}>(.*?)</{tool_name}>'
+            pattern = rf"<{tool_name}>(.*?)</{tool_name}>"
             for match in re.finditer(pattern, content, re.DOTALL):
                 all_matches.append((match.end(), tool_name, match))
-    
+
     if not all_matches:
         return None
-    
+
     # Use the match with the highest end position (last in content)
     all_matches.sort(key=lambda x: x[0], reverse=True)
     _, tool_name, match = all_matches[0]
-    
+
     inner = match.group(1)
     params = {}
-    
+
     # Parse parameters - order matters because large payload params may contain nested XML.
     # Use canonical tool definitions so parser stays aligned with the registry.
     tool_def = get_tool_def(tool_name)
@@ -318,24 +355,24 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     complex_param_names = {"content", "diff", "replacement", "arguments"}
     complex_params = [p for p in param_names if p in complex_param_names]
     simple_params = [p for p in param_names if p not in complex_param_names]
-    
+
     # For tools with complex content (write_to_file, replace_in_file),
     # extract the content/diff FIRST, then only search for other params
     # in the portion BEFORE <content> or <diff> starts
     search_area = inner  # default: search entire inner block
-    
+
     # Find where complex params start (to avoid extracting example XML from content)
     for cp in complex_params:
-        open_tag = f'<{cp}>'
+        open_tag = f"<{cp}>"
         start = inner.find(open_tag)
         if start != -1:
             # Only search for simple params BEFORE the complex param starts
             search_area = inner[:start]
             break
-    
+
     for param_name in simple_params:
-        open_tag = f'<{param_name}>'
-        close_tag = f'</{param_name}>'
+        open_tag = f"<{param_name}>"
+        close_tag = f"</{param_name}>"
         start = search_area.find(open_tag)
         if start == -1:
             continue
@@ -343,13 +380,13 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         end = search_area.find(close_tag, start)
         if end == -1:
             continue
-        value = search_area[start + len(open_tag):end]
-        value = value.strip('\n')
+        value = search_area[start + len(open_tag) : end]
+        value = value.strip("\n")
         params[param_name] = value
-    
+
     for param_name in complex_params:
-        open_tag = f'<{param_name}>'
-        close_tag = f'</{param_name}>'
+        open_tag = f"<{param_name}>"
+        close_tag = f"</{param_name}>"
         start = inner.find(open_tag)
         if start == -1:
             continue
@@ -357,22 +394,22 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
         end = inner.rfind(close_tag)
         if end == -1 or end < start:
             continue
-        value = inner[start + len(open_tag):end]
+        value = inner[start + len(open_tag) : end]
         # Only strip leading/trailing newlines for complex content, preserve internal structure
         if param_name in complex_param_names:
             # For complex content like file content, preserve internal structure but clean edges
-            value = value.strip('\n')
+            value = value.strip("\n")
         else:
             # For simple params, strip all whitespace
             value = value.strip()
         params[param_name] = value
-    
+
     return ParsedToolCall(name=tool_name, parameters=params)
 
 
 def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
     """Parse ALL tool calls from content, in the order they appear.
-    
+
     Unlike parse_xml_tool (which returns only the last match),
     this returns every non-overlapping tool call so that the agent
     can execute them sequentially. This is essential for batched
@@ -380,19 +417,19 @@ def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
     """
     stripped = strip_thinking_blocks(content)
     stripped = _normalize_tool_xml(stripped)
-    
+
     tool_names = get_tool_names()
-    
+
     # Find all <tool_name>...</tool_name> blocks with their positions
     matches = []  # (start_pos, end_pos, tool_name)
     for tool_name in tool_names:
-        pattern = rf'<{tool_name}>(.*?)</{tool_name}>'
+        pattern = rf"<{tool_name}>(.*?)</{tool_name}>"
         for m in re.finditer(pattern, stripped, re.DOTALL):
             matches.append((m.start(), m.end(), tool_name, m.group(0)))
-    
+
     # Sort by start position (order of appearance)
     matches.sort(key=lambda x: x[0])
-    
+
     # Remove overlapping matches (keep earliest)
     filtered = []
     last_end = -1
@@ -400,20 +437,20 @@ def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
         if start >= last_end:
             filtered.append((start, end, tool_name, raw))
             last_end = end
-    
+
     # Parse each match into a ParsedToolCall using the existing parser
     results = []
     for start, end, tool_name, raw in filtered:
         parsed = parse_xml_tool(raw)
         if parsed:
             results.append(parsed)
-    
+
     return results
 
 
 class ClineAgent:
     """Agent using Cline-style XML tool format with streaming."""
-    
+
     def __init__(
         self,
         config: Config,
@@ -427,41 +464,43 @@ class ClineAgent:
         self.max_iterations = max_iterations
         self.workspace_path = str(Path.cwd().resolve())
         self.cost_tracker = get_global_tracker()
-        
+
         # Provider management and Claude CLI config
         self.providers = providers or {}
         self.claude_cli_config = claude_cli_config or {}
-        
+
         # Conversation history
         self.messages: List[StreamingMessage] = []
         self._initialized = False
-        
+
         # Context container for managing loaded content
         self.context = ContextContainer()
-        
+
         # Duplicate file detection
         self._duplicate_detector = DuplicateDetector()
-        
+
         # Todo list for tracking goals/objectives
         self.todo_manager = TodoManager()
-        
+
         # Smart context manager for intelligent eviction/compaction
         _t0_sc = time.perf_counter()
         self.smart_context = SmartContextManager(self.todo_manager)
-        log.info("SmartContextManager init: %.1fms", (time.perf_counter() - _t0_sc) * 1000)
-        
+        log.info(
+            "SmartContextManager init: %.1fms", (time.perf_counter() - _t0_sc) * 1000
+        )
+
         # Token tracking
         self._last_token_count = 0
-        
+
         # Persistent bottom status line
         self.status = StatusLine(enabled=sys.stdin.isatty())
-        
+
         # Thrash detection: track consecutive edit failures per file
         # {filepath: {"failures": int, "last_error": str}}
         self._edit_failures: Dict[str, dict] = {}
-        
-        self._active_client = None            # set during _run_loop for introspect tool access
-        
+
+        self._active_client = None  # set during _run_loop for introspect tool access
+
         # Tool handlers - delegates all tool execution logic
         self.tool_handlers = ToolHandlers(
             config=self.config,
@@ -469,22 +508,26 @@ class ClineAgent:
             workspace_path=self.workspace_path,
             context=self.context,
             duplicate_detector=self._duplicate_detector,
-            context_manager=self.smart_context
+            context_manager=self.smart_context,
         )
         # Set claude model for create_plan tool
         self.tool_handlers._claude_model = self.claude_cli_config.get("model")
-        
+
         # Workspace index — built once at startup
         _t0_idx = time.perf_counter()
         self.workspace_index = WorkspaceIndex(self.workspace_path).build()
-        log.info("WorkspaceIndex.build(): %.1fms (%d files)",
-                 (time.perf_counter() - _t0_idx) * 1000,
-                 len(self.workspace_index.files))
+        log.info(
+            "WorkspaceIndex.build(): %.1fms (%d files)",
+            (time.perf_counter() - _t0_idx) * 1000,
+            len(self.workspace_index.files),
+        )
 
     def _system_prompt(self) -> str:
         """Return the system prompt for this agent."""
         debug_print("_system_prompt: getting workspace summary...")
-        index_summary = self.workspace_index.summary() if self.workspace_index.files else ""
+        index_summary = (
+            self.workspace_index.summary() if self.workspace_index.files else ""
+        )
         debug_print("_system_prompt: calling get_system_prompt...")
         base = get_system_prompt(self.workspace_path, project_map=index_summary)
         # Keep MCP server inventory visible in the active system prompt so the
@@ -504,7 +547,9 @@ class ClineAgent:
                 cfg = servers.get(name, {}) or {}
                 enabled = bool(cfg.get("enabled", True))
                 stype = str(cfg.get("type", "local"))
-                lines.append(f"- {name} [{stype}] ({'enabled' if enabled else 'disabled'})")
+                lines.append(
+                    f"- {name} [{stype}] ({'enabled' if enabled else 'disabled'})"
+                )
             debug_print("_system_prompt: DONE with servers")
             return base + "\n\n====\n\n" + "\n".join(lines)
         debug_print("_system_prompt: DONE no servers")
@@ -526,7 +571,7 @@ class ClineAgent:
             return False
         self.messages.insert(0, StreamingMessage(role="system", content=new_prompt))
         return True
-    
+
     @staticmethod
     def _thinking_system_prompt() -> str:
         """System prompt for deep analysis mode (introspect tool) — no tool definitions."""
@@ -550,19 +595,19 @@ class ClineAgent:
             "Write several paragraphs minimum. Go deep. The more thorough your "
             "analysis, the better your subsequent actions will be."
         )
-    
+
     def _build_introspect_prompt(self, focus: str = "") -> str:
         """Build the user message for an introspect tool call."""
         parts = []
-        
+
         if focus:
             parts.append(f"FOCUS: {focus}")
-        
+
         # Active task context
         todo_state = self.todo_manager.format_list(include_completed=False)
         if todo_state and "empty" not in todo_state.lower():
             parts.append(f"\nACTIVE TASKS:\n{todo_state}")
-        
+
         parts.append(
             "\n[DEEP ANALYSIS MODE — No tools available. "
             "Analyze everything you've learned from the conversation above. "
@@ -570,53 +615,51 @@ class ClineAgent:
             "identify issues, plan your approach. "
             "The full conversation history above contains all the information you've gathered.]"
         )
-        
+
         return "\n".join(parts)
-    
-    _INTROSPECT_MIN_CHARS = 600   # minimum chars for a useful introspect pass
+
+    _INTROSPECT_MIN_CHARS = 600  # minimum chars for a useful introspect pass
     _INTROSPECT_MAX_CONTINUATIONS = 2  # max times to push for more depth
-    
+
     async def _execute_introspect(self, focus: str = "") -> str:
         """Execute the introspect tool: a dedicated API call with no tools available.
-        
+
         Makes a separate API call using a system prompt WITHOUT tool definitions,
         so the model can ONLY produce reasoning. If the initial output is too short,
         we push the model to continue (up to _INTROSPECT_MAX_CONTINUATIONS times).
         The thinking output is returned as the tool result.
         """
         log.info("Introspect tool called: focus=%r", focus[:80] if focus else "(none)")
-        
+
         self.console.print(
             "  [dim]•[/dim] [magenta]Introspect[/magenta]"
             + (f" [dim]{focus[:80]}[/dim]" if focus else "")
         )
-        
+
         # Build thinking messages: swap system prompt, keep conversation, add thinking prompt
         thinking_messages = list(self.messages)  # shallow copy
         thinking_messages[0] = StreamingMessage(
-            role="system",
-            content=self._thinking_system_prompt()
+            role="system", content=self._thinking_system_prompt()
         )
-        thinking_messages.append(StreamingMessage(
-            role="user",
-            content=self._build_introspect_prompt(focus)
-        ))
-        
+        thinking_messages.append(
+            StreamingMessage(role="user", content=self._build_introspect_prompt(focus))
+        )
+
         full_thinking = ""
         api_t0 = time.time()
         client = self._active_client
-        
+
         # Build a set of tag patterns to suppress from the live stream.
         # The thinking model sometimes emits XML tool tags despite being told not to.
         _suppress_tags = set(get_tool_names())
-        
+
         for attempt in range(1 + self._INTROSPECT_MAX_CONTINUATIONS):
             first_token = True
             chunk_text = ""
-            _tag_buf = ""       # buffer for potential XML tag detection
-            _in_tag = False     # currently inside a < ... > sequence
-            _suppress = False   # current tag should be suppressed
-            
+            _tag_buf = ""  # buffer for potential XML tag detection
+            _in_tag = False  # currently inside a < ... > sequence
+            _suppress = False  # current tag should be suppressed
+
             def _flush_tag_buf():
                 """Flush buffered tag to stdout (it wasn't a tool tag)."""
                 nonlocal _tag_buf
@@ -624,28 +667,28 @@ class ClineAgent:
                     sys.stdout.write(_tag_buf)
                     sys.stdout.flush()
                     _tag_buf = ""
-            
+
             def on_chunk(c: str):
                 nonlocal chunk_text, first_token, _tag_buf, _in_tag, _suppress
                 if first_token:
                     self.status.clear()
                     first_token = False
                 chunk_text += c
-                
+
                 # Stream filtering: suppress XML tool tags from display
-                if c == '<' and not _in_tag:
+                if c == "<" and not _in_tag:
                     _flush_tag_buf()
                     _in_tag = True
                     _suppress = False
                     _tag_buf = c
                     return
-                
+
                 if _in_tag:
                     _tag_buf += c
-                    if c == '>':
+                    if c == ">":
                         # Tag complete — check if it's a tool tag
                         # Extract tag name: <tagname ...> or </tagname>
-                        m = re.match(r'</?(\w+)', _tag_buf)
+                        m = re.match(r"</?(\w+)", _tag_buf)
                         if m and m.group(1) in _suppress_tags:
                             # Suppress this tag (don't display it)
                             _tag_buf = ""
@@ -658,10 +701,10 @@ class ClineAgent:
                         _flush_tag_buf()
                         _in_tag = False
                     return
-                
+
                 sys.stdout.write(c)
                 sys.stdout.flush()
-            
+
             self.status.update(
                 "Thinking deeply..." if attempt == 0 else "Continuing analysis...",
                 StatusLine.SENDING,
@@ -674,9 +717,9 @@ class ClineAgent:
             )
             _flush_tag_buf()  # flush any trailing buffered content
             self.status.clear()
-            
+
             full_thinking += chunk_text
-            
+
             # Track cost for this sub-call
             input_tokens = estimate_messages_tokens(thinking_messages)
             output_tokens = estimate_tokens(chunk_text)
@@ -687,120 +730,91 @@ class ClineAgent:
                 duration_ms=0,
                 tool_calls=0,
                 finish_reason=response.finish_reason,
-                extra_usage=response.usage if getattr(response, "usage", None) else None,
+                extra_usage=response.usage
+                if getattr(response, "usage", None)
+                else None,
             )
-            
+
             # Check if output is deep enough
-            if (len(full_thinking) >= self._INTROSPECT_MIN_CHARS
-                    or response.interrupted
-                    or response.is_truncated):
+            if (
+                len(full_thinking) >= self._INTROSPECT_MIN_CHARS
+                or response.interrupted
+                or response.is_truncated
+            ):
                 break
-            
+
             # Output too short — push for more depth
-            log.info("Introspect attempt %d too short (%d chars, need %d). Continuing.",
-                     attempt + 1, len(full_thinking), self._INTROSPECT_MIN_CHARS)
-            
+            log.info(
+                "Introspect attempt %d too short (%d chars, need %d). Continuing.",
+                attempt + 1,
+                len(full_thinking),
+                self._INTROSPECT_MIN_CHARS,
+            )
+
             # Add the short response and a continuation prompt
-            thinking_messages.append(StreamingMessage(
-                role="assistant", content=chunk_text
-            ))
-            thinking_messages.append(StreamingMessage(
-                role="user",
-                content=(
-                    f"You've only written {len(full_thinking.split())} words. "
-                    "Go much deeper. Trace through specific code paths you read. "
-                    "Identify concrete bugs with file names and line numbers. "
-                    "Consider race conditions, resource leaks, error handling gaps. "
-                    "What are the non-obvious issues? What could break under load? "
-                    "Continue your analysis."
+            thinking_messages.append(
+                StreamingMessage(role="assistant", content=chunk_text)
+            )
+            thinking_messages.append(
+                StreamingMessage(
+                    role="user",
+                    content=(
+                        f"You've only written {len(full_thinking.split())} words. "
+                        "Go much deeper. Trace through specific code paths you read. "
+                        "Identify concrete bugs with file names and line numbers. "
+                        "Consider race conditions, resource leaks, error handling gaps. "
+                        "What are the non-obvious issues? What could break under load? "
+                        "Continue your analysis."
+                    ),
                 )
-            ))
-        
+            )
+
         print()  # newline after stream
         api_elapsed = time.time() - api_t0
-        
+
         # Strip XML tool tags that the thinking model sometimes emits
         # despite being told not to (it pattern-matches from conversation history).
-        _tool_names_pattern = '|'.join(re.escape(n) for n in get_tool_names())
+        _tool_names_pattern = "|".join(re.escape(n) for n in get_tool_names())
         full_thinking = re.sub(
-            rf'</?(?:{_tool_names_pattern})\b[^>]*>',
-            '', full_thinking
+            rf"</?(?:{_tool_names_pattern})\b[^>]*>", "", full_thinking
         ).strip()
-        
+
         word_count = len(full_thinking.split())
-        log.info("Introspect complete: %d words, %d chars, %.1fs",
-                 word_count, len(full_thinking), api_elapsed)
-        
+        log.info(
+            "Introspect complete: %d words, %d chars, %.1fs",
+            word_count,
+            len(full_thinking),
+            api_elapsed,
+        )
+
         result = (
             f"[Deep analysis complete — {word_count} words, {api_elapsed:.1f}s]\n\n"
             f"{full_thinking}"
         )
         return result
-    
-    
-    def _handle_update_agent_rules(self, params: Dict[str, str]) -> str:
-        """Append a rule/preference to the workspace agent.md file."""
-        rule = (params.get("rule") or "").strip()
-        if not rule:
-            return "Error: 'rule' parameter is required."
-        
-        category = (params.get("category") or "preference").strip().lower()
-        valid_categories = ("preference", "convention", "behavior", "project", "workflow")
-        if category not in valid_categories:
-            category = "preference"
-        
-        agent_md = Path(self.workspace_path) / "agent.md"
-        
-        # Build the entry
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d")
-        entry = f"\n## [{category}] — {timestamp}\n{rule}\n"
-        
-        # Create or append
-        is_new = not agent_md.exists() or agent_md.stat().st_size == 0
-        if is_new:
-            header = (
-                "# Agent Rules\n\n"
-                "This file contains project-specific rules, user preferences, and conventions.\n"
-                "The AI agent reads this file at the start of every session and follows all rules.\n"
-                "You can edit this file manually at any time.\n"
-            )
-            agent_md.write_text(header + entry, encoding="utf-8")
-            log.info("Created agent.md with initial rule: [%s] %s", category, rule[:80])
-        else:
-            with agent_md.open("a", encoding="utf-8") as f:
-                f.write(entry)
-            log.info("Appended to agent.md: [%s] %s", category, rule[:80])
-        
-        # Refresh the system prompt so the new rule takes effect immediately
-        if self.messages and self.messages[0].role == "system":
-            self.messages[0] = StreamingMessage(role="system", content=self._system_prompt())
-            log.debug("System prompt refreshed after agent.md update")
-        
-        return f"Rule recorded in agent.md [{category}]: {rule}"
-    
+
     async def cleanup_background_procs_async(self) -> None:
         """Terminate all background processes safely (async)."""
         return await self.tool_handlers.cleanup_background_procs_async()
-    
+
     def cleanup_background_procs(self) -> None:
         """Terminate all background processes safely (sync wrapper)."""
         return self.tool_handlers.cleanup_background_procs()
-    
+
     def list_background_procs(self) -> List[dict]:
         """List all background processes with their status."""
         return self.tool_handlers.list_background_procs()
-    
+
     def save_session(self, path: str) -> None:
         """Save conversation history and context."""
         import json
-        
+
         def sanitize_string(s) -> str:
             """Remove unicode surrogates that can't be encoded."""
             if isinstance(s, str):
-                return s.encode('utf-8', errors='replace').decode('utf-8')
+                return s.encode("utf-8", errors="replace").decode("utf-8")
             return s
-        
+
         def sanitize_content(content):
             """Sanitize message content (can be string or list for vision)."""
             if isinstance(content, str):
@@ -811,10 +825,14 @@ class ClineAgent:
                     if isinstance(item, dict):
                         sanitized = {}
                         for k, v in item.items():
-                            sanitized[k] = sanitize_string(v) if isinstance(v, str) else v
+                            sanitized[k] = (
+                                sanitize_string(v) if isinstance(v, str) else v
+                            )
                         result.append(sanitized)
                     else:
-                        result.append(sanitize_string(item) if isinstance(item, str) else item)
+                        result.append(
+                            sanitize_string(item) if isinstance(item, str) else item
+                        )
                 return result
             return content
 
@@ -837,31 +855,42 @@ class ClineAgent:
                             clean[k] = v
                     out.append(clean)
             return out or None
-        
+
         # Ensure session always persists a valid system prompt at index 0.
         if not self.messages or self.messages[0].role != "system":
-            self.messages.insert(0, StreamingMessage(role="system", content=self._system_prompt()))
+            self.messages.insert(
+                0, StreamingMessage(role="system", content=self._system_prompt())
+            )
 
         # Serialize context items
         context_items = []
         for item in self.context.list_items():
-            context_items.append({
-                "id": item.id,
-                "type": item.type,
-                "source": sanitize_string(item.source),
-                "content": sanitize_string(item.content),
-                "added_at": item.added_at,
-                "line_range": item.line_range
-            })
-        
+            context_items.append(
+                {
+                    "id": item.id,
+                    "type": item.type,
+                    "source": sanitize_string(item.source),
+                    "content": sanitize_string(item.content),
+                    "added_at": item.added_at,
+                    "line_range": item.line_range,
+                }
+            )
+
         data = {
             "workspace": self.workspace_path,
             "messages": [
                 {
                     "role": m.role,
                     "content": sanitize_content(m.content),
-                    **({"provider_blocks": sanitize_provider_blocks(getattr(m, "provider_blocks", None))}
-                       if getattr(m, "provider_blocks", None) else {}),
+                    **(
+                        {
+                            "provider_blocks": sanitize_provider_blocks(
+                                getattr(m, "provider_blocks", None)
+                            )
+                        }
+                        if getattr(m, "provider_blocks", None)
+                        else {}
+                    ),
                 }
                 for m in self.messages
             ],
@@ -871,17 +900,22 @@ class ClineAgent:
             "smart_context": self.smart_context.to_dict(),
         }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
-        log.debug("Session saved: path=%s messages=%d context_items=%d",
-                  path, len(self.messages), len(context_items))
-    
+        log.debug(
+            "Session saved: path=%s messages=%d context_items=%d",
+            path,
+            len(self.messages),
+            len(context_items),
+        )
+
     def load_session(self, path: str, inject_resume: bool = True) -> bool:
         """Load conversation history and context.
-        
+
         Args:
             path: Path to session file
             inject_resume: If True, adds a resume context message to help the model
         """
         import json
+
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             self.messages = [
@@ -892,20 +926,32 @@ class ClineAgent:
                 )
                 for m in data["messages"]
             ]
-            
+
             # CRITICAL: Verify system prompt integrity after load
             # If messages[0] is not a system prompt, inject a fresh one
             if not self.messages or self.messages[0].role != "system":
-                self.console.print("[yellow][!] Session missing system prompt - injecting fresh one[/yellow]")
-                system_msg = StreamingMessage(role="system", content=self._system_prompt())
+                self.console.print(
+                    "[yellow][!] Session missing system prompt - injecting fresh one[/yellow]"
+                )
+                system_msg = StreamingMessage(
+                    role="system", content=self._system_prompt()
+                )
                 self.messages.insert(0, system_msg)
             else:
                 # Verify system prompt has tool definitions (not truncated/evicted)
                 sys_content = self.messages[0].content
-                if not isinstance(sys_content, str) or "TOOL USE" not in sys_content or "read_file" not in sys_content:
-                    self.console.print("[yellow][!] System prompt appears corrupted - replacing with fresh one[/yellow]")
-                    self.messages[0] = StreamingMessage(role="system", content=self._system_prompt())
-            
+                if (
+                    not isinstance(sys_content, str)
+                    or "TOOL USE" not in sys_content
+                    or "read_file" not in sys_content
+                ):
+                    self.console.print(
+                        "[yellow][!] System prompt appears corrupted - replacing with fresh one[/yellow]"
+                    )
+                    self.messages[0] = StreamingMessage(
+                        role="system", content=self._system_prompt()
+                    )
+
             # Load context if present
             if "context" in data:
                 self.context.clear()
@@ -916,49 +962,64 @@ class ClineAgent:
                         source=item_data["source"],
                         content=item_data["content"],
                         added_at=item_data.get("added_at", time.time()),
-                        line_range=tuple(item_data["line_range"]) if item_data.get("line_range") else None
+                        line_range=tuple(item_data["line_range"])
+                        if item_data.get("line_range")
+                        else None,
                     )
                     self.context._items[item.id] = item
-                self.context._next_id = data.get("context_next_id", max(self.context._items.keys(), default=0) + 1)
-            
+                self.context._next_id = data.get(
+                    "context_next_id", max(self.context._items.keys(), default=0) + 1
+                )
+
             # Load todos if present
             if "todos" in data:
                 self.todo_manager = TodoManager.from_dict(data["todos"])
                 # Reconnect smart context manager to the loaded todo manager
                 self.smart_context = SmartContextManager(self.todo_manager)
-            
+
             # Load smart context state if present
             if "smart_context" in data:
                 self.smart_context.load_dict(data["smart_context"])
-            
+
             # Inject a resume context message to orient the model
             if inject_resume and len(self.messages) > 1:
                 resume_msg = self._build_resume_context()
                 if resume_msg:
-                    self.messages.append(StreamingMessage(role="user", content=resume_msg))
-            
+                    self.messages.append(
+                        StreamingMessage(role="user", content=resume_msg)
+                    )
+
             self._initialized = True
-            log.info("Session loaded: path=%s messages=%d context_items=%d",
-                     path, len(self.messages), len(self.context.list_items()))
+            log.info(
+                "Session loaded: path=%s messages=%d context_items=%d",
+                path,
+                len(self.messages),
+                len(self.context.list_items()),
+            )
             return True
         except Exception as e:
             log_exception(log, f"Failed to load session from {path}", e)
             self.console.print(f"[red][!] Failed to load session: {e}[/red]")
             return False
-    
+
     def _build_resume_context(self) -> str:
         """Build a resume context message from conversation history."""
         # Find the last few exchanges to summarize
         summary_parts = []
-        
+
         # Get last user request (not tool results)
         last_user_request = None
         for msg in reversed(self.messages):
             text = msg.content if isinstance(msg.content, str) else ""
-            if msg.role == "user" and text and not text.startswith("[") and not text.startswith("<"):
+            if (
+                msg.role == "user"
+                and text
+                and not text.startswith("[")
+                and not text.startswith("<")
+            ):
                 last_user_request = text[:200]
                 break
-        
+
         # Get last assistant action
         last_action = None
         for msg in reversed(self.messages):
@@ -976,20 +1037,20 @@ class ClineAgent:
                 else:
                     last_action = "responding"
                 break
-        
+
         if last_user_request:
             summary_parts.append(f"Last request: {last_user_request}...")
         if last_action:
             summary_parts.append(f"Last action: {last_action}")
-        
+
         if not summary_parts:
             return ""
-        
+
         # Include todo list state if available
         todo_state = self.todo_manager.format_list(include_completed=False)
         if todo_state and "empty" not in todo_state.lower():
             summary_parts.append(f"\n{todo_state}")
-        
+
         # Include eviction recovery notice
         recovery = self.smart_context.build_context_recovery_notice()
         if recovery:
@@ -997,7 +1058,7 @@ class ClineAgent:
 
         heuristic = " ".join(summary_parts)
         return f"[Session resumed. {heuristic}. Continue where you left off or ask what you need to know.]"
-    
+
     def clear_history(self) -> None:
         """Clear conversation history and context."""
         debug_print("clear_history: START")
@@ -1014,11 +1075,11 @@ class ClineAgent:
         self._last_token_count = 0
         self._initialized = True
         debug_print("clear_history: DONE")
-    
+
     def get_token_count(self) -> int:
         """Get estimated token count of current conversation."""
         return estimate_messages_tokens(self.messages)
-    
+
     def get_context_stats(self) -> dict:
         """Get context statistics for display."""
         _, max_allowed = get_model_limits(self.config.model)
@@ -1037,13 +1098,13 @@ class ClineAgent:
             "todos_completed": len(todos) - len(active_todos),
             "evictions": len(self.smart_context.compaction_traces),
         }
-    
+
     def get_token_breakdown(self) -> dict:
         """Get detailed breakdown of where tokens are going."""
         system_tokens = 0
         conv_tokens = 0
         message_sizes = []
-        
+
         for i, msg in enumerate(self.messages):
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             tokens = estimate_tokens(content)
@@ -1052,43 +1113,40 @@ class ClineAgent:
             else:
                 conv_tokens += tokens
                 # Track largest messages for diagnosis
-                preview = content[:100].replace('\n', ' ')
-                message_sizes.append({
-                    "index": i,
-                    "role": msg.role,
-                    "tokens": tokens,
-                    "preview": preview
-                })
-        
+                preview = content[:100].replace("\n", " ")
+                message_sizes.append(
+                    {"index": i, "role": msg.role, "tokens": tokens, "preview": preview}
+                )
+
         # Sort by size, get top 5
         message_sizes.sort(key=lambda x: x["tokens"], reverse=True)
         largest = message_sizes[:5]
-        
+
         return {
             "system": system_tokens,
             "conversation": conv_tokens,
             "total": system_tokens + conv_tokens,
             "message_count": len(self.messages) - 1,  # minus system
-            "largest_messages": largest
+            "largest_messages": largest,
         }
-    
+
     def dump_context(self, path: Optional[str] = None, reason: str = "") -> str:
         """Dump the full model context (all messages) to a JSON log file.
-        
+
         This writes EXACTLY what would be sent to the API, making it possible
         to trace what the model actually sees.
-        
+
         Args:
             path: Output file path. If None, auto-generates timestamped path.
             reason: Optional label for why this dump was triggered.
-            
+
         Returns:
             Path to the dump file.
         """
         if path is None:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(self.workspace_path, f".harness_context_{ts}.json")
-        
+
         # Build the exact payload that would be sent to the API
         messages_data = []
         for i, msg in enumerate(self.messages):
@@ -1096,22 +1154,32 @@ class ClineAgent:
             content_str = content if isinstance(content, str) else str(content)
             tokens = estimate_tokens(content_str)
             char_count = len(content_str)
-            messages_data.append({
-                "index": i,
-                "role": msg.role,
-                "tokens_est": tokens,
-                "chars": char_count,
-                "content": content,
-            })
-        
+            messages_data.append(
+                {
+                    "index": i,
+                    "role": msg.role,
+                    "tokens_est": tokens,
+                    "chars": char_count,
+                    "content": content,
+                }
+            )
+
         total_tokens = estimate_messages_tokens(self.messages)
         _, max_allowed = get_model_limits(self.config.model)
-        
+
         # System prompt analysis
-        sys_msg = self.messages[0] if self.messages and self.messages[0].role == "system" else None
+        sys_msg = (
+            self.messages[0]
+            if self.messages and self.messages[0].role == "system"
+            else None
+        )
         sys_analysis = {}
         if sys_msg:
-            sys_content = sys_msg.content if isinstance(sys_msg.content, str) else str(sys_msg.content)
+            sys_content = (
+                sys_msg.content
+                if isinstance(sys_msg.content, str)
+                else str(sys_msg.content)
+            )
             sys_analysis = {
                 "chars": len(sys_content),
                 "tokens_est": estimate_tokens(sys_content),
@@ -1125,7 +1193,7 @@ class ClineAgent:
                 "first_200": sys_content[:200],
                 "last_200": sys_content[-200:],
             }
-        
+
         dump = {
             "timestamp": datetime.datetime.now().isoformat(),
             "reason": reason,
@@ -1136,44 +1204,50 @@ class ClineAgent:
                 "total_messages": len(self.messages),
                 "total_tokens_est": total_tokens,
                 "max_allowed": max_allowed,
-                "percent_used": f"{(total_tokens / max_allowed * 100):.1f}%" if max_allowed > 0 else "N/A",
+                "percent_used": f"{(total_tokens / max_allowed * 100):.1f}%"
+                if max_allowed > 0
+                else "N/A",
                 "system_prompt_analysis": sys_analysis,
             },
             "todos": self.todo_manager.to_dict(),
-            "compaction_traces": [t.format_notice() for t in self.smart_context.compaction_traces],
+            "compaction_traces": [
+                t.format_notice() for t in self.smart_context.compaction_traces
+            ],
             "messages": messages_data,
         }
-        
-        Path(path).write_text(json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        Path(path).write_text(
+            json.dumps(dump, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
         return path
-    
+
     def compact_history(self, strategy: str = "half") -> int:
         """Compact conversation history by removing older messages.
-        
+
         Strategies:
         - 'half': Remove first half of messages
         - 'quarter': Remove first quarter of messages
         - 'last2': Keep only last 2 exchanges
-        
+
         Returns: number of tokens removed
         """
         before = estimate_messages_tokens(self.messages)
-        
+
         # Find messages (skip system prompt at index 0)
         if len(self.messages) <= 1:
             return 0
-        
+
         # Map strategy names
-        strat_map = {'last2': 'lastTwo'}
+        strat_map = {"last2": "lastTwo"}
         strat = strat_map.get(strategy, strategy)
-        
+
         # Apply truncation to messages (preserves system prompt)
         result = truncate_conversation(self.messages, strat)
         self.messages = result.messages
-        
+
         after = estimate_messages_tokens(self.messages)
         return before - after
-    
+
     async def run_message(
         self,
         user_content: Union[str, List[Dict[str, Any]]],
@@ -1185,25 +1259,29 @@ class ClineAgent:
             log_input = user_content
         else:
             log_input = user_label or "[multimodal message]"
-        log.info("agent.run START interrupt=%s msg_count=%d input=%s",
-                 enable_interrupt, len(self.messages),
-                 log_truncate(log_input, 150))
-        
+        log.info(
+            "agent.run START interrupt=%s msg_count=%d input=%s",
+            enable_interrupt,
+            len(self.messages),
+            log_truncate(log_input, 150),
+        )
+
         # Initialize system prompt if first run
         if not self._initialized:
             self.messages = [
                 StreamingMessage(role="system", content=self._system_prompt()),
             ]
             self._initialized = True
-            log.debug("System prompt initialised (%d chars)", len(self.messages[0].content))
+            log.debug(
+                "System prompt initialised (%d chars)", len(self.messages[0].content)
+            )
         else:
             # Keep MCP/provider config changes reflected without requiring restart.
             self.refresh_system_prompt()
-        
+
         # Add user message
         self.messages.append(StreamingMessage(role="user", content=user_content))
 
-        
         # Capture original request for todo grounding (first real user message)
         if (
             isinstance(user_content, str)
@@ -1211,12 +1289,12 @@ class ClineAgent:
             and not user_content.startswith("[")
         ):
             self.todo_manager.set_original_request(user_content[:500])
-        
+
         # Start keyboard monitoring for escape/Ctrl+C.
         # Keep this enabled even in non-tty wrappers so SIGINT soft-cancel works.
         if enable_interrupt:
             start_monitoring()
-        
+
         try:
             result = await self._run_loop()
             log.info("agent.run DONE result_len=%d", len(result or ""))
@@ -1233,13 +1311,14 @@ class ClineAgent:
         """Run the agent with a plain text user request."""
         return await self.run_message(user_input, enable_interrupt=enable_interrupt)
 
-    
     async def _run_loop(self) -> str:
         """Main agent loop."""
         # Client is created inside the loop so that reasoning-mode switches
         # (which change self.config) take effect on the very next API call.
         client: Optional[StreamingJSONClient] = None
-        _client_model: Optional[str] = None  # track which config the client was built for
+        _client_model: Optional[str] = (
+            None  # track which config the client was built for
+        )
 
         async def _ensure_client():
             """Create or recreate the streaming client when config changes."""
@@ -1254,8 +1333,11 @@ class ClineAgent:
                     await client.__aexit__(None, None, None)
                 except Exception:
                     pass
-                log.info("Closed old client (was %s), opening new one for %s",
-                         _client_model, config_key)
+                log.info(
+                    "Closed old client (was %s), opening new one for %s",
+                    _client_model,
+                    config_key,
+                )
             client = None
             _client_model = None
             new_client = StreamingJSONClient(
@@ -1274,15 +1356,24 @@ class ClineAgent:
             _hidden_only_retry_count = 0
             _hidden_only_retry_max = 2
             for iteration in range(self.max_iterations):
+                log.info("[WATCHDOG] Starting iteration %d", iteration + 1)
+
                 # (Re)create client if needed
+                log.debug("[WATCHDOG] Ensuring client...")
                 await _ensure_client()
+                log.debug("[WATCHDOG] Client ready")
+
                 _, max_allowed = get_model_limits(self.config.model)
 
-                log.debug("_run_loop iteration=%d/%d tokens=%d msgs=%d",
-                          iteration + 1, self.max_iterations,
-                          estimate_messages_tokens(self.messages), len(self.messages))
+                log.debug(
+                    "_run_loop iteration=%d/%d tokens=%d msgs=%d",
+                    iteration + 1,
+                    self.max_iterations,
+                    estimate_messages_tokens(self.messages),
+                    len(self.messages),
+                )
                 self.status.set_iterations(iteration + 1, self.max_iterations)
-                
+
                 # Check for interrupt BEFORE starting new iteration
                 # This ensures user can stop between iterations
                 if is_interrupted():
@@ -1290,71 +1381,127 @@ class ClineAgent:
                     self.status.clear()
                     self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
                     return "[Interrupted - session preserved. Type to continue or start new request]"
-                
+
                 # Reset only background flag (not interrupt) for this iteration
                 # User needs to explicitly continue after interrupt
-                
+
                 # Check if we need to compact/truncate conversation
-                self._last_token_count = estimate_messages_tokens(self.messages)
+                # Wrap in try/timeout to prevent hangs from corrupt context
+                try:
+                    import asyncio
+
+                    self._last_token_count = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: estimate_messages_tokens(self.messages)
+                        ),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.error("Token estimation timed out - context may be corrupt")
+                    self.console.print("[red]Error: Token estimation timed out[/red]")
+                    # Fallback: truncate aggressively
+                    from .context_management import truncate_conversation
+
+                    result = truncate_conversation(self.messages, strategy="lastTwo")
+                    self.messages = result.messages
+                    self._last_token_count = estimate_messages_tokens(self.messages)
+
+                # Check interrupt before expensive operations
+                if is_interrupted():
+                    log.info("Interrupted before semantic maintenance")
+                    self.status.clear()
+                    return "[Interrupted]"
 
                 # Continuous semantic maintenance (lightweight) every turn.
                 # Keeps stale guidance/noise trimmed even before hard thresholds.
-                self.messages, _maint_freed, _maint_report = self.smart_context.semantic_maintenance_tick(
-                    self.messages, max_allowed, current_tokens=self._last_token_count
-                )
+                try:
+                    self.messages, _maint_freed, _maint_report = (
+                        self.smart_context.semantic_maintenance_tick(
+                            self.messages,
+                            max_allowed,
+                            current_tokens=self._last_token_count,
+                        )
+                    )
+                except Exception as e:
+                    log.error("Semantic maintenance failed: %s", e)
+                    _maint_freed = 0
+                    _maint_report = "error"
                 if _maint_freed > 0:
                     self._last_token_count = estimate_messages_tokens(self.messages)
-                    log.info("Semantic maintenance freed %d tokens. Report: %s", _maint_freed, _maint_report)
-                    self.console.print(f"[dim][~] Semantic maintenance: freed {_maint_freed:,} tokens ({_maint_report})[/dim]")
+                    log.info(
+                        "Semantic maintenance freed %d tokens. Report: %s",
+                        _maint_freed,
+                        _maint_report,
+                    )
+                    self.console.print(
+                        f"[dim][~] Semantic maintenance: freed {_maint_freed:,} tokens ({_maint_report})[/dim]"
+                    )
 
-                compact_threshold = int(max_allowed * 0.85)
+                compact_threshold = int(max_allowed * self.config.compaction_threshold)
                 if self._last_token_count > compact_threshold:
-                    log.info("Context compaction triggered: %d tokens > %d threshold",
-                             self._last_token_count, compact_threshold)
+                    log.info(
+                        "Context compaction triggered: %d tokens > %d threshold",
+                        self._last_token_count,
+                        compact_threshold,
+                    )
                     self.status.update("Compacting context...", StatusLine.COMPACTING)
                     # Smart compaction: dedup → compact low-priority → evict lowest-scored
                     self.messages, freed, report = self.smart_context.compact_context(
-                        self.messages, max_allowed, current_tokens=self._last_token_count
+                        self.messages,
+                        max_allowed,
+                        current_tokens=self._last_token_count,
                     )
                     if freed > 0:
                         self._last_token_count = estimate_messages_tokens(self.messages)
-                        log.info("Compaction freed %d tokens, now %d tokens. Report: %s",
-                                 freed, self._last_token_count, report)
-                        self.console.print(f"[dim][!] Smart compaction: freed {freed:,} tokens ({report})[/dim]")
-                        
+                        log.info(
+                            "Compaction freed %d tokens, now %d tokens. Report: %s",
+                            freed,
+                            self._last_token_count,
+                            report,
+                        )
+                        self.console.print(
+                            f"[dim][!] Smart compaction: freed {freed:,} tokens ({report})[/dim]"
+                        )
+
                         # Inject reorientation so the agent knows context changed
-                        todo_state = self.todo_manager.format_list(include_completed=False)
+                        todo_state = self.todo_manager.format_list(
+                            include_completed=False
+                        )
                         recovery = self.smart_context.build_context_recovery_notice()
-                        
+
                         reorientation = "[CONTEXT COMPACTED - Re-orienting]\n"
                         if todo_state and "empty" not in todo_state.lower():
                             reorientation += f"\n{todo_state}\n"
                         if recovery:
                             reorientation += f"\n{recovery}\n"
                         reorientation += "\nCheck your todos and continue working on the current in-progress item."
-                        
-                        self.messages.append(StreamingMessage(
-                            role="user", content=reorientation
-                        ))
-                
+
+                        self.messages.append(
+                            StreamingMessage(role="user", content=reorientation)
+                        )
+
                 # Auto-dump context before API call if debug enabled
                 if os.environ.get("HARNESS_DEBUG_CONTEXT"):
                     dump_path = self.dump_context(
                         reason=f"pre_api_call_iter_{iteration}"
                     )
-                    self.console.print(f"[dim][DEBUG] Context dumped to {dump_path}[/dim]")
-                
+                    self.console.print(
+                        f"[dim][DEBUG] Context dumped to {dump_path}[/dim]"
+                    )
+
                 # Show status: sending request
                 token_info = f"{self._last_token_count // 1000}k tokens"
                 self.status.update(f"Sending to LLM ({token_info})", StatusLine.SENDING)
-                
+
                 full_content = ""
                 first_token = True
                 _defer_markdown_render = bool(sys.stdout.isatty())
                 _payload_progress_step = 32 * 1024
                 _payload_next_report = _payload_progress_step
                 _payload_announced = False
-                _stream_payload_enabled = os.environ.get("HARNESS_STREAM_CODE_CHANGES", "1") != "0"
+                _stream_payload_enabled = (
+                    os.environ.get("HARNESS_STREAM_CODE_CHANGES", "1") != "0"
+                )
                 _stream_tool_param = {
                     "write_to_file": "content",
                     "replace_in_file": "diff",
@@ -1370,7 +1517,10 @@ class ClineAgent:
                 _stream_payload_line_limit = 220
 
                 def _stream_process_tag(raw_tag: str):
-                    nonlocal _stream_tool_stack, _stream_in_payload, _stream_payload_line
+                    nonlocal \
+                        _stream_tool_stack, \
+                        _stream_in_payload, \
+                        _stream_payload_line
                     tag = raw_tag.strip()
                     m = re.match(r"</?\s*([a-zA-Z_][a-zA-Z0-9_]*)", tag)
                     if not m:
@@ -1457,22 +1607,27 @@ class ClineAgent:
                             _stream_payload_line += c
                             if c == "\n":
                                 _stream_emit_payload_line()
-                            elif len(_stream_payload_line) >= _stream_payload_line_limit * 2:
+                            elif (
+                                len(_stream_payload_line)
+                                >= _stream_payload_line_limit * 2
+                            ):
                                 _stream_emit_payload_line(force=True)
-                
+
                 # ── XML stream filter ────────────────────────────────────
                 # Suppresses raw XML tool tags from the live terminal while
                 # full_content still accumulates everything for parsing.
                 # IMPORTANT: chat_stream_raw passes MULTI-CHARACTER chunks
                 # to on_chunk, so we iterate char-by-char internally.
-                _sf_tool_names = set(get_tool_names()) | {'tool_call'}
-                _sf_thinking_tags = {'thinking', 'think'}
+                _sf_tool_names = set(get_tool_names()) | {"tool_call"}
+                _sf_thinking_tags = {
+                    "thinking"
+                }  # Removed "think" to allow </think> in content
                 _sf_suppressing: Optional[str] = None  # tool block being eaten
                 _sf_thinking_suppress = False  # eating content inside <thinking>
                 _sf_tag_buf = ""
                 _sf_in_tag = False
                 _sf_had_visible = False
-                
+
                 def _sf_flush():
                     nonlocal _sf_tag_buf, _sf_had_visible
                     if _sf_tag_buf:
@@ -1483,8 +1638,13 @@ class ClineAgent:
 
                 def _sf_char(c: str):
                     """Process a single character through the filter."""
-                    nonlocal _sf_suppressing, _sf_thinking_suppress, _sf_tag_buf, _sf_in_tag, _sf_had_visible
-                    
+                    nonlocal \
+                        _sf_suppressing, \
+                        _sf_thinking_suppress, \
+                        _sf_tag_buf, \
+                        _sf_in_tag, \
+                        _sf_had_visible
+
                     # ── SUPPRESS_BLOCK: eat everything until </tool_name> ──
                     if _sf_suppressing:
                         _sf_tag_buf += c
@@ -1493,16 +1653,16 @@ class ClineAgent:
                             _sf_suppressing = None
                             _sf_tag_buf = ""
                         elif len(_sf_tag_buf) > len(close) + 30:
-                            _sf_tag_buf = _sf_tag_buf[-(len(close) + 10):]
+                            _sf_tag_buf = _sf_tag_buf[-(len(close) + 10) :]
                         return
-                    
+
                     # ── THINKING_SUPPRESS: route content to reasoning display ──
                     if _sf_thinking_suppress:
                         _sf_tag_buf += c
                         for tag in _sf_thinking_tags:
                             close = f"</{tag}>"
                             if _sf_tag_buf.endswith(close):
-                                text = _sf_tag_buf[:-len(close)]
+                                text = _sf_tag_buf[: -len(close)]
                                 if text:
                                     on_reasoning(text)
                                 _sf_thinking_suppress = False
@@ -1512,15 +1672,15 @@ class ClineAgent:
                             on_reasoning(_sf_tag_buf[:-20])
                             _sf_tag_buf = _sf_tag_buf[-20:]
                         return
-                    
+
                     # ── DETECT_TAG: buffering after '<' ──
                     if _sf_in_tag:
                         _sf_tag_buf += c
-                        if c == '>':
-                            m = re.match(r'</?(\w+)', _sf_tag_buf)
+                        if c == ">":
+                            m = re.match(r"</?(\w+)", _sf_tag_buf)
                             if m:
                                 tag = m.group(1)
-                                is_close = _sf_tag_buf.startswith('</')
+                                is_close = _sf_tag_buf.startswith("</")
                                 if tag in _sf_tool_names:
                                     if not is_close:
                                         _sf_suppressing = tag
@@ -1532,7 +1692,7 @@ class ClineAgent:
                                         _sf_tag_buf = ""
                                     else:
                                         _sf_thinking_suppress = True
-                                        _sf_tag_buf = ""
+                                    _sf_tag_buf = ""
                                     _sf_in_tag = False
                                     return
                             _sf_flush()
@@ -1542,30 +1702,40 @@ class ClineAgent:
                             _sf_flush()
                             _sf_in_tag = False
                         return
-                    
+
                     # ── NORMAL ──
-                    if c == '<':
+                    if c == "<":
                         _sf_in_tag = True
                         _sf_tag_buf = c
                         return
-                    
+
                     sys.stdout.write(c)
                     sys.stdout.flush()
                     _sf_had_visible = True
 
                 def on_chunk(chunk: str):
                     """Handle a (possibly multi-char) streaming chunk."""
-                    nonlocal full_content, first_token, _payload_next_report, _payload_announced
+                    nonlocal \
+                        full_content, \
+                        first_token, \
+                        _payload_next_report, \
+                        _payload_announced
                     full_content += chunk
                     if len(full_content) % 5000 == 0:
-                        log.debug("on_chunk: accumulated content_len=%d chunk_len=%d", len(full_content), len(chunk))
+                        log.debug(
+                            "on_chunk: accumulated content_len=%d chunk_len=%d",
+                            len(full_content),
+                            len(chunk),
+                        )
                     _stream_process_chunk(chunk)
                     if first_token:
                         # If native reasoning already started, don't repaint the
                         # status line here; \r-based status updates can overwrite
                         # the currently streaming thinking line.
                         if _defer_markdown_render and not _thinking_started:
-                            self.status.update("Receiving response...", StatusLine.STREAMING)
+                            self.status.update(
+                                "Receiving response...", StatusLine.STREAMING
+                            )
                         else:
                             self.status.clear()
                         first_token = False
@@ -1575,7 +1745,11 @@ class ClineAgent:
                             return
                         active_tool = None
                         payload_bytes = 0
-                        for tname in ("write_to_file", "replace_in_file", "replace_between_anchors"):
+                        for tname in (
+                            "write_to_file",
+                            "replace_in_file",
+                            "replace_between_anchors",
+                        ):
                             open_tag = f"<{tname}>"
                             close_tag = f"</{tname}>"
                             open_pos = full_content.rfind(open_tag)
@@ -1615,17 +1789,26 @@ class ClineAgent:
                 _thinking_prefix = f"{_ansi_dim}  {_ansi_reset}" if _tty else "  "
                 _thinking_header = (
                     f"\n{_ansi_dim}{_ansi_italic}Thinking:{_ansi_reset}\n"
-                    if _tty else "\nThinking:\n"
+                    if _tty
+                    else "\nThinking:\n"
                 )
 
                 def on_reasoning(chunk: str):
                     """Display native reasoning stream (reasoning_content)."""
-                    nonlocal full_reasoning, _thinking_started, _thinking_line_start, _thinking_line_has_text
+                    nonlocal \
+                        full_reasoning, \
+                        _thinking_started, \
+                        _thinking_line_start, \
+                        _thinking_line_has_text
                     if not chunk:
                         return
                     full_reasoning += chunk
                     if len(full_reasoning) % 3000 == 0:
-                        log.debug("on_reasoning: accumulated reasoning_len=%d chunk_len=%d", len(full_reasoning), len(chunk))
+                        log.debug(
+                            "on_reasoning: accumulated reasoning_len=%d chunk_len=%d",
+                            len(full_reasoning),
+                            len(chunk),
+                        )
                     if not _thinking_started and not chunk.strip():
                         return
                     if not _thinking_started:
@@ -1656,24 +1839,61 @@ class ClineAgent:
                 # Web search disabled by default to avoid unnecessary searches
                 # Use /search command for explicit web searches
                 api_t0 = time.time()
-                log.info("API request: model=%s tokens_in=%d iter=%d",
-                         self.config.model, self._last_token_count, iteration + 1)
-                response = await client.chat_stream_raw(
-                    messages=self.messages,
-                    on_content=on_chunk,
-                    on_reasoning=on_reasoning,
-                    check_interrupt=is_interrupted,
-                    enable_web_search=False,
-                    status_line=self.status,
+                log.info(
+                    "API request: model=%s tokens_in=%d iter=%d",
+                    self.config.model,
+                    self._last_token_count,
+                    iteration + 1,
                 )
+
+                # Wrap API call in timeout to prevent indefinite hangs
+                import asyncio
+
+                try:
+                    response = await asyncio.wait_for(
+                        client.chat_stream_raw(
+                            messages=self.messages,
+                            on_content=on_chunk,
+                            on_reasoning=on_reasoning,
+                            check_interrupt=is_interrupted,
+                            enable_web_search=False,
+                            status_line=self.status,
+                        ),
+                        timeout=120.0,  # 2 minute max for any single API call
+                    )
+                except asyncio.TimeoutError:
+                    log.error("API call timed out after 120s")
+                    self.console.print(
+                        "[red]Error: API call timed out after 2 minutes[/red]"
+                    )
+                    return "[Error - API timeout. Check connection and try again]"
+                except asyncio.CancelledError:
+                    # This happens when user presses Ctrl+C - client was closed
+                    log.info("API call cancelled by user interrupt")
+                    self.console.print("\n  [yellow]Interrupted by user[/yellow]")
+                    return "[Interrupted]"
+                except RuntimeError as e:
+                    if "closed" in str(e).lower():
+                        # Client was closed due to interrupt
+                        log.info("HTTP client closed due to interrupt")
+                        self.console.print("\n  [yellow]Interrupted[/yellow]")
+                        return "[Interrupted]"
+                    raise
                 api_elapsed = time.time() - api_t0
-                log.info("API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d reasoning_len=%d",
-                         response.finish_reason, response.interrupted, api_elapsed,
-                         len(full_content), len(full_reasoning))
-                log.debug("Response object details: raw_json_len=%s thinking_len=%s usage=%s",
-                          len(response.raw_json) if response.raw_json else 0,
-                          len(response.thinking) if response.thinking else 0,
-                          response.usage)
+                log.info(
+                    "API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d reasoning_len=%d",
+                    response.finish_reason,
+                    response.interrupted,
+                    api_elapsed,
+                    len(full_content),
+                    len(full_reasoning),
+                )
+                log.debug(
+                    "Response object details: raw_json_len=%s thinking_len=%s usage=%s",
+                    len(response.raw_json) if response.raw_json else 0,
+                    len(response.thinking) if response.thinking else 0,
+                    response.usage,
+                )
 
                 _sf_flush()  # Flush any trailing buffered content
                 _stream_emit_payload_line(force=True)
@@ -1684,31 +1904,39 @@ class ClineAgent:
                 self.status.clear()
                 if _sf_had_visible:
                     print()  # Newline after visible stream content
-                
+
                 # Display web search results if any
                 if response.has_web_search:
-                    self.console.print(f"\n[dim][Web Search: {len(response.web_search_results)} results][/dim]")
+                    self.console.print(
+                        f"\n[dim][Web Search: {len(response.web_search_results)} results][/dim]"
+                    )
                     for result in response.web_search_results[:3]:  # Show top 3
-                        self.console.print(f"[dim]  - {result.title[:60]}... ({result.media})[/dim]")
-                
+                        self.console.print(
+                            f"[dim]  - {result.title[:60]}... ({result.media})[/dim]"
+                        )
+
                 # Handle interrupt
                 if response.interrupted:
                     self.status.clear()
                     print("\n[STOP] Interrupted")
                     # Save partial response to history
                     if full_content.strip():
-                        self.messages.append(StreamingMessage(
-                            role="assistant", 
-                            content=full_content + "\n[interrupted by user]"
-                        ))
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content + "\n[interrupted by user]",
+                            )
+                        )
                     return "[Interrupted - press Enter to continue or type new request]"
-                
+
                 full_content = response.content or full_content
                 full_reasoning = response.thinking or full_reasoning
 
                 # Wrap reasoning into full_content so the pipeline can see it
                 if full_reasoning.strip():
-                    full_content = f"<thinking>\n{full_reasoning}\n</thinking>\n{full_content}"
+                    full_content = (
+                        f"<thinking>\n{full_reasoning}\n</thinking>\n{full_content}"
+                    )
 
                 # Track usage - estimate if API didn't return it
                 if response.usage:
@@ -1722,7 +1950,7 @@ class ClineAgent:
                     # Estimate tokens
                     input_tokens = estimate_messages_tokens(self.messages)
                     output_tokens = estimate_tokens(full_content)
-                
+
                 self.cost_tracker.record_call(
                     model=self.config.model,
                     input_tokens=input_tokens,
@@ -1730,67 +1958,96 @@ class ClineAgent:
                     duration_ms=0,
                     tool_calls=0,
                     finish_reason=response.finish_reason,
-                    extra_usage=response.usage if getattr(response, "usage", None) else None,
+                    extra_usage=response.usage
+                    if getattr(response, "usage", None)
+                    else None,
                 )
-                log.debug("Usage: in=%d out=%d finish_reason=%s",
-                          input_tokens, output_tokens, response.finish_reason)
-                
+                log.debug(
+                    "Usage: in=%d out=%d finish_reason=%s",
+                    input_tokens,
+                    output_tokens,
+                    response.finish_reason,
+                )
+
                 # Detect truncated output: the model hit max_tokens mid-response.
                 # Only trigger continuation if there's an UNCLOSED tool tag —
                 # meaning the model was genuinely cut off mid-tool-call.
                 # If finish_reason is "length" but all tags are closed, the
                 # response is usable; don't waste iterations on continuation.
                 has_unclosed = self._has_unclosed_tool_tag(full_content)
-                
+
                 if has_unclosed:
-                    log.warning("Output truncated (unclosed tool tag) at iteration %d (content_len=%d)",
-                                iteration + 1, len(full_content))
-                    self.console.print("[dim][!] Output truncated mid-tool-call — asking model to continue[/dim]")
+                    log.warning(
+                        "Output truncated (unclosed tool tag) at iteration %d (content_len=%d)",
+                        iteration + 1,
+                        len(full_content),
+                    )
+                    self.console.print(
+                        "[dim][!] Output truncated mid-tool-call — asking model to continue[/dim]"
+                    )
                     # Save the partial response and ask the model to finish
-                    self.messages.append(StreamingMessage(
-                        role="assistant",
-                        content=full_content,
-                        provider_blocks=getattr(response, "provider_content_blocks", None),
-                    ))
-                    self.messages.append(StreamingMessage(
-                        role="user",
-                        content=(
-                            "[SYSTEM: Your output was truncated before completing the tool call. "
-                            "Please continue from where you left off. Do NOT repeat what you already wrote — "
-                            "just output the remaining XML to complete the tool call.]"
-                        ),
-                    ))
+                    self.messages.append(
+                        StreamingMessage(
+                            role="assistant",
+                            content=full_content,
+                            provider_blocks=getattr(
+                                response, "provider_content_blocks", None
+                            ),
+                        )
+                    )
+                    self.messages.append(
+                        StreamingMessage(
+                            role="user",
+                            content=(
+                                "[SYSTEM: Your output was truncated before completing the tool call. "
+                                "Please continue from where you left off. Do NOT repeat what you already wrote — "
+                                "just output the remaining XML to complete the tool call.]"
+                            ),
+                        )
+                    )
                     continue  # next iteration will get the continuation
                 elif response.is_truncated:
                     # finish_reason was "length" but all tool tags are closed.
                     # The model finished its work; just log it and proceed.
-                    log.info("finish_reason=length but all tool tags closed — proceeding normally (content_len=%d)",
-                             len(full_content))
-                
+                    log.info(
+                        "finish_reason=length but all tool tags closed — proceeding normally (content_len=%d)",
+                        len(full_content),
+                    )
+
                 # Parse ALL XML tool calls from content (not just the last one)
                 all_tool_calls = parse_all_xml_tools(full_content)
                 tool_call = all_tool_calls[-1] if all_tool_calls else None
-                
+
                 if all_tool_calls:
                     _hidden_only_retry_count = 0
-                    log.info("Tools parsed: %d call(s) — %s",
-                             len(all_tool_calls),
-                             ", ".join(tc.name for tc in all_tool_calls))
+                    log.info(
+                        "Tools parsed: %d call(s) — %s",
+                        len(all_tool_calls),
+                        ", ".join(tc.name for tc in all_tool_calls),
+                    )
                 else:
-                    log.debug("No tool call parsed from response (len=%d)", len(full_content))
-                
+                    log.debug(
+                        "No tool call parsed from response (len=%d)", len(full_content)
+                    )
+
                 # Debug output - save full content for analysis
                 if os.environ.get("HARNESS_DEBUG"):
                     debug_file = os.path.join(self.workspace_path, ".harness_debug.txt")
                     with open(debug_file, "w", encoding="utf-8") as f:
-                        f.write(f"=== Full Model Output ({len(full_content)} chars) ===\n")
+                        f.write(
+                            f"=== Full Model Output ({len(full_content)} chars) ===\n"
+                        )
                         f.write(full_content)
-                        f.write(f"\n\n=== Parsed Tool Calls ({len(all_tool_calls)}) ===\n")
+                        f.write(
+                            f"\n\n=== Parsed Tool Calls ({len(all_tool_calls)}) ===\n"
+                        )
                         for tc in all_tool_calls:
                             f.write(f"  tool={tc.name}, params={tc.parameters}\n")
                     print(f"[DEBUG] Saved model output to {debug_file}")
-                    print(f"[DEBUG] parse_all_xml_tools returned: {len(all_tool_calls)} calls")
-                
+                    print(
+                        f"[DEBUG] parse_all_xml_tools returned: {len(all_tool_calls)} calls"
+                    )
+
                 if not tool_call:
                     # Detect invalid direct MCP tool-tag usage (e.g. <browser_navigate>).
                     # MCP tools must be invoked via mcp_call_tool, not direct tags.
@@ -1808,19 +2065,25 @@ class ClineAgent:
 
                     if invalid_tag_names:
                         bad = ", ".join(sorted(set(invalid_tag_names))[:5])
-                        self.messages.append(StreamingMessage(
-                            role="assistant",
-                            content=full_content,
-                            provider_blocks=getattr(response, "provider_content_blocks", None),
-                        ))
-                        self.messages.append(StreamingMessage(
-                            role="user",
-                            content=(
-                                "[SYSTEM: Invalid tool format. Do NOT emit direct tool tags like "
-                                f"{bad}. MCP tools must be called via <mcp_call_tool> with "
-                                "<server>, <tool>, and <arguments> JSON. Re-issue only valid harness tool XML.]"
-                            ),
-                        ))
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(
+                                    response, "provider_content_blocks", None
+                                ),
+                            )
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="user",
+                                content=(
+                                    "[SYSTEM: Invalid tool format. Do NOT emit direct tool tags like "
+                                    f"{bad}. MCP tools must be called via <mcp_call_tool> with "
+                                    "<server>, <tool>, and <arguments> JSON. Re-issue only valid harness tool XML.]"
+                                ),
+                            )
+                        )
                         continue
 
                     display_text = strip_thinking_blocks(full_content).strip()
@@ -1833,19 +2096,28 @@ class ClineAgent:
 
                     # Check for empty or thinking-only response and auto-retry with guidance
                     if not display_text or len(display_text) < 20:
-                        thinking_len = len(response.thinking) if response.thinking else 0
+                        thinking_len = (
+                            len(response.thinking) if response.thinking else 0
+                        )
 
                         # Model produced thinking-only or empty response
                         if thinking_len > 50 or not display_text:
-                            log.warning("Model returned empty response (thinking_len=%d, content_len=%d) - sending guidance nudge",
-                                       thinking_len, len(full_content))
+                            log.warning(
+                                "Model returned empty response (thinking_len=%d, content_len=%d) - sending guidance nudge",
+                                thinking_len,
+                                len(full_content),
+                            )
 
                             # Add the assistant's response (even if empty/thinking-only) to history
-                            self.messages.append(StreamingMessage(
-                                role="assistant",
-                                content=full_content,
-                                provider_blocks=getattr(response, "provider_content_blocks", None),
-                            ))
+                            self.messages.append(
+                                StreamingMessage(
+                                    role="assistant",
+                                    content=full_content,
+                                    provider_blocks=getattr(
+                                        response, "provider_content_blocks", None
+                                    ),
+                                )
+                            )
 
                             # Add a guidance message to nudge the model
                             guidance_msg = (
@@ -1853,80 +2125,124 @@ class ClineAgent:
                                 "Please provide a clear, written response to complete the user's request. "
                                 "If you need to use a tool, emit the appropriate tool call in XML format."
                             )
-                            self.messages.append(StreamingMessage(role="user", content=guidance_msg))
-                            self.console.print("\n  [dim]→ Model response was empty. Sending guidance nudge...[/dim]\n")
+                            self.messages.append(
+                                StreamingMessage(role="user", content=guidance_msg)
+                            )
+                            self.console.print(
+                                "\n  [dim]→ Model response was empty. Sending guidance nudge...[/dim]\n"
+                            )
 
                             # Continue to next iteration to try again
                             continue
 
                     # No tool call — final response to user
-                    self.messages.append(StreamingMessage(
-                        role="assistant",
-                        content=full_content,
-                        provider_blocks=getattr(response, "provider_content_blocks", None),
-                    ))
+                    self.messages.append(
+                        StreamingMessage(
+                            role="assistant",
+                            content=full_content,
+                            provider_blocks=getattr(
+                                response, "provider_content_blocks", None
+                            ),
+                        )
+                    )
                     return full_content
-                
+
                 # Execute tool(s) — if multiple calls found, run them all
                 tool_results_combined = []
                 _mode_switched = False
                 for tc_idx, tc in enumerate(all_tool_calls):
-                    self.status.update(f"Executing: {tc.name}" + (f" ({tc_idx+1}/{len(all_tool_calls)})" if len(all_tool_calls) > 1 else ""), StatusLine.TOOL_EXEC)
+                    self.status.update(
+                        f"Executing: {tc.name}"
+                        + (
+                            f" ({tc_idx + 1}/{len(all_tool_calls)})"
+                            if len(all_tool_calls) > 1
+                            else ""
+                        ),
+                        StatusLine.TOOL_EXEC,
+                    )
                     tool_t0 = time.time()
-                    log.info("Tool exec START: %s (%d/%d)", tc.name, tc_idx+1, len(all_tool_calls))
+                    log.info(
+                        "Tool exec START: %s (%d/%d)",
+                        tc.name,
+                        tc_idx + 1,
+                        len(all_tool_calls),
+                    )
                     tc_result = await self._execute_tool(tc)
                     tool_elapsed = time.time() - tool_t0
-                    log.info("Tool exec DONE: %s elapsed=%.1fs result_len=%d",
-                             tc.name, tool_elapsed, len(tc_result or ""))
-                    
+                    log.info(
+                        "Tool exec DONE: %s elapsed=%.1fs result_len=%d",
+                        tc.name,
+                        tool_elapsed,
+                        len(tc_result or ""),
+                    )
+
                     # Check for interrupt between tool calls
                     if is_interrupted():
-                        self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
-                        self.messages.append(StreamingMessage(
-                            role="assistant",
-                            content=full_content,
-                            provider_blocks=getattr(response, "provider_content_blocks", None),
-                        ))
+                        self.console.print(
+                            "\n[yellow][STOP] Interrupted by user[/yellow]"
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(
+                                    response, "provider_content_blocks", None
+                                ),
+                            )
+                        )
                         return "[Interrupted - session preserved. Type to continue or start new request]"
-                    
+
                     # Spill each individual result BEFORE combining, so that
                     # small results stay inline even when there are many calls.
                     tc_result = self.tool_handlers.spill_output_to_file(
                         tc_result, tc.name
                     )
-                    
+
                     if len(all_tool_calls) > 1:
-                        tool_results_combined.append(f"[{tc.name} result ({tc_idx+1}/{len(all_tool_calls)})]:\n{tc_result}")
+                        tool_results_combined.append(
+                            f"[{tc.name} result ({tc_idx + 1}/{len(all_tool_calls)})]:\n{tc_result}"
+                        )
                     else:
                         tool_results_combined.append(tc_result)
-                    
-                
+
                 tool_result = "\n\n".join(tool_results_combined)
 
                 # Add to history
-                self.messages.append(StreamingMessage(
-                    role="assistant",
-                    content=full_content,
-                    provider_blocks=getattr(response, "provider_content_blocks", None),
-                ))
-                
+                self.messages.append(
+                    StreamingMessage(
+                        role="assistant",
+                        content=full_content,
+                        provider_blocks=getattr(
+                            response, "provider_content_blocks", None
+                        ),
+                    )
+                )
+
                 # Build tool result message
                 header_parts = []
-                
+
                 # Active todos at top for grounding
                 active_todos = self.todo_manager.list_active()
                 if active_todos:
-                    in_progress = [t for t in active_todos if t.status.value == "in-progress"]
-                    not_started = [t for t in active_todos if t.status.value == "not-started"]
+                    in_progress = [
+                        t for t in active_todos if t.status.value == "in-progress"
+                    ]
+                    not_started = [
+                        t for t in active_todos if t.status.value == "not-started"
+                    ]
                     todo_hint = "[ACTIVE TODOS]"
                     if in_progress:
-                        todo_hint += "\n  In progress: " + "; ".join(f"[{t.id}] {t.title}" for t in in_progress)
+                        todo_hint += "\n  In progress: " + "; ".join(
+                            f"[{t.id}] {t.title}" for t in in_progress
+                        )
                     if not_started:
-                        todo_hint += "\n  Remaining: " + "; ".join(f"[{t.id}] {t.title}" for t in not_started[:5])
+                        todo_hint += "\n  Remaining: " + "; ".join(
+                            f"[{t.id}] {t.title}" for t in not_started[:5]
+                        )
                         if len(not_started) > 5:
                             todo_hint += f" (+{len(not_started) - 5} more)"
                     header_parts.append(todo_hint)
-                
+
                 header = "\n".join(header_parts)
                 # Label: for multi-tool batches show count; for single tool
                 # use the actual tool name (tc is the last *executed* tool).
@@ -1938,12 +2254,11 @@ class ClineAgent:
                     result_content = f"{header}\n\n[{_result_label}]\n{tool_result}"
                 else:
                     result_content = f"[{_result_label}]\n{tool_result}"
-                
-                self.messages.append(StreamingMessage(
-                    role="user",
-                    content=result_content
-                ))
-            
+
+                self.messages.append(
+                    StreamingMessage(role="user", content=result_content)
+                )
+
             log.warning("Max iterations reached (%d)", self.max_iterations)
             self.status.clear()
             return "Max iterations reached."
@@ -1951,20 +2266,20 @@ class ClineAgent:
             self._active_client = None
             if client is not None:
                 await client.__aexit__(None, None, None)
-    
+
     # Tool tag names — derived from the single registry
     _TOOL_TAGS = get_tool_names()
 
     @staticmethod
     def _has_unclosed_tool_tag(content: str) -> bool:
         """Detect if the content has an opening tool XML tag without a matching close.
-        
+
         This indicates the model's output was truncated mid-tool-call,
         even if finish_reason wasn't set to 'length' by the API.
         """
         for tag in ClineAgent._TOOL_TAGS:
-            open_tag = f'<{tag}>'
-            close_tag = f'</{tag}>'
+            open_tag = f"<{tag}>"
+            close_tag = f"</{tag}>"
             if open_tag in content and close_tag not in content:
                 return True
         return False
@@ -1978,7 +2293,7 @@ class ClineAgent:
         _t0 = time.time()
         _success = True
         _error_msg = None
-        
+
         try:
             result = await self._dispatch_tool(tool)
             return result
@@ -1993,7 +2308,7 @@ class ClineAgent:
             _result_size = 0
             # result is local to the try block; capture it safely
             try:
-                _result_size = len(result) if 'result' in dir() else 0
+                _result_size = len(result) if "result" in dir() else 0
             except Exception:
                 pass
             _metrics.record(tool.name, _elapsed, _success, _error_msg, _result_size)
@@ -2004,9 +2319,11 @@ class ClineAgent:
             if tool.name == "read_file":
                 path = tool.parameters.get("path", "")
                 result = await self.tool_handlers.read_file(tool.parameters)
-                lines = result.count('\n') + 1
-                self.console.print(f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}  ({lines} lines)[/dim]")
-                
+                lines = result.count("\n") + 1
+                self.console.print(
+                    f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}  ({lines} lines)[/dim]"
+                )
+
             elif tool.name == "write_to_file":
                 path = tool.parameters.get("path", "")
                 content = tool.parameters.get("content", "")
@@ -2018,37 +2335,48 @@ class ClineAgent:
                         old_content = resolved.read_text(encoding="utf-8")
                     except Exception:
                         pass
-                self.console.print(f"  [dim]•[/dim] [green]Write[/green] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(
+                    f"  [dim]•[/dim] [green]Write[/green] [dim]{rich_escape(path)}[/dim]"
+                )
                 result = await self.tool_handlers.write_file(tool.parameters)
                 # Show diff for overwrites, or creation summary for new files
                 if old_content is not None and not result.startswith("Error:"):
                     self._show_write_diff(old_content, content, path)
                 elif old_content is None and not result.startswith("Error:"):
-                    n_lines = content.count('\n') + 1
-                    self.console.print(f"    [green]+ {n_lines} lines[/green] [dim](new file)[/dim]")
-                
+                    n_lines = content.count("\n") + 1
+                    self.console.print(
+                        f"    [green]+ {n_lines} lines[/green] [dim](new file)[/dim]"
+                    )
+
             elif tool.name == "replace_in_file":
                 path = tool.parameters.get("path", "")
                 diff_text = tool.parameters.get("diff", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Edit[/yellow] [dim]{rich_escape(path)}[/dim]")
+                self.console.print(
+                    f"  [dim]•[/dim] [yellow]Edit[/yellow] [dim]{rich_escape(path)}[/dim]"
+                )
                 result = await self.tool_handlers.replace_in_file(tool.parameters)
-                
+
                 # Show pretty diff on success
                 if not result.startswith("Error:") and diff_text:
                     from .tool_handlers import parse_search_replace_blocks
+
                     blocks = parse_search_replace_blocks(diff_text)
                     if blocks:
                         self._show_diff_blocks(blocks, path)
-                
+
                 # Thrash detection: track consecutive failures
                 norm_path = str(self.tool_handlers._resolve_path(path))
                 if result.startswith("Error:"):
-                    entry = self._edit_failures.setdefault(norm_path, {"failures": 0, "last_error": ""})
+                    entry = self._edit_failures.setdefault(
+                        norm_path, {"failures": 0, "last_error": ""}
+                    )
                     entry["failures"] += 1
                     entry["last_error"] = result[:200]
                     n = entry["failures"]
                     if n >= 3:
-                        self.console.print(f"    [bold red]{n} consecutive edit failures on this file![/bold red]")
+                        self.console.print(
+                            f"    [bold red]{n} consecutive edit failures on this file![/bold red]"
+                        )
                         result += (
                             f"\n\n[REPEATED FAILURE — {n} consecutive failed edits on this file]\n"
                             f"You are stuck in a loop. STOP and try a DIFFERENT approach:\n"
@@ -2069,81 +2397,90 @@ class ClineAgent:
 
             elif tool.name == "replace_between_anchors":
                 path = tool.parameters.get("path", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Rewrite[/yellow] [dim]{rich_escape(path)}[/dim]")
-                result = await self.tool_handlers.replace_between_anchors(tool.parameters)
+                self.console.print(
+                    f"  [dim]•[/dim] [yellow]Rewrite[/yellow] [dim]{rich_escape(path)}[/dim]"
+                )
+                result = await self.tool_handlers.replace_between_anchors(
+                    tool.parameters
+                )
                 if not result.startswith("Error:"):
                     norm_path = str(self.tool_handlers._resolve_path(path))
                     self._edit_failures.pop(norm_path, None)
-                
+
             elif tool.name == "execute_command":
                 result = await self.tool_handlers.execute_command(tool.parameters)
-                
+
             elif tool.name == "list_files":
                 path = tool.parameters.get("path", "")
                 result = await self.tool_handlers.list_files(tool.parameters)
                 count = len(result.splitlines())
-                self.console.print(f"  [dim]•[/dim] [blue]Listed[/blue] [dim]{rich_escape(path)}  ({count} items)[/dim]")
-                
+                self.console.print(
+                    f"  [dim]•[/dim] [blue]Listed[/blue] [dim]{rich_escape(path)}  ({count} items)[/dim]"
+                )
+
             elif tool.name == "search_files":
                 regex = tool.parameters.get("regex", "")
                 result = await self.tool_handlers.search_files(tool.parameters)
                 matches = len(result.splitlines()) if result != "(no matches)" else 0
-                self.console.print(f"  [dim]•[/dim] [magenta]Searched[/magenta] [dim]{rich_escape(regex)}  ({matches} matches)[/dim]")
-                
+                self.console.print(
+                    f"  [dim]•[/dim] [magenta]Searched[/magenta] [dim]{rich_escape(regex)}  ({matches} matches)[/dim]"
+                )
+
             elif tool.name == "check_background_process":
                 bg_id = tool.parameters.get("id", "")
-                self.console.print(f"  [dim]•[/dim] [cyan]Check process[/cyan] [dim]{bg_id or 'all'}[/dim]")
-                result = await self.tool_handlers.check_background_process(tool.parameters)
-                
+                self.console.print(
+                    f"  [dim]•[/dim] [cyan]Check process[/cyan] [dim]{bg_id or 'all'}[/dim]"
+                )
+                result = await self.tool_handlers.check_background_process(
+                    tool.parameters
+                )
+
             elif tool.name == "stop_background_process":
                 bg_id = tool.parameters.get("id", "")
-                self.console.print(f"  [dim]•[/dim] [red]Stop process[/red] [dim]{bg_id}[/dim]")
-                result = await self.tool_handlers.stop_background_process(tool.parameters)
-                
+                self.console.print(
+                    f"  [dim]•[/dim] [red]Stop process[/red] [dim]{bg_id}[/dim]"
+                )
+                result = await self.tool_handlers.stop_background_process(
+                    tool.parameters
+                )
+
             elif tool.name == "list_background_processes":
                 self.console.print(f"  [dim]•[/dim] [cyan]List processes[/cyan]")
-                result = await self.tool_handlers.list_background_processes(tool.parameters)
-            
-                
+                result = await self.tool_handlers.list_background_processes(
+                    tool.parameters
+                )
+
             elif tool.name == "create_plan":
                 prompt = tool.parameters.get("prompt", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Plan[/yellow] [dim](Claude CLI)[/dim]")
+                self.console.print(
+                    f"  [dim]•[/dim] [yellow]Plan[/yellow] [dim](Claude CLI)[/dim]"
+                )
                 # Auto-build context summary
                 context_summary = self._build_plan_context()
-                result = await self.tool_handlers.create_plan(tool.parameters, context_summary=context_summary)
-                
-            elif tool.name == "update_agent_rules":
-                rule = tool.parameters.get("rule", "")
-                category = tool.parameters.get("category", "preference")
-                self.console.print(f"  [dim]•[/dim] [cyan]Rule[/cyan] [dim][{category}] {rich_escape(rule[:60])}[/dim]")
-                result = self._handle_update_agent_rules(tool.parameters)
-                
-            elif tool.name == "list_context":
-                result = self.context.summary()
-                n_items = len(self.context.list_items())
-                self.console.print(f"  [dim]•[/dim] [blue]Context[/blue] [dim]({n_items} items)[/dim]")
+                result = await self.tool_handlers.create_plan(
+                    tool.parameters, context_summary=context_summary
+                )
 
             elif tool.name == "retrieve_tool_result":
                 self.console.print(f"  [dim]•[/dim] [cyan]Retrieve result[/cyan]")
                 result = await self.tool_handlers.retrieve_tool_result(tool.parameters)
-                
-            elif tool.name == "remove_from_context":
-                item_id = tool.parameters.get("id", "")
-                source = tool.parameters.get("source", "")
-                self.console.print(f"  [dim]•[/dim] [yellow]Remove context[/yellow] [dim]{rich_escape(item_id or source)}[/dim]")
-                result = self._remove_from_context(tool.parameters)
-                
+
             elif tool.name == "analyze_image":
                 path = tool.parameters.get("path", "")
-                question = tool.parameters.get("question", "Describe this image in detail.")
-                self.console.print(f"  [dim]•[/dim] [magenta]Analyze image[/magenta] [dim]{rich_escape(path)}[/dim]")
+                question = tool.parameters.get(
+                    "question", "Describe this image in detail."
+                )
+                self.console.print(
+                    f"  [dim]•[/dim] [magenta]Analyze image[/magenta] [dim]{rich_escape(path)}[/dim]"
+                )
                 result = await self.tool_handlers.analyze_image(tool.parameters)
-                
+
             elif tool.name == "web_search":
                 query = tool.parameters.get("query", "")
-                self.console.print(f"  [dim]*[/dim] [cyan]Web search[/cyan] [dim]{rich_escape(query)}[/dim]")
+                self.console.print(
+                    f"  [dim]*[/dim] [cyan]Web search[/cyan] [dim]{rich_escape(query)}[/dim]"
+                )
                 result = await self.tool_handlers.web_search(tool.parameters)
-                
 
             elif tool.name == "mcp_search_tools":
                 server = tool.parameters.get("server", "")
@@ -2155,7 +2492,9 @@ class ClineAgent:
 
             elif tool.name == "mcp_list_tools":
                 server = tool.parameters.get("server", "")
-                self.console.print(f"  [dim]*[/dim] [cyan]MCP list[/cyan] [dim]{rich_escape(server)}[/dim]")
+                self.console.print(
+                    f"  [dim]*[/dim] [cyan]MCP list[/cyan] [dim]{rich_escape(server)}[/dim]"
+                )
                 result = await self.tool_handlers.mcp_list_tools(tool.parameters)
 
             elif tool.name == "mcp_call_tool":
@@ -2168,37 +2507,40 @@ class ClineAgent:
 
             elif tool.name == "manage_todos":
                 action = tool.parameters.get("action", "list")
-                self.console.print(f"  [dim]*[/dim] [blue]Todo[/blue] [dim]{action}[/dim]")
+                self.console.print(
+                    f"  [dim]*[/dim] [blue]Todo[/blue] [dim]{action}[/dim]"
+                )
                 result = self._handle_manage_todos(tool.parameters)
                 # Render live todo panel after any todo change
                 self.todo_manager.print_todo_panel(self.console)
-                
+
             elif tool.name == "introspect":
                 focus = tool.parameters.get("focus", "")
                 result = await self._execute_introspect(focus)
-                
+
             else:
                 result = f"Unknown tool: {tool.name}"
-            
+
             return result
-            
+
         except Exception as e:
             raise  # Re-raise — _execute_tool handles logging + metrics
-    
+
     # ── Pretty-printed diff display ─────────────────────────────────
-    _DIFF_CONTEXT = 2      # Context lines around each change
-    _DIFF_MAX_LINES = 20   # Max total diff lines before collapsing
-    
+    _DIFF_CONTEXT = 2  # Context lines around each change
+    _DIFF_MAX_LINES = 20  # Max total diff lines before collapsing
+
     def _render_udiff(self, old_text: str, new_text: str) -> None:
         """Render a unified diff between two strings, showing only real changes."""
         import difflib
+
         old_lines = old_text.splitlines(keepends=True)
         new_lines = new_text.splitlines(keepends=True)
         diff = list(difflib.unified_diff(old_lines, new_lines, n=self._DIFF_CONTEXT))
-        
+
         if not diff:
             return
-        
+
         shown = 0
         for line in diff[2:]:  # skip --- / +++ headers
             if shown >= self._DIFF_MAX_LINES:
@@ -2206,12 +2548,12 @@ class ClineAgent:
                 if remaining > 0:
                     self.console.print(f"    [dim]… {remaining} more diff lines[/dim]")
                 break
-            text = line.rstrip('\n')
-            if line.startswith('+'):
+            text = line.rstrip("\n")
+            if line.startswith("+"):
                 self.console.print(f"    [green]{rich_escape(text)}[/green]")
-            elif line.startswith('-'):
+            elif line.startswith("-"):
                 self.console.print(f"    [red]{rich_escape(text)}[/red]")
-            elif line.startswith('@@'):
+            elif line.startswith("@@"):
                 self.console.print(f"    [cyan]{rich_escape(text)}[/cyan]")
             else:
                 self.console.print(f"    [dim]{rich_escape(text)}[/dim]")
@@ -2221,7 +2563,7 @@ class ClineAgent:
         """Display SEARCH/REPLACE blocks as a unified diff (only real changes)."""
         for search, replace in blocks:
             self._render_udiff(search, replace)
-    
+
     def _show_write_diff(self, old_content: str, new_content: str, path: str) -> None:
         """Display a unified diff for write_to_file overwrites."""
         self._render_udiff(old_content, new_content)
@@ -2229,12 +2571,12 @@ class ClineAgent:
     def _build_plan_context(self) -> str:
         """Build a context summary to pass to create_plan (Claude CLI)."""
         parts = []
-        
+
         # Active todos
         todo_state = self.todo_manager.format_list(include_completed=False)
         if todo_state and "empty" not in todo_state.lower():
             parts.append(f"ACTIVE TODOS:\n{todo_state}")
-        
+
         # Recent context items (last 5 files/outputs)
         items = self.context.list_items()
         if items:
@@ -2247,16 +2589,16 @@ class ClineAgent:
                     preview += f"\n... ({len(item.content):,} chars total)"
                 ctx_lines.append(f"\n--- {item.type}: {item.source} ---\n{preview}")
             parts.append("\n".join(ctx_lines))
-        
+
         # Working directory
         parts.append(f"WORKSPACE: {self.workspace_path}")
-        
+
         return "\n\n".join(parts)
-    
+
     def _handle_manage_todos(self, params: Dict[str, str]) -> str:
         """Handle the manage_todos tool."""
         action = params.get("action", "list").lower()
-        
+
         if action == "add":
             title = params.get("title", "")
             if not title:
@@ -2270,26 +2612,31 @@ class ClineAgent:
                     return f"Error: Invalid parent_id: {params['parent_id']}"
             context_refs = []
             if params.get("context_refs"):
-                context_refs = [r.strip() for r in params["context_refs"].split(",") if r.strip()]
-            
+                context_refs = [
+                    r.strip() for r in params["context_refs"].split(",") if r.strip()
+                ]
+
             item = self.todo_manager.add(
                 title=title,
                 description=description,
                 parent_id=parent_id,
                 context_refs=context_refs,
             )
-            
+
             # If this is the first todo and we don't have an original request, set it
-            if not self.todo_manager.original_request and len(self.todo_manager.list_all()) == 1:
+            if (
+                not self.todo_manager.original_request
+                and len(self.todo_manager.list_all()) == 1
+            ):
                 # Find the original user message
                 for msg in self.messages:
                     _text = msg.content if isinstance(msg.content, str) else ""
                     if msg.role == "user" and _text and not _text.startswith("["):
                         self.todo_manager.set_original_request(_text[:500])
                         break
-            
+
             return f"Added todo [{item.id}]: {item.title}\n\n{self.todo_manager.format_list()}"
-        
+
         elif action == "update":
             item_id_str = params.get("id", "")
             if not item_id_str:
@@ -2298,13 +2645,15 @@ class ClineAgent:
                 item_id = int(item_id_str)
             except ValueError:
                 return f"Error: Invalid id: {item_id_str}"
-            
+
             context_refs = None
             if params.get("context_refs"):
-                context_refs = [r.strip() for r in params["context_refs"].split(",") if r.strip()]
-            
+                context_refs = [
+                    r.strip() for r in params["context_refs"].split(",") if r.strip()
+                ]
+
             parent_id_str = params.get("parent_id")
-            
+
             item = self.todo_manager.update(
                 item_id=item_id,
                 title=params.get("title"),
@@ -2313,12 +2662,12 @@ class ClineAgent:
                 notes=params.get("notes"),
                 context_refs=context_refs,
             )
-            
+
             if not item:
                 return f"Error: Todo [{item_id}] not found."
-            
+
             return f"Updated todo [{item.id}]: {item.title} ({item.status.value})\n\n{self.todo_manager.format_list()}"
-        
+
         elif action == "remove":
             item_id_str = params.get("id", "")
             if not item_id_str:
@@ -2327,50 +2676,16 @@ class ClineAgent:
                 item_id = int(item_id_str)
             except ValueError:
                 return f"Error: Invalid id: {item_id_str}"
-            
+
             if self.todo_manager.remove(item_id):
                 return f"Removed todo [{item_id}].\n\n{self.todo_manager.format_list()}"
             else:
                 return f"Error: Todo [{item_id}] not found."
-        
+
         elif action == "list":
             return self.todo_manager.format_list()
-        
+
         else:
-            return f"Error: Unknown action '{action}'. Use add, update, remove, or list."
-    
-    def _remove_from_context(self, params: Dict[str, str]) -> str:
-        """Remove items from context by ID(s) or source pattern."""
-        item_id = params.get("id", "")
-        source = params.get("source", "")
-        
-        if item_id:
-            # Handle multiple IDs (comma-separated or from multiple <id> tags)
-            id_strs = [s.strip() for s in item_id.replace('\n', ',').split(',') if s.strip()]
-            removed = []
-            errors = []
-            
-            for id_str in id_strs:
-                try:
-                    id_int = int(id_str)
-                    if self.context.remove(id_int):
-                        removed.append(id_int)
-                    else:
-                        errors.append(f"{id_int} (not found)")
-                except ValueError:
-                    errors.append(f"{id_str} (invalid)")
-            
-            result = []
-            if removed:
-                result.append(f"Removed context items: {', '.join(map(str, removed))}")
-            if errors:
-                result.append(f"Errors: {', '.join(errors)}")
-            return "\n".join(result) if result else "No items removed."
-        elif source:
-            count = self.context.remove_by_source(source)
-            if count > 0:
-                return f"Removed {count} context item(s) matching '{source}'."
-            else:
-                return f"No context items matching '{source}'."
-        else:
-            return "Error: Provide either 'id' or 'source' parameter."
+            return (
+                f"Error: Unknown action '{action}'. Use add, update, remove, or list."
+            )
