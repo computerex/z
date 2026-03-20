@@ -1916,6 +1916,33 @@ class ClineAgent:
                 response = None
 
                 while _throttle_attempt <= _throttle_max_retries:
+                    # Reset content buffers before each attempt so partial content
+                    # from a failed mid-stream attempt doesn't get duplicated.
+                    if _throttle_attempt > 0:
+                        full_content = ""
+                        full_reasoning = ""
+                        first_token = True
+                        _payload_announced = False
+                        _payload_next_report = _payload_progress_step
+                        _thinking_started = False
+                        _thinking_line_start = True
+                        _thinking_line_has_text = False
+                        # Reset stream filter state
+                        _sf_suppressing = None
+                        _sf_thinking_suppress = False
+                        _sf_tag_buf = ""
+                        _sf_in_tag = False
+                        _sf_had_visible = False
+                        # Reset payload stream state
+                        _stream_tool_stack.clear()
+                        _stream_in_tag = False
+                        _stream_tag_buf = ""
+                        _stream_in_payload = False
+                        _stream_payload_line = ""
+                        _stream_payload_header_printed = False
+                        _stream_payload_lines = 0
+                        api_t0 = time.time()
+
                     try:
                         api_task = asyncio.ensure_future(
                             client.chat_stream_raw(
@@ -1963,8 +1990,10 @@ class ClineAgent:
                         is_throttle = any(kw in err_str for kw in (
                             "throttling", "throttled", "rate limit", "rate_limit",
                             "too many requests", "too many tokens", "quota",
-                            "capacity", "overloaded", "retry",
-                        )) or "429" in err_str or err_type == "ThrottlingException"
+                            "overloaded", "serviceunavailable",
+                        )) or "429" in err_str or err_type in (
+                            "ThrottlingException", "ServiceUnavailableException",
+                        )
 
                         if is_throttle and _throttle_attempt < _throttle_max_retries:
                             _throttle_attempt += 1
@@ -1976,7 +2005,7 @@ class ClineAgent:
                             )
                             self.status.set_retry(
                                 _throttle_attempt, _throttle_max_retries, wait_time,
-                                reason=" (quota/rate limit)"
+                                reason="quota/rate limit"
                             )
                             # Wait with interrupt checking
                             for _ in range(int(wait_time * 10)):
@@ -1985,7 +2014,7 @@ class ClineAgent:
                                     self.console.print("\n  [yellow]Interrupted during retry wait[/yellow]")
                                     return "[Interrupted]"
                                 await asyncio.sleep(0.1)
-                            self.status.update("Streaming response", state=StatusLine.STREAMING)
+                            self.status.update("Retrying request...", state=StatusLine.SENDING)
                             continue  # Retry
                         else:
                             # Not a throttle error or max retries exceeded — re-raise
