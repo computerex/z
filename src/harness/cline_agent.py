@@ -1909,40 +1909,93 @@ class ClineAgent:
                             return
                         await asyncio.sleep(0.15)
 
-                try:
-                    api_task = asyncio.ensure_future(
-                        client.chat_stream_raw(
-                            messages=self.messages,
-                            on_content=on_chunk,
-                            on_reasoning=on_reasoning,
-                            check_interrupt=is_interrupted,
-                            enable_web_search=False,
-                            status_line=self.status,
-                        )
-                    )
-                    watcher = asyncio.ensure_future(_interrupt_watcher(api_task))
+                # Retry loop for throttling errors (Bedrock quota limits, rate limits, etc.)
+                _throttle_max_retries = 10
+                _throttle_base_wait = 30  # Start with 30 seconds for quota errors
+                _throttle_attempt = 0
+                response = None
+
+                while _throttle_attempt <= _throttle_max_retries:
                     try:
-                        response = await asyncio.wait_for(api_task, timeout=120.0)
-                    finally:
-                        watcher.cancel()
-                except asyncio.TimeoutError:
-                    log.error("API call timed out after 120s")
-                    self.console.print(
-                        "[red]Error: API call timed out after 2 minutes[/red]"
-                    )
-                    return "[Error - API timeout. Check connection and try again]"
-                except asyncio.CancelledError:
-                    # This happens when user presses Ctrl+C - client was closed
-                    log.info("API call cancelled by user interrupt")
-                    self.console.print("\n  [yellow]Interrupted by user[/yellow]")
-                    return "[Interrupted]"
-                except RuntimeError as e:
-                    if "closed" in str(e).lower():
-                        # Client was closed due to interrupt
-                        log.info("HTTP client closed due to interrupt")
-                        self.console.print("\n  [yellow]Interrupted[/yellow]")
+                        api_task = asyncio.ensure_future(
+                            client.chat_stream_raw(
+                                messages=self.messages,
+                                on_content=on_chunk,
+                                on_reasoning=on_reasoning,
+                                check_interrupt=is_interrupted,
+                                enable_web_search=False,
+                                status_line=self.status,
+                            )
+                        )
+                        watcher = asyncio.ensure_future(_interrupt_watcher(api_task))
+                        try:
+                            response = await asyncio.wait_for(api_task, timeout=120.0)
+                        finally:
+                            watcher.cancel()
+                        break  # Success — exit retry loop
+
+                    except asyncio.TimeoutError:
+                        log.error("API call timed out after 120s")
+                        self.console.print(
+                            "[red]Error: API call timed out after 2 minutes[/red]"
+                        )
+                        return "[Error - API timeout. Check connection and try again]"
+
+                    except asyncio.CancelledError:
+                        # This happens when user presses Ctrl+C - client was closed
+                        log.info("API call cancelled by user interrupt")
+                        self.console.print("\n  [yellow]Interrupted by user[/yellow]")
                         return "[Interrupted]"
-                    raise
+
+                    except RuntimeError as e:
+                        if "closed" in str(e).lower():
+                            # Client was closed due to interrupt
+                            log.info("HTTP client closed due to interrupt")
+                            self.console.print("\n  [yellow]Interrupted[/yellow]")
+                            return "[Interrupted]"
+                        raise
+
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        err_type = type(e).__name__
+
+                        # Check for throttling/rate limit errors
+                        is_throttle = any(kw in err_str for kw in (
+                            "throttling", "throttled", "rate limit", "rate_limit",
+                            "too many requests", "too many tokens", "quota",
+                            "capacity", "overloaded", "retry",
+                        )) or "429" in err_str or err_type == "ThrottlingException"
+
+                        if is_throttle and _throttle_attempt < _throttle_max_retries:
+                            _throttle_attempt += 1
+                            # Exponential backoff: 30s, 60s, 120s, ... capped at 5 min
+                            wait_time = min(_throttle_base_wait * (2 ** (_throttle_attempt - 1)), 300)
+                            log.warning(
+                                "Throttling detected (attempt %d/%d): %s. Waiting %ds...",
+                                _throttle_attempt, _throttle_max_retries, str(e)[:100], wait_time
+                            )
+                            self.status.set_retry(
+                                _throttle_attempt, _throttle_max_retries, wait_time,
+                                reason=" (quota/rate limit)"
+                            )
+                            # Wait with interrupt checking
+                            for _ in range(int(wait_time * 10)):
+                                if is_interrupted():
+                                    self.status.clear()
+                                    self.console.print("\n  [yellow]Interrupted during retry wait[/yellow]")
+                                    return "[Interrupted]"
+                                await asyncio.sleep(0.1)
+                            self.status.set_streaming()
+                            continue  # Retry
+                        else:
+                            # Not a throttle error or max retries exceeded — re-raise
+                            raise
+
+                if response is None:
+                    self.console.print(
+                        f"[red]Error: Max retries ({_throttle_max_retries}) exceeded for throttling[/red]"
+                    )
+                    return "[Error - API throttling. Try again later.]"
                 api_elapsed = time.time() - api_t0
                 log.info(
                     "API response: finish_reason=%s interrupted=%s elapsed=%.1fs content_len=%d reasoning_len=%d",
