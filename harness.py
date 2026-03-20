@@ -1217,32 +1217,33 @@ def run_model_switch_wizard(
     parts = [p for p in cmd_arg.split() if p.strip()]
     verb = parts[0].lower() if parts else ""
 
-    # /model <number> — switch from MRU history
+    # /model <number> — switch from last displayed list (same as /model use <n>)
     if verb and verb.isdigit() and len(parts) == 1:
         idx = int(verb)
-        history = _load_model_history()
-        if not history:
+        if not _LAST_MODEL_SEARCH_RESULTS:
             return (
-                "No model history yet. Use /model <query> to search and switch first."
+                "No model list displayed yet. Use /model to see history or /model <query> to search first."
             )
-        if idx < 1 or idx > len(history):
-            return f"Invalid selection. You have {len(history)} model(s) in history."
-        entry = history[idx - 1]
-        m_model = entry.get("model", "")
-        m_profile = entry.get("profile", "")
-        p = providers.get(m_profile)
-        if not p:
-            return f"Provider profile '{m_profile}' no longer exists."
+        if idx < 1 or idx > len(_LAST_MODEL_SEARCH_RESULTS):
+            return f"Invalid selection. List has {len(_LAST_MODEL_SEARCH_RESULTS)} item(s)."
+        row = _LAST_MODEL_SEARCH_RESULTS[idx - 1]
         return _apply_selected_provider_model(
-            workspace, agent, providers, m_profile, dict(p), m_model
+            workspace,
+            agent,
+            providers,
+            row["profile"],
+            dict(row["cfg"]),
+            row["model_id"],
         )
 
     if verb == "use":
         if len(parts) < 2 or not parts[1].isdigit():
-            return "Usage: /model use <number> (use a result number from the last /model search)"
+            return "Usage: /model use <number> (pick from the last displayed /model list)"
         idx = int(parts[1])
+        if not _LAST_MODEL_SEARCH_RESULTS:
+            return "No model list displayed yet. Use /model to see history or /model <query> to search first."
         if idx < 1 or idx > len(_LAST_MODEL_SEARCH_RESULTS):
-            return "Invalid selection. Run /model <query> first."
+            return f"Invalid selection. List has {len(_LAST_MODEL_SEARCH_RESULTS)} item(s)."
         row = _LAST_MODEL_SEARCH_RESULTS[idx - 1]
         return _apply_selected_provider_model(
             workspace,
@@ -1284,13 +1285,26 @@ def run_model_switch_wizard(
         # Show MRU model history
         history = _load_model_history()
         if history:
+            shown = history[:10]
+            # Populate _LAST_MODEL_SEARCH_RESULTS so /model use <n> works
+            # with the displayed MRU list
+            _LAST_MODEL_SEARCH_RESULTS = []
+            for entry in shown:
+                m_profile = entry.get("profile", "")
+                p_cfg = dict(providers.get(m_profile, {}))
+                _LAST_MODEL_SEARCH_RESULTS.append({
+                    "profile": m_profile,
+                    "provider_display": m_profile,
+                    "model_id": entry.get("model", ""),
+                    "cfg": p_cfg,
+                })
             console.print()
             tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
             tbl.add_column(width=2)
             tbl.add_column("num", style="dim", width=4)
             tbl.add_column("model", style="bold")
             tbl.add_column("provider", style="cyan")
-            for i, entry in enumerate(history[:10], 1):
+            for i, entry in enumerate(shown, 1):
                 m_model = entry.get("model", "")
                 m_profile = entry.get("profile", "")
                 mark = (
