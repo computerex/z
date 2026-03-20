@@ -1985,7 +1985,7 @@ class ClineAgent:
                                     self.console.print("\n  [yellow]Interrupted during retry wait[/yellow]")
                                     return "[Interrupted]"
                                 await asyncio.sleep(0.1)
-                            self.status.set_streaming()
+                            self.status.update("Streaming response", state=StatusLine.STREAMING)
                             continue  # Retry
                         else:
                             # Not a throttle error or max retries exceeded — re-raise
