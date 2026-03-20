@@ -34,8 +34,8 @@ class StatusLine:
     COMPACTING = "compacting"
     WAITING = "waiting"
 
-    # Spinner frames for active states
-    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _SPINNER = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+    _ACCENT = "\033[38;5;75m"
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled and sys.stdout.isatty()
@@ -49,6 +49,8 @@ class StatusLine:
         # Track active iteration for display
         self._iteration = 0
         self._max_iterations = 0
+        # Turn-level timer (persists across clear() calls within a turn)
+        self._turn_start: Optional[float] = None
         # Retry info
         self._retry_attempt = 0
         self._retry_max = 0
@@ -65,6 +67,14 @@ class StatusLine:
         """Set current iteration counter for display."""
         self._iteration = current
         self._max_iterations = maximum
+
+    def set_turn_start(self):
+        """Mark the start of a new agent turn (total runtime timer)."""
+        self._turn_start = time.time()
+
+    def clear_turn(self):
+        """Clear the turn timer (call when the turn is fully done)."""
+        self._turn_start = None
 
     def update(self, text: str, state: str = WAITING):
         """Update the status line text and state."""
@@ -121,19 +131,28 @@ class StatusLine:
         # Pick icon based on state
         icon = self._get_icon()
 
-        # Build the line
-        iter_part = ""
-        if self._max_iterations > 0:
-            iter_part = f" [{self._iteration}/{self._max_iterations}]"
+        # Turn-level elapsed time
+        turn_elapsed_str = ""
+        if self._turn_start:
+            turn_elapsed_str = self._format_elapsed(now - self._turn_start)
 
+        # Build compact line: icon text │ iter │ phase_elapsed │ total_elapsed
+        parts = [f"{icon} {self._text}"]
+        if self._max_iterations > 0:
+            parts.append(f"iter: {self._iteration}/{self._max_iterations}")
+        if elapsed_str:
+            parts.append(elapsed_str)
+        if turn_elapsed_str and turn_elapsed_str != elapsed_str:
+            parts.append(f"total {turn_elapsed_str}")
+        
         cols = shutil.get_terminal_size().columns
-        line = f" {icon} {self._text}{iter_part}  {elapsed_str} "
+        line = " " + " │ ".join(parts) + " "
 
         # Truncate if too wide
         if len(line) > cols:
             line = line[:cols - 1] + "…"
 
-        # Dim styling via ANSI
+        # Dim + cyan icon via ANSI
         dim = "\033[2m"
         reset = "\033[0m"
 
@@ -142,16 +161,17 @@ class StatusLine:
         self._visible = True
 
     def _get_icon(self) -> str:
-        """Get the current icon/spinner character."""
+        """Get the current icon/spinner character with accent coloring."""
+        c = self._ACCENT
+        r = "\033[0m\033[2m"
         if self._state in (self.STREAMING,):
-            return "◉"  # Solid dot for active streaming
+            return f"{c}\u25cf{r}"
         if self._state == self.IDLE:
-            return "◯"
+            return f"{c}\u25cb{r}"
         if self._state == self.RETRYING:
-            return "⟳"
-        # Animated spinner for all other active states
+            return f"{c}\u27f3{r}"
         self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER)
-        return self._SPINNER[self._spinner_idx]
+        return f"{c}{self._SPINNER[self._spinner_idx]}{r}"
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:

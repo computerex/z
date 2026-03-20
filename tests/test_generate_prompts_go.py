@@ -29,7 +29,7 @@ PROMPT = '''Write a complete prompts.go file for harness_go/ that includes:
 3. A defaultSystemPrompt constant (use backticks) with documentation for these tools:
    - read_file: read a file, params: path
    - write_to_file: create new file, params: path, content
-   - replace_in_file: edit file with SEARCH/REPLACE blocks, params: path, diff
+   - replace_in_file: edit file with exact text replacement, params: path, old_text, new_text
    - execute_command: run shell command, params: command, background
    - list_files: list directory, params: path, recursive
    - search_files: regex search, params: path, regex, file_pattern

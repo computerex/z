@@ -12,7 +12,7 @@ def get_global_config_path() -> Path:
 
 
 def get_workspace_config_path(workspace: Optional[Path] = None) -> Path:
-    """Get path to workspace config: workspace/.z/.z.json"""
+    """Legacy helper kept for compatibility (workspace config is ignored)."""
     ws = workspace or Path.cwd()
     return ws / ".z" / ".z.json"
 
@@ -27,10 +27,29 @@ def load_json_config(path: Path) -> dict:
     return {}
 
 
+def _is_empty_override(value) -> bool:
+    """True when a config value should not override an existing non-empty value."""
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _merge_non_empty(base: dict, overlay: dict) -> dict:
+    """Merge overlay into base, skipping None/empty-string values."""
+    out = dict(base)
+    for k, v in (overlay or {}).items():
+        if _is_empty_override(v):
+            continue
+        out[k] = v
+    return out
+
+
 @dataclass
 class Config:
     """Configuration for the agentic harness."""
-    
+
     api_url: str = ""
     api_key: str = ""
     model: str = "glm-4.7"
@@ -39,33 +58,33 @@ class Config:
     workspace_path: Path = field(default_factory=lambda: Path.cwd())
     max_context_tokens: int = 32000
     embedding_model: str = "all-MiniLM-L6-v2"
-    
+    compaction_threshold: float = 0.85  # Start compaction at 85% of max_tokens
+    reasoning_effort: str = "high"  # Reasoning effort: high, medium, low, none
+    plugins: list = field(default_factory=list)         # Extra plugin paths
+    plugin_config: dict = field(default_factory=dict)   # Per-plugin config dicts
+
     @classmethod
     def from_json(
         cls,
         workspace: Optional[Path] = None,
         overrides: Optional[dict] = None,
     ) -> "Config":
-        """Load configuration from JSON files.
-        
+        """Load configuration from JSON files (global-only).
+
         Priority (later overrides earlier):
         1. ~/.z.json (global)
-        2. workspace/.z/.z.json (workspace-specific)
+        2. explicit overrides (runtime)
         """
         # Start with defaults
         config_data = {}
-        
+
         # Load global config
         global_config = load_json_config(get_global_config_path())
-        config_data.update(global_config)
-        
-        # Load workspace config (overrides global)
-        ws_config = load_json_config(get_workspace_config_path(workspace))
-        config_data.update(ws_config)
-        
+        config_data = _merge_non_empty(config_data, global_config)
+
         if overrides:
-            config_data.update(overrides)
-        
+            config_data = _merge_non_empty(config_data, overrides)
+
         return cls(
             api_url=config_data.get("api_url", ""),
             api_key=config_data.get("api_key", ""),
@@ -74,28 +93,31 @@ class Config:
             temperature=float(config_data.get("temperature", 0.7)),
             workspace_path=workspace or Path.cwd(),
             max_context_tokens=int(config_data.get("max_context_tokens", 32000)),
+            compaction_threshold=float(config_data.get("compaction_threshold", 0.85)),
+            plugins=list(config_data.get("plugins", [])),
+            plugin_config=dict(config_data.get("plugin_config", {})),
         )
-    
+
     @classmethod
     def from_env(
         cls,
         env_path: Optional[Path] = None,
         workspace: Optional[Path] = None,
     ) -> "Config":
-        """Load configuration from JSON config files.
-        
-        Priority (later overrides earlier):
-        1. ~/.z.json (global)
-        2. workspace/.z/.z.json (workspace-specific — WINS)
-        
+        """Load configuration from global JSON config file.
+
         The env_path parameter is accepted but ignored (legacy compat).
         """
         return cls.from_json(workspace)
-    
+
     def validate(self) -> bool:
         """Validate the configuration."""
         if not self.api_url:
-            raise ValueError("API URL is required. Run 'python harness.py --install' to configure.")
+            raise ValueError(
+                "API URL is required. Run 'python harness.py --install' to configure."
+            )
         if not self.api_key:
-            raise ValueError("API key is required. Run 'python harness.py --install' to configure.")
+            raise ValueError(
+                "API key is required. Run 'python harness.py --install' to configure."
+            )
         return True

@@ -2,6 +2,9 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [project]
 name = "harness"
 version = "0.1.0"
@@ -10,6 +13,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27.0",
+    "anthropic>=0.39.0",
     "pydantic>=2.0.0",
     "tiktoken>=0.5.0",
     "numpy>=1.26.0",
@@ -24,6 +28,9 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+
+[project.scripts]
+z = "harness.cli:run"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -231,11 +231,12 @@ class TodoManager:
         lines.append(self.get_progress_summary())
         lines.append("")
 
-        # Group by parent
-        roots = [i for i in items if not i.parent_id]
+        # Group by parent (orphans whose parent is missing show as roots)
+        item_ids = {i.id for i in items}
+        roots = [i for i in items if not i.parent_id or i.parent_id not in item_ids]
         children_map: Dict[int, List[TodoItem]] = {}
         for item in items:
-            if item.parent_id:
+            if item.parent_id and item.parent_id in item_ids:
                 children_map.setdefault(item.parent_id, []).append(item)
 
         for root in roots:
@@ -317,11 +318,12 @@ class TodoManager:
 
         tree = Tree(progress_text)
 
-        # Group into roots and children
-        roots = [i for i in items if not i.parent_id]
+        # Group into roots and children (orphans whose parent is missing show as roots)
+        item_ids = {i.id for i in items}
+        roots = [i for i in items if not i.parent_id or i.parent_id not in item_ids]
         children_map: Dict[int, List[TodoItem]] = {}
         for item in items:
-            if item.parent_id:
+            if item.parent_id and item.parent_id in item_ids:
                 children_map.setdefault(item.parent_id, []).append(item)
 
         for root in roots:
@@ -359,8 +361,8 @@ class TodoManager:
                     clabel.append(f"  ({child.notes[:60]})", style="dim italic")
                 branch.add(clabel)
 
-        border = "green" if completed == total and total > 0 else "yellow" if in_progress else "blue"
-        return Panel(tree, title="Todo List", border_style=border, padding=(0, 1))
+        border = "green" if completed == total and total > 0 else "yellow" if in_progress else "bright_blue"
+        return Panel(tree, title="[bold]Todo[/bold]", border_style=border, padding=(0, 1))
 
     def print_todo_panel(self, console: Optional[Console] = None) -> None:
         """Print the todo panel to the given (or default) console.

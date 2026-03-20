@@ -1,0 +1,5 @@
+This is a test file for think token handling.
+Line 2: normal text here.
+Line 3: REPLACED
+Line 4: more text after the token.
+Line 5: end of file.

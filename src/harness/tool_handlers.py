@@ -1,18 +1,37 @@
 """Tool handlers for ClineAgent - manages all tool execution logic."""
 
 import asyncio
+import base64
+import html
+import json
 import os
 import platform
 import re
 import signal
 import time
+import difflib
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from rich.console import Console
 import psutil
 
 from .context_management import truncate_file_content, truncate_output
 from .logger import get_logger, log_exception, truncate as log_truncate
+from .streaming_client import desanitize_think_tokens
+
+try:
+    from mcp import ClientSession, StdioServerParameters  # type: ignore
+    from mcp.client.stdio import stdio_client  # type: ignore
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+    from mcp.client.sse import sse_client  # type: ignore
+    HAS_MCP_SDK = True
+except Exception:
+    ClientSession = None
+    StdioServerParameters = None
+    stdio_client = None
+    streamablehttp_client = None
+    sse_client = None
+    HAS_MCP_SDK = False
 
 log = get_logger("tools")
 
@@ -79,22 +98,53 @@ def sanitize_terminal_output(text: str) -> str:
     return text
 
 
-def parse_search_replace_blocks(diff: str) -> List[Tuple[str, str]]:
-    """Parse SEARCH/REPLACE blocks from diff string."""
-    blocks = []
-    
-    # Normalize line endings first
-    diff = diff.replace('\r\n', '\n').replace('\r', '\n')
-    
-    # Pattern: <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE
-    # Allow optional whitespace and be flexible with newlines
-    pattern = r'<{7}\s*SEARCH\s*\n(.*?)\n={7}\s*\n(.*?)\n>{7}\s*REPLACE'
-    
-    for m in re.finditer(pattern, diff, re.DOTALL):
-        search, replace = m.groups()
-        blocks.append((search, replace))
-    
-    return blocks
+_PS_CLIXML_STR_RE = re.compile(r'<S(?:\s+S="[^"]+")?>(.*?)</S>', re.DOTALL)
+_PS_CLIXML_HEX_ESCAPE_RE = re.compile(r'_x([0-9A-Fa-f]{4})_')
+# Match an entire CLIXML block: #< CLIXML\n<Objs ...>...</Objs>
+_PS_CLIXML_BLOCK_RE = re.compile(
+    r'#< CLIXML\s*\n\s*<Objs[^>]*>.*?</Objs>',
+    re.DOTALL,
+)
+
+
+def _decode_powershell_clixml(text: str) -> str:
+    """Best-effort decode of PowerShell CLIXML error/progress output to plain text.
+
+    Handles both single-line fragments and multi-line CLIXML blocks.
+    """
+    if not text:
+        return text
+    t = text
+    if "#< CLIXML" in t:
+        t = t.replace("#< CLIXML", "")
+    if "http://schemas.microsoft.com/powershell/2004/04" not in t and "<Objs" not in t:
+        return t.strip("\r\n")
+
+    parts = _PS_CLIXML_STR_RE.findall(t)
+    if not parts:
+        return t.strip("\r\n")
+
+    decoded = "".join(parts)
+    decoded = html.unescape(decoded)
+    decoded = _PS_CLIXML_HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), decoded)
+    return decoded.strip("\r\n")
+
+
+def _decode_clixml_in_text(text: str) -> str:
+    """Replace all CLIXML blocks in *text* with their decoded plain-text form.
+
+    Non-CLIXML content passes through unchanged.  This is the main entry point
+    for cleaning up raw log files that may contain a mix of normal output and
+    CLIXML error/progress fragments.
+    """
+    if not text or "CLIXML" not in text:
+        return text
+    return _PS_CLIXML_BLOCK_RE.sub(
+        lambda m: _decode_powershell_clixml(m.group(0)),
+        text,
+    )
+
+
 
 
 class ToolHandlers:
@@ -106,7 +156,8 @@ class ToolHandlers:
         console: Console,
         workspace_path: str,
         context,
-        duplicate_detector
+        duplicate_detector,
+        context_manager=None
     ):
         """Initialize tool handlers with required dependencies.
         
@@ -116,12 +167,14 @@ class ToolHandlers:
             workspace_path: Path to workspace directory
             context: ContextContainer for managing loaded content
             duplicate_detector: DuplicateDetector for tracking file reads
+            context_manager: SmartContextManager for accessing stored tool results
         """
         self.config = config
         self.console = console
         self.workspace_path = workspace_path
         self.context = context
         self._duplicate_detector = duplicate_detector
+        self._context_manager = context_manager
         
         # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
         self._background_procs: Dict[int, dict] = {}
@@ -131,6 +184,11 @@ class ToolHandlers:
         # Directory for spilled command output files
         self._output_dir = os.path.join(workspace_path, ".harness_output")
         os.makedirs(self._output_dir, exist_ok=True)
+
+        # Persistent MCP sessions (server name -> session bundle).
+        # Keeps browser/tool state across turns (critical for Playwright MCP refs).
+        self._mcp_sessions: Dict[str, Dict[str, Any]] = {}
+        self._mcp_locks: Dict[str, asyncio.Lock] = {}
     
     # -- Output spill helpers --------------------------------------------------
     
@@ -139,6 +197,8 @@ class ToolHandlers:
     
     # Maximum tokens to include inline when output is spilled.
     OUTPUT_INLINE_PREVIEW_TOKENS = 300   # ~1,200 chars — enough for LLM to understand
+    LARGE_WRITE_FEEDBACK_THRESHOLD = 256 * 1024  # chars
+    LARGE_WRITE_CHUNK_SIZE = 128 * 1024  # chars
     
     def spill_output_to_file(self, output: str, label: str) -> str:
         """Write large output to a file and return a compact reference.
@@ -194,6 +254,420 @@ class ToolHandlers:
         if not p.is_absolute():
             p = Path(self.workspace_path) / p
         return p.resolve()
+
+    def _load_mcp_servers(self) -> Dict[str, dict]:
+        cfg_path = Path.home() / ".z.json"
+        if not cfg_path.exists():
+            return {}
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            mcp = data.get("mcp", {})
+            return mcp if isinstance(mcp, dict) else {}
+        except Exception:
+            return {}
+
+    def _mcp_server_cfg(self, name: str) -> Tuple[dict, str]:
+        servers = self._load_mcp_servers()
+        cfg = servers.get(name)
+        if not isinstance(cfg, dict):
+            return {}, f"MCP server '{name}' not found in ~/.z.json mcp config."
+        if cfg.get("enabled", True) is False:
+            return {}, f"MCP server '{name}' is disabled."
+        stype = str(cfg.get("type", "local")).lower()
+        if stype in ("local", "stdio"):
+            cmd = cfg.get("command")
+            if not isinstance(cmd, list) or not cmd:
+                return {}, f"MCP server '{name}' has invalid command configuration."
+        elif stype in ("http", "streamable_http", "sse"):
+            url = cfg.get("url")
+            if not isinstance(url, str) or not url.strip():
+                return {}, f"MCP server '{name}' has invalid URL configuration."
+        else:
+            return {}, f"MCP server '{name}' has unsupported type '{stype}'."
+        return cfg, ""
+
+    def _normalize_mcp_command(self, cmd: List[str]) -> List[str]:
+        """Rewrite known noisy MCP launchers into protocol-safe equivalents."""
+        if len(cmd) >= 2 and cmd[0] == "uvx" and cmd[1] == "minimax-coding-plan-mcp":
+            # minimax-coding-plan-mcp prints a banner to stdout before protocol
+            # frames, which breaks MCP SDK parsing. Run its module directly.
+            return [
+                "uvx",
+                "--from",
+                "minimax-coding-plan-mcp",
+                "python",
+                "-c",
+                "from minimax_mcp.server import mcp; mcp.run()",
+            ]
+        return cmd
+
+    async def _close_mcp_session(self, name: str) -> None:
+        entry = self._mcp_sessions.pop(name, None)
+        if not entry:
+            return
+        try:
+            session_cm = entry.get("session_cm")
+            if session_cm is not None:
+                await session_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            cm = entry.get("cm")
+            if cm is not None:
+                await cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            errlog = entry.get("errlog")
+            if errlog is not None:
+                errlog.close()
+        except Exception:
+            pass
+
+    async def _get_or_create_mcp_session(self, name: str, cfg: dict):
+        if not HAS_MCP_SDK:
+            raise RuntimeError(
+                "MCP SDK is not installed. Install package 'mcp' to enable MCP server execution."
+            )
+        cfg_key = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+        existing = self._mcp_sessions.get(name)
+        if existing and existing.get("cfg_key") == cfg_key:
+            return existing.get("session")
+        if existing:
+            await self._close_mcp_session(name)
+
+        stype = str(cfg.get("type", "local")).lower()
+
+        if stype in ("local", "stdio"):
+            cmd = [str(x) for x in (cfg.get("command", []) or [])]
+            if not cmd:
+                raise RuntimeError("MCP server command is empty.")
+            cmd = self._normalize_mcp_command(cmd)
+            env_cfg = cfg.get("environment", {})
+            env = os.environ.copy()
+            if isinstance(env_cfg, dict):
+                env.update({str(k): str(v) for k, v in env_cfg.items()})
+
+            server_params = StdioServerParameters(
+                command=cmd[0],
+                args=cmd[1:],
+                env=env,
+            )
+
+            _errlog = open(os.devnull, "w", encoding="utf-8")
+            cm = stdio_client(server_params, errlog=_errlog)
+            read_stream, write_stream = await cm.__aenter__()
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            try:
+                await asyncio.wait_for(session.initialize(), timeout=15)
+            except Exception:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    _errlog.close()
+                except Exception:
+                    pass
+                raise
+            self._mcp_sessions[name] = {
+                "cfg_key": cfg_key,
+                "stype": stype,
+                "cm": cm,
+                "session_cm": session_cm,
+                "session": session,
+                "errlog": _errlog,
+            }
+            return session
+
+        if stype in ("http", "streamable_http", "sse"):
+            url = str(cfg.get("url", "") or "").strip()
+            if not url:
+                raise RuntimeError("MCP HTTP server URL is empty.")
+            headers_cfg = cfg.get("headers", {})
+            headers: Dict[str, str] = {}
+            if isinstance(headers_cfg, dict):
+                headers = {str(k): str(v) for k, v in headers_cfg.items()}
+
+            if stype == "sse":
+                cm = sse_client(url, headers=headers, timeout=20, sse_read_timeout=300)
+                read_stream, write_stream = await cm.__aenter__()
+                session_cm = ClientSession(read_stream, write_stream)
+                session = await session_cm.__aenter__()
+                try:
+                    await asyncio.wait_for(session.initialize(), timeout=20)
+                except Exception:
+                    try:
+                        await session_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    raise
+                self._mcp_sessions[name] = {
+                    "cfg_key": cfg_key,
+                    "stype": stype,
+                    "cm": cm,
+                    "session_cm": session_cm,
+                    "session": session,
+                }
+                return session
+
+            cm = streamablehttp_client(url, headers=headers, timeout=20, sse_read_timeout=300)
+            read_stream, write_stream, _get_session_id = await cm.__aenter__()
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            try:
+                await asyncio.wait_for(session.initialize(), timeout=20)
+            except Exception:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                raise
+            self._mcp_sessions[name] = {
+                "cfg_key": cfg_key,
+                "stype": stype,
+                "cm": cm,
+                "session_cm": session_cm,
+                "session": session,
+            }
+            return session
+
+        raise RuntimeError(f"Unsupported MCP server type: {stype}")
+
+    async def _mcp_with_sdk_session(self, name: str, cfg: dict, fn):
+        lock = self._mcp_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            session = await self._get_or_create_mcp_session(name, cfg)
+            try:
+                return await asyncio.wait_for(fn(session), timeout=45)
+            except Exception:
+                # Reset broken sessions so next call recreates cleanly.
+                await self._close_mcp_session(name)
+                raise
+
+    async def mcp_list_tools(self, params: Dict[str, str]) -> str:
+        name = (params.get("server") or "").strip()
+        if not name:
+            return "Error: mcp_list_tools requires <server>."
+        cfg, err = self._mcp_server_cfg(name)
+        if err:
+            return f"Error: {err}"
+        try:
+            async def _do(session):
+                return await session.list_tools()
+
+            result = await self._mcp_with_sdk_session(name, cfg, _do)
+            tools = getattr(result, "tools", None)
+            if tools is None and isinstance(result, dict):
+                tools = result.get("tools", [])
+            if not isinstance(tools, list):
+                tools = []
+            if not tools:
+                return f"MCP server '{name}' returned no tools."
+            lines = [f"MCP tools on '{name}':"]
+            for t in tools[:200]:
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")).strip()
+                req_fields: List[str] = []
+                schema = getattr(t, "inputSchema", None)
+                if schema is None and isinstance(t, dict):
+                    schema = t.get("inputSchema")
+                if isinstance(schema, dict):
+                    req = schema.get("required", [])
+                    if isinstance(req, list):
+                        req_fields = [str(x) for x in req if isinstance(x, str)]
+                req_txt = f" [required: {', '.join(req_fields)}]" if req_fields else ""
+                lines.append(f"- {tn}" + (f": {td}" if td else "") + req_txt)
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: MCP list failed for '{name}': {e}"
+
+    async def mcp_search_tools(self, params: Dict[str, str]) -> str:
+        name = (params.get("server") or "").strip()
+        query = (params.get("query") or "").strip()
+        try:
+            limit = int(params.get("limit", 8) or 8)
+        except Exception:
+            limit = 8
+        limit = max(1, min(limit, 20))
+        if not name or not query:
+            return "Error: mcp_search_tools requires <server> and <query>."
+
+        cfg, err = self._mcp_server_cfg(name)
+        if err:
+            return f"Error: {err}"
+        try:
+            async def _do(session):
+                return await session.list_tools()
+
+            result = await self._mcp_with_sdk_session(name, cfg, _do)
+            tools = getattr(result, "tools", None)
+            if tools is None and isinstance(result, dict):
+                tools = result.get("tools", [])
+            if not isinstance(tools, list) or not tools:
+                return f"MCP server '{name}' returned no tools."
+
+            q = query.lower()
+            q_tokens = {t for t in re.split(r"[^a-z0-9]+", q) if t}
+
+            scored: List[Tuple[float, dict]] = []
+            for t in tools:
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else ""))
+                hay = f"{tn} {td}".lower()
+                hay_tokens = {x for x in re.split(r"[^a-z0-9]+", hay) if x}
+                overlap = 0.0
+                if q_tokens:
+                    overlap = len(q_tokens & hay_tokens) / len(q_tokens)
+                ratio_name = difflib.SequenceMatcher(None, q, tn.lower()).ratio()
+                ratio_hay = difflib.SequenceMatcher(None, q, hay).ratio()
+                score = overlap * 2.0 + ratio_name * 1.5 + ratio_hay
+                if q in hay:
+                    score += 1.5
+                scored.append((score, t))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top = [t for s, t in scored[:limit] if s > 0.1]
+            if not top:
+                return f"No relevant MCP tools found on '{name}' for query: {query}"
+
+            lines = [f"Top MCP tools on '{name}' for '{query}' (limit={limit}):"]
+            for t in top:
+                tn = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                td = str(getattr(t, "description", "") or (t.get("description", "") if isinstance(t, dict) else "")).strip()
+                req_fields: List[str] = []
+                schema = getattr(t, "inputSchema", None)
+                if schema is None and isinstance(t, dict):
+                    schema = t.get("inputSchema")
+                if isinstance(schema, dict):
+                    req = schema.get("required", [])
+                    if isinstance(req, list):
+                        req_fields = [str(x) for x in req if isinstance(x, str)]
+                req_txt = f" [required: {', '.join(req_fields)}]" if req_fields else ""
+                lines.append(f"- {tn}" + (f": {td[:180]}" if td else "") + req_txt)
+            lines.append("Use mcp_call_tool with the exact chosen tool name.")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: MCP search failed for '{name}': {e}"
+
+    async def mcp_call_tool(self, params: Dict[str, str]) -> str:
+        name = (params.get("server") or "").strip()
+        tool = (params.get("tool") or "").strip()
+        args_raw = (params.get("arguments") or "").strip()
+        if not name or not tool:
+            return "Error: mcp_call_tool requires <server> and <tool>."
+        if not args_raw:
+            args_raw = "{}"
+        try:
+            arguments = json.loads(args_raw)
+            if not isinstance(arguments, dict):
+                return "Error: <arguments> must be a JSON object."
+        except Exception as e:
+            return f"Error: invalid JSON in <arguments>: {e}"
+
+        cfg, err = self._mcp_server_cfg(name)
+        if err:
+            return f"Error: {err}"
+        try:
+            async def _do(session):
+                # Schema-aware argument aliasing: if caller provided a generic
+                # "query" field but the MCP tool requires e.g. "search_query",
+                # map it automatically to reduce model-side friction.
+                try:
+                    listed = await session.list_tools()
+                    listed_tools = getattr(listed, "tools", None)
+                    if listed_tools is None and isinstance(listed, dict):
+                        listed_tools = listed.get("tools", [])
+                    if isinstance(listed_tools, list):
+                        match = None
+                        for t in listed_tools:
+                            tname = str(getattr(t, "name", "") or (t.get("name", "") if isinstance(t, dict) else ""))
+                            if tname == tool:
+                                match = t
+                                break
+                        if match is not None:
+                            schema = getattr(match, "inputSchema", None)
+                            if schema is None and isinstance(match, dict):
+                                schema = match.get("inputSchema")
+                            if isinstance(schema, dict):
+                                required = schema.get("required", [])
+                                if isinstance(required, list):
+                                    missing = [r for r in required if isinstance(r, str) and r not in arguments]
+                                    if "query" in arguments:
+                                        query_val = arguments.get("query")
+                                        for r in missing:
+                                            if isinstance(query_val, str) and r.endswith("query"):
+                                                arguments[r] = query_val
+                except Exception:
+                    pass
+
+                return await session.call_tool(tool, arguments)
+
+            result = await self._mcp_with_sdk_session(name, cfg, _do)
+            text_parts: List[str] = []
+            content = getattr(result, "content", None)
+            if content is None and isinstance(result, dict):
+                content = result.get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    txt = getattr(part, "text", None)
+                    if txt is None and isinstance(part, dict):
+                        txt = part.get("text")
+                    if isinstance(txt, str):
+                        text_parts.append(txt)
+            if text_parts:
+                return "\n".join(text_parts)
+            try:
+                if hasattr(result, "model_dump"):
+                    return json.dumps(result.model_dump(), ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            if isinstance(result, dict):
+                return json.dumps(result, ensure_ascii=False, indent=2)
+            return str(result)
+        except Exception as e:
+            return f"Error: MCP tool call failed on '{name}/{tool}': {e}"
+
+    def _display_path(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(Path(self.workspace_path)))
+        except Exception:
+            return str(path)
+
+    async def _write_text_with_feedback(self, path: Path, content: str, action: str = "Writing") -> None:
+        """Write text with visible progress for large payloads."""
+        total = len(content)
+        if total < self.LARGE_WRITE_FEEDBACK_THRESHOLD:
+            path.write_text(content, encoding="utf-8")
+            return
+
+        self.console.print(f"[dim]   {action} {self._display_path(path)} ({total:,} chars)[/dim]")
+        next_report = 10
+        written = 0
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            for i in range(0, total, self.LARGE_WRITE_CHUNK_SIZE):
+                chunk = content[i:i + self.LARGE_WRITE_CHUNK_SIZE]
+                f.write(chunk)
+                written += len(chunk)
+                pct = int((written * 100) / max(total, 1))
+                if pct >= next_report and pct < 100:
+                    self.console.print(f"[dim]     ... {pct}%[/dim]")
+                    next_report += 10
+                    await asyncio.sleep(0)
+        self.console.print("[dim]     ... 100%[/dim]")
     
     async def _background_log_tailer(self, bg_id: int, proc: asyncio.subprocess.Process,
                                       log_path: str):
@@ -269,6 +743,13 @@ class ToolHandlers:
                         info["task"].cancel()
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+        # Close persistent MCP sessions on shutdown.
+        for sname in list(self._mcp_sessions.keys()):
+            try:
+                await self._close_mcp_session(sname)
             except Exception:
                 pass
         self._background_procs.clear()
@@ -403,7 +884,7 @@ class ToolHandlers:
     async def write_file(self, params: Dict[str, str]) -> str:
         """Write content to a new file."""
         path = self._resolve_path(params.get("path", ""))
-        content = params.get("content", "")
+        content = desanitize_think_tokens(params.get("content", ""))
         log.info("write_file: path=%s content_len=%d", path, len(content))
         
         # Clean up invalid backtick escapes in Go files
@@ -425,7 +906,7 @@ class ToolHandlers:
             self.console.print(f"[yellow]Warning: Overwriting existing file ({old_size} bytes). Consider replace_in_file for edits.[/yellow]")
         
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        await self._write_text_with_feedback(path, content, action="Writing")
         
         # DEBUG: Verify write
         if os.environ.get("HARNESS_DEBUG"):
@@ -435,47 +916,189 @@ class ToolHandlers:
         if was_overwrite:
             return f"Successfully wrote to {path}\nNote: This file already existed. For future edits to existing files, please use replace_in_file instead of write_to_file."
         return f"Successfully wrote to {path}"
+
+    async def replace_between_anchors(self, params: Dict[str, str]) -> str:
+        """Replace content between two exact anchors, preserving the anchors.
+
+        Useful for large-block replacements where you want to keep the
+        boundary lines intact and replace everything between them.
+        """
+        path = self._resolve_path(params.get("path", ""))
+        start_anchor = params.get("start_anchor", "")
+        end_anchor = params.get("end_anchor", "")
+        replacement = params.get("replacement", "")
+        log.info(
+            "replace_between_anchors: path=%s start_len=%d end_len=%d repl_len=%d",
+            path, len(start_anchor), len(end_anchor), len(replacement)
+        )
+
+        if not path.exists():
+            return f"Error: File not found: {path}"
+        if not start_anchor:
+            return "Error: start_anchor is required."
+        if not end_anchor:
+            return "Error: end_anchor is required."
+
+        content = path.read_text(encoding="utf-8", errors="replace")
+
+        start_count = content.count(start_anchor)
+        end_count = content.count(end_anchor)
+        if start_count == 0:
+            return "Error: start_anchor not found in file."
+        if end_count == 0:
+            return "Error: end_anchor not found in file."
+        if start_count > 1:
+            return f"Error: start_anchor matched {start_count} times. Use a more specific anchor."
+        if end_count > 1:
+            return f"Error: end_anchor matched {end_count} times. Use a more specific anchor."
+
+        start_idx = content.find(start_anchor)
+        end_idx = content.find(end_anchor)
+        if end_idx <= start_idx:
+            return "Error: end_anchor occurs before start_anchor."
+
+        body_start = start_idx + len(start_anchor)
+        old_segment = content[body_start:end_idx]
+        new_content = content[:body_start] + replacement + content[end_idx:]
+        await self._write_text_with_feedback(path, new_content, action="Writing updated file")
+
+        old_lines = old_segment.count("\n") + (1 if old_segment else 0)
+        new_lines = replacement.count("\n") + (1 if replacement else 0)
+        return (
+            f"Successfully replaced content between anchors in {path}\n"
+            f"Anchors preserved. Replaced ~{old_lines} line(s) with ~{new_lines} line(s)."
+        )
     
     async def replace_in_file(self, params: Dict[str, str]) -> str:
-        """Replace sections of content in an existing file.
+        """Replace a section of text in an existing file.
         
         Matching strategy (in order):
         1. Exact string match
         2. Trailing-whitespace-normalized match
-        3. Indentation-agnostic match (strip leading whitespace, compare content)
-        4. Fuzzy best-match (difflib) — if similarity ≥ 0.6, apply with a warning
-        5. Fail with a helpful diagnostic showing the closest section in the file
+        3. Unicode-normalized match (smart quotes, en-dashes, NBSP → ASCII)
+        4. Escape-sequence-normalized match (literal \\n → newline, etc.)
+        5. Indentation-agnostic match (strip leading whitespace, compare content)
+        6. Block-anchor match (first+last line exact, fuzzy middle — from opencode)
+        7. Fuzzy best-match (difflib) — if similarity ≥ 0.6, apply with a warning
+        8. Fail with a helpful diagnostic showing the closest section in the file
         """
+        import unicodedata, difflib as _difflib
+
         path = self._resolve_path(params.get("path", ""))
-        diff = params.get("diff", "")
-        log.info("replace_in_file: path=%s diff_len=%d", path, len(diff))
+        search = desanitize_think_tokens(params.get("old_text", ""))
+        replace = desanitize_think_tokens(params.get("new_text", ""))
+        log.info("replace_in_file: path=%s old_len=%d new_len=%d", path, len(search), len(replace))
         
         if not path.exists():
             log.warning("replace_in_file: file not found: %s", path)
             return f"Error: File not found: {path}"
         
-        content = path.read_text(encoding="utf-8")
-        blocks = parse_search_replace_blocks(diff)
+        if not search:
+            return "Error: old_text is required (the text to find and replace)."
         
-        if not blocks:
-            return "Error: No valid SEARCH/REPLACE blocks found"
-        
+        raw_content = path.read_text(encoding="utf-8")
+        content = raw_content
+
         def normalize_trailing(s: str) -> str:
             """Normalize line endings and trailing whitespace."""
             lines = s.replace('\r\n', '\n').replace('\r', '\n').split('\n')
             return '\n'.join(line.rstrip() for line in lines)
         
+        def normalize_unicode(s: str) -> str:
+            """Normalize Unicode substitutions LLMs commonly make.
+            
+            Ported from pi-mono's normalizeForFuzzyMatch:
+            - NFKC normalization
+            - Strip trailing whitespace per line
+            - Smart quotes → ASCII equivalents
+            - Unicode dashes/hyphens → hyphen-minus
+            - Non-breaking and special spaces → regular space
+            """
+            s = unicodedata.normalize('NFKC', s)
+            s = '\n'.join(line.rstrip() for line in s.replace('\r\n', '\n').split('\n'))
+            s = re.sub(r'[\u2018\u2019\u201A\u201B]', "'", s)   # smart single quotes
+            s = re.sub(r'[\u201C\u201D\u201E\u201F]', '"', s)   # smart double quotes
+            s = re.sub(r'[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]', '-', s)  # dashes
+            s = re.sub(r'[\u00A0\u2002-\u200A\u202F\u205F\u3000]', ' ', s)  # special spaces
+            return s
+
+        def unescape_text(s: str) -> str:
+            """Normalize literal escape sequences (\\n → newline, \\t → tab etc.)."""
+            return (s.replace('\\n', '\n')
+                     .replace('\\t', '\t')
+                     .replace('\\r', '\r')
+                     .replace("\\'", "'")
+                     .replace('\\"', '"'))
+
         def strip_indent(s: str) -> list:
             """Return (stripped_lines, indent_per_line) for indentation-agnostic compare."""
             lines = s.replace('\r\n', '\n').replace('\r', '\n').split('\n')
             stripped = [line.lstrip() for line in lines]
             indents = [line[:len(line) - len(line.lstrip())] for line in lines]
             return stripped, indents
+
+        def block_anchor_match(content_lines: list, search_lines: list):
+            """Find block by anchoring on first+last lines, fuzzy-match middle.
+            
+            Ported from opencode's BlockAnchorReplacer + BlockAnchorReplacer logic.
+            Returns (start_idx, end_exclusive_idx) or None.
+            """
+            # Strip trailing empty lines (like opencode's BlockAnchorReplacer)
+            while search_lines and search_lines[-1].strip() == "":
+                search_lines = search_lines[:-1]
+            if len(search_lines) < 3:
+                return None
+            first = search_lines[0].strip()
+            last = search_lines[-1].strip()
+            if not first or not last:
+                return None
+
+            candidates = []
+            for i, line in enumerate(content_lines):
+                if line.strip() != first:
+                    continue
+                for j in range(i + 2, len(content_lines)):
+                    if content_lines[j].strip() == last:
+                        candidates.append((i, j))
+                        break  # only first occurrence of last line after this first
+
+            if not candidates:
+                return None
+
+            def middle_similarity(cand_start: int, cand_end: int) -> float:
+                s_mid = search_lines[1:-1]
+                a_mid = content_lines[cand_start + 1:cand_end]
+                n = max(len(s_mid), len(a_mid))
+                if n == 0:
+                    return 1.0
+                total = 0.0
+                for s_line, a_line in zip(s_mid, a_mid):
+                    max_len = max(len(s_line.strip()), len(a_line.strip()))
+                    if max_len == 0:
+                        continue
+                    total += _difflib.SequenceMatcher(None, s_line.strip(), a_line.strip()).ratio()
+                return total / n
+
+            if len(candidates) == 1:
+                start, end = candidates[0]
+                # Single candidate: accept if anchors match (threshold 0.0, like opencode)
+                return start, end + 1
+
+            # Multiple candidates: pick the one with highest middle similarity
+            best = max(candidates, key=lambda c: middle_similarity(c[0], c[1]))
+            start, end = best
+            if middle_similarity(start, end) >= 0.3:
+                return start, end + 1
+            return None
         
         def find_best_fuzzy_match(content_text: str, search_text: str):
             """Find the best fuzzy match for search_text within content_text.
             
             Returns (start_line_idx, end_line_idx, similarity_ratio) or None.
+            
+            Capped at 30 search lines to avoid O(n³) blowup on large blocks
+            (e.g. model sends entire <style> block as old_text).  Large blocks
+            should always be found by exact / whitespace / indent strategies.
             """
             import difflib
             search_lines = search_text.replace('\r\n', '\n').split('\n')
@@ -485,20 +1108,29 @@ class ToolHandlers:
             if search_len == 0 or len(content_lines) == 0:
                 return None
             
+            # Skip fuzzy matching for large blocks — too expensive and
+            # unlikely to produce a useful result.
+            if search_len > 30:
+                return None
+            
             best_ratio = 0.0
             best_start = 0
+            best_window = search_len
             
             # Slide a window of size search_len (±30%) across content_lines
             min_window = max(1, int(search_len * 0.7))
             max_window = int(search_len * 1.3) + 1
             
+            # Pre-filter threshold: at least 40% of lines must match exactly
+            min_shared = max(2, int(search_len * 0.4))
+            
             for window_size in range(min_window, min(max_window, len(content_lines) + 1)):
                 for i in range(len(content_lines) - window_size + 1):
                     candidate = content_lines[i:i + window_size]
-                    # Quick pre-filter: at least some lines must share content
+                    # Quick pre-filter: require a meaningful fraction of exact-match lines
                     shared = sum(1 for a, b in zip(search_lines, candidate)
                                  if a.strip() == b.strip())
-                    if shared < min(3, search_len * 0.3):
+                    if shared < min_shared:
                         continue
                     
                     ratio = difflib.SequenceMatcher(
@@ -524,9 +1156,9 @@ class ToolHandlers:
             content_lines = content_text.replace('\r\n', '\n').split('\n')
             
             msg_parts = [
-                f"Error: SEARCH block not found in file.",
+                f"Error: old_text not found in file.",
                 f"",
-                f"SEARCH block ({len(search_lines)} lines):",
+                f"old_text ({len(search_lines)} lines):",
                 f"  {chr(10).join('  ' + l for l in search_lines[:5])}",
             ]
             if len(search_lines) > 5:
@@ -543,13 +1175,12 @@ class ToolHandlers:
                 msg_parts.append(f"")
                 msg_parts.append(f"Tip: Re-read the file around lines {start+1}-{end} and retry with the exact content.")
             else:
-                # Show first few lines of each search line in context
                 first_search = search_lines[0].strip() if search_lines else ""
                 if first_search:
                     near = [i for i, l in enumerate(content_lines) if first_search in l]
                     if near:
                         msg_parts.append(f"")
-                        msg_parts.append(f"First search line found near line(s): {', '.join(str(n+1) for n in near[:5])}")
+                        msg_parts.append(f"First line of old_text found near line(s): {', '.join(str(n+1) for n in near[:5])}")
                         ctx_start = max(0, near[0] - 2)
                         ctx_end = min(len(content_lines), near[0] + 5)
                         for i in range(ctx_start, ctx_end):
@@ -559,89 +1190,133 @@ class ToolHandlers:
             
             return '\n'.join(msg_parts)
         
-        changes = 0
-        for search, replace in blocks:
-            # Strategy 1: Exact match
-            if search in content:
-                content = content.replace(search, replace, 1)
-                changes += 1
-                continue
+        # Strategy 1: Exact match
+        if search in content:
+            content = content.replace(search, replace, 1)
+            await self._write_text_with_feedback(path, content, action="Writing updated file")
+            return f"Successfully replaced text in {path}"
+        
+        # Strategy 2: Trailing-whitespace-normalized match
+        norm_content = normalize_trailing(content)
+        norm_search = normalize_trailing(search)
+        
+        if norm_search in norm_content:
+            search_lines = norm_search.split('\n')
+            content_lines = content.replace('\r\n', '\n').split('\n')
             
-            # Strategy 2: Trailing-whitespace-normalized match
-            norm_content = normalize_trailing(content)
-            norm_search = normalize_trailing(search)
-            
-            if norm_search in norm_content:
-                search_lines = norm_search.split('\n')
-                content_lines = content.replace('\r\n', '\n').split('\n')
-                
-                for i in range(len(content_lines) - len(search_lines) + 1):
-                    match = True
-                    for j, search_line in enumerate(search_lines):
-                        if content_lines[i + j].rstrip() != search_line:
-                            match = False
-                            break
-                    if match:
-                        replace_lines = replace.replace('\r\n', '\n').split('\n')
-                        content_lines = content_lines[:i] + replace_lines + content_lines[i + len(search_lines):]
-                        content = '\n'.join(content_lines)
-                        changes += 1
+            for i in range(len(content_lines) - len(search_lines) + 1):
+                match = True
+                for j, search_line in enumerate(search_lines):
+                    if content_lines[i + j].rstrip() != search_line:
+                        match = False
                         break
-                else:
-                    return build_diagnostic(content, search)
-                continue
-            
-            # Strategy 3: Indentation-agnostic match
-            search_stripped, _ = strip_indent(search)
+                if match:
+                    replace_lines = replace.replace('\r\n', '\n').split('\n')
+                    content_lines = content_lines[:i] + replace_lines + content_lines[i + len(search_lines):]
+                    content = '\n'.join(content_lines)
+                    await self._write_text_with_feedback(path, content, action="Writing updated file")
+                    return f"Successfully replaced text in {path}"
+
+        # Strategy 3: Unicode-normalized match
+        # Handles LLM substitutions: smart quotes → ASCII, en-dash → hyphen, NBSP → space
+        uni_content = normalize_unicode(content)
+        uni_search = normalize_unicode(search)
+        uni_replace = normalize_unicode(replace)
+        # Only apply if normalization changed search or content (otherwise S1/S2 already handled it)
+        if (uni_search != search or uni_content != content) and uni_search in uni_content:
+            idx = uni_content.index(uni_search)
+            # Apply replacement inside unicode-normalized content, then write
+            new_uni = uni_content[:idx] + uni_replace + uni_content[idx + len(uni_search):]
+            await self._write_text_with_feedback(path, new_uni, action="Writing updated file")
+            content = new_uni
+            self.console.print(f"[dim]   (matched with Unicode normalization)[/dim]")
+            return f"Successfully replaced text in {path}"
+
+        # Strategy 4: Escape-sequence-normalized match
+        # Handles LLM outputting literal \n instead of actual newline characters
+        esc_content = unescape_text(content)
+        esc_search = unescape_text(search)
+        # Only apply if unescaping changed search (otherwise S1 should have caught it)
+        if esc_search != search and esc_search in esc_content:
+            idx = esc_content.index(esc_search)
+            esc_replace = unescape_text(replace)
+            new_content = esc_content[:idx] + esc_replace + esc_content[idx + len(esc_search):]
+            await self._write_text_with_feedback(path, new_content, action="Writing updated file")
+            content = new_content
+            self.console.print(f"[dim]   (matched with escape-sequence normalization)[/dim]")
+            return f"Successfully replaced text in {path}"
+
+        # Strategy 5: Indentation-agnostic match
+        search_stripped, _ = strip_indent(search)
+        content_lines_raw = content.replace('\r\n', '\n').split('\n')
+        content_stripped = [l.lstrip() for l in content_lines_raw]
+        
+        for i in range(len(content_stripped) - len(search_stripped) + 1):
+            if all(content_stripped[i + j] == search_stripped[j]
+                   for j in range(len(search_stripped))):
+                file_indent = content_lines_raw[i][:len(content_lines_raw[i]) - len(content_lines_raw[i].lstrip())]
+                search_indent = search.replace('\r\n', '\n').split('\n')[0]
+                search_indent = search_indent[:len(search_indent) - len(search_indent.lstrip())]
+                
+                replace_lines_raw = replace.replace('\r\n', '\n').split('\n')
+                adjusted_replace = []
+                for rl in replace_lines_raw:
+                    if rl.startswith(search_indent):
+                        adjusted_replace.append(file_indent + rl[len(search_indent):])
+                    else:
+                        adjusted_replace.append(rl)
+                
+                content_lines_raw = content_lines_raw[:i] + adjusted_replace + content_lines_raw[i + len(search_stripped):]
+                content = '\n'.join(content_lines_raw)
+                await self._write_text_with_feedback(path, content, action="Writing updated file")
+                self.console.print(f"[dim]   (matched with indentation adjustment)[/dim]")
+                return f"Successfully replaced text in {path}"
+
+        # Strategy 6: Block-anchor match (first+last line exact, fuzzy middle)
+        # Ported from opencode's BlockAnchorReplacer.  Handles cases where the
+        # model's old_text has slightly-off middle lines but correct boundaries.
+        content_lines_raw = content.replace('\r\n', '\n').split('\n')
+        search_lines_raw = search.replace('\r\n', '\n').split('\n')
+        anchor = block_anchor_match(content_lines_raw, search_lines_raw)
+        if anchor:
+            start, end = anchor
+            replace_lines = replace.replace('\r\n', '\n').split('\n')
+            content_lines_raw = content_lines_raw[:start] + replace_lines + content_lines_raw[end:]
+            content = '\n'.join(content_lines_raw)
+            await self._write_text_with_feedback(path, content, action="Writing updated file")
+            self.console.print(f"[dim]   (matched with block-anchor at lines {start+1}-{end})[/dim]")
+            return f"Successfully replaced text in {path}"
+
+        # Strategy 7: Fuzzy match — apply if similarity ≥ 0.6
+        # Guard: also reject if ANY single line diverges too much from the
+        # corresponding file line (catches reasoning-text contamination where
+        # the model's thinking leaks into old_text string arguments).
+        fuzzy = find_best_fuzzy_match(content, search)
+        if fuzzy and fuzzy[2] >= 0.6:
+            start, end, ratio = fuzzy
             content_lines_raw = content.replace('\r\n', '\n').split('\n')
-            content_stripped = [l.lstrip() for l in content_lines_raw]
-            indent_match_found = False
-            
-            for i in range(len(content_stripped) - len(search_stripped) + 1):
-                if all(content_stripped[i + j] == search_stripped[j]
-                       for j in range(len(search_stripped))):
-                    # Content matches but indentation differs.
-                    # Determine the indentation offset and apply it to the replacement.
-                    file_indent = content_lines_raw[i][:len(content_lines_raw[i]) - len(content_lines_raw[i].lstrip())]
-                    search_indent = search.replace('\r\n', '\n').split('\n')[0]
-                    search_indent = search_indent[:len(search_indent) - len(search_indent.lstrip())]
-                    
-                    replace_lines_raw = replace.replace('\r\n', '\n').split('\n')
-                    # Adjust each replacement line: remove search's base indent, add file's base indent
-                    adjusted_replace = []
-                    for rl in replace_lines_raw:
-                        if rl.startswith(search_indent):
-                            adjusted_replace.append(file_indent + rl[len(search_indent):])
-                        else:
-                            adjusted_replace.append(rl)
-                    
-                    content_lines_raw = content_lines_raw[:i] + adjusted_replace + content_lines_raw[i + len(search_stripped):]
-                    content = '\n'.join(content_lines_raw)
-                    changes += 1
-                    indent_match_found = True
-                    self.console.print(f"[dim]   (matched with indentation adjustment)[/dim]")
-                    break
-            
-            if indent_match_found:
-                continue
-            
-            # Strategy 4: Fuzzy match — apply if similarity ≥ 0.6
-            fuzzy = find_best_fuzzy_match(content, search)
-            if fuzzy and fuzzy[2] >= 0.6:
-                start, end, ratio = fuzzy
-                content_lines_raw = content.replace('\r\n', '\n').split('\n')
+            search_lines_check = search.replace('\r\n', '\n').split('\n')
+            candidate_lines = content_lines_raw[start:end]
+
+            # Per-line similarity floor: every aligned line pair must be ≥ 0.5
+            import difflib
+            min_line_ratio = 1.0
+            for sl, cl in zip(search_lines_check, candidate_lines):
+                lr = difflib.SequenceMatcher(None, sl.strip(), cl.strip()).ratio()
+                min_line_ratio = min(min_line_ratio, lr)
+
+            if min_line_ratio >= 0.5:
                 replace_lines = replace.replace('\r\n', '\n').split('\n')
                 content_lines_raw = content_lines_raw[:start] + replace_lines + content_lines_raw[end:]
                 content = '\n'.join(content_lines_raw)
-                changes += 1
+                await self._write_text_with_feedback(path, content, action="Writing updated file")
                 self.console.print(f"[dim]   (fuzzy match {ratio:.0%} at lines {start+1}-{end})[/dim]")
-                continue
-            
-            # Strategy 5: Fail with helpful diagnostic
-            return build_diagnostic(content, search)
+                return f"Successfully replaced text in {path}"
+            else:
+                log.info("replace_in_file: fuzzy match rejected — per-line min ratio %.2f < 0.5 (possible contamination)", min_line_ratio)
         
-        path.write_text(content, encoding="utf-8")
-        return f"Successfully made {changes} replacement(s) in {path}"
+        # Strategy 8: Fail with helpful diagnostic
+        return build_diagnostic(content, search)
     
     async def execute_command(self, params: Dict[str, str]) -> str:
         """Execute a shell command with live output display and interrupt support.
@@ -657,12 +1332,13 @@ class ToolHandlers:
         command = params.get("command", "")
         background = params.get("background", "").lower() == "true"
         timeout_secs = 120  # Auto-background after this many seconds
+        if not command.strip():
+            return "Error: execute_command requires a non-empty <command> parameter."
         log.info("execute_command: cmd=%s bg=%s", log_truncate(command, 200), background)
         
-        # Show command being executed
         mode_indicator = "[bg] " if background else ""
         cmd_short = command.split('\n')[0][:120]  # First line, truncated
-        self.console.print(f"\n  [dim]•[/dim] Running [dim]{mode_indicator}{cmd_short}[/dim]")
+        self.console.print(f"  [dim]•[/dim] [bold]Running[/bold] [dim]{mode_indicator}{cmd_short}[/dim]")
         
         if background:
             return await self._run_background_command(command)
@@ -680,7 +1356,7 @@ class ToolHandlers:
         # NOTE: create_subprocess_shell already invokes the platform shell
         # (cmd.exe on Windows, /bin/sh on Unix), so we must NOT wrap with
         # an extra "cmd /c" — that breaks commands containing double quotes.
-        wrapped = f'{command} > "{cmd_log_path}" 2>&1'
+        wrapped = self._wrap_shell_command(command, cmd_log_path)
 
         proc = await asyncio.create_subprocess_shell(
             wrapped,
@@ -704,7 +1380,7 @@ class ToolHandlers:
                 # Check for interrupt (Esc)
                 if is_interrupted():
                     self._kill_proc(proc)
-                    self.console.print(f"\n    [yellow]⏹ Command interrupted[/yellow]")
+                    self.console.print(f"    [yellow]interrupted[/yellow]")
                     raw_output = self._read_log_file(cmd_log_path)
                     output = self.spill_output_to_file(
                         raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
@@ -713,12 +1389,12 @@ class ToolHandlers:
                 # Check for background request (Ctrl+B)
                 if is_background_requested():
                     reset_background()
-                    self.console.print(f"\n    [cyan]→ Sending to background...[/cyan]")
+                    self.console.print(f"    [cyan]→ background[/cyan]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
-                    self.console.print(f"    [dim](Ctrl+B to background, Esc to stop)[/dim]")
+                    self.console.print(f"    [dim]Ctrl+B background · Esc stop[/dim]")
                     hint_shown = True
                 
                 # Auto-background after timeout.  Use a shorter timeout for
@@ -726,7 +1402,7 @@ class ToolHandlers:
                 # that block cmd.exe but have no console output to tail.
                 effective_timeout = 10 if not output_lines else timeout_secs
                 if elapsed > effective_timeout:
-                    self.console.print(f"\n    [cyan]→ No output for {elapsed:.0f}s, sending to background...[/cyan]")
+                    self.console.print(f"    [cyan]→ background[/cyan] [dim](no output for {elapsed:.0f}s)[/dim]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
                 
                 # Read new content from log file
@@ -756,7 +1432,7 @@ class ToolHandlers:
                 if output_lines:
                     # Log file is growing — a detached app is still running.
                     # Promote to background so the log tailer keeps reading.
-                    self.console.print(f"    [cyan]→ Detached process detected, sending to background...[/cyan]")
+                    self.console.print(f"    [cyan]→ background[/cyan] [dim](detached process)[/dim]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
 
             exit_code = proc.returncode
@@ -797,6 +1473,28 @@ class ToolHandlers:
     # Maximum lines to show live before collapsing (show first N, then summarize)
     _MAX_LIVE_DISPLAY = 10
 
+    def _wrap_shell_command(self, command: str, log_path: str) -> str:
+        """Build platform shell wrapper for a command with file redirection.
+        
+        On Windows, default to PowerShell execution for deterministic behavior
+        with PowerShell syntax (the system prompt advertises PowerShell).
+        Set HARNESS_WINDOWS_SHELL=cmd to force legacy cmd.exe behavior.
+        """
+        if platform.system() == "Windows":
+            win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
+            if win_shell != "cmd":
+                # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
+                ps_command = "$ProgressPreference='SilentlyContinue'; " + command
+                encoded = base64.b64encode(ps_command.encode("utf-16le")).decode("ascii")
+                launcher = (
+                    "powershell -NoProfile -NonInteractive "
+                    "-InputFormat Text -OutputFormat Text "
+                    "-ExecutionPolicy Bypass "
+                    f"-EncodedCommand {encoded}"
+                )
+                return f'{launcher} > "{log_path}" 2>&1'
+        return f'{command} > "{log_path}" 2>&1'
+
     def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:
         """Read new content from a log file starting at file_pos.
         
@@ -811,11 +1509,17 @@ class ToolHandlers:
                 new_data = f.read()
                 new_pos = f.tell()
             if new_data:
+                # Decode any CLIXML blocks before splitting into lines so
+                # multi-line XML fragments are cleaned up as a unit.
+                new_data = _decode_clixml_in_text(new_data)
                 for line in new_data.splitlines():
-                    output_lines.append(line)
+                    decoded_line = _decode_powershell_clixml(line)
+                    if not decoded_line.strip():
+                        continue
+                    output_lines.append(decoded_line)
                     n = len(output_lines)
                     if n <= self._MAX_LIVE_DISPLAY:
-                        safe_line = sanitize_terminal_output(line)
+                        safe_line = sanitize_terminal_output(decoded_line)
                         self.console.print(f"    [dim]{safe_line}[/dim]")
                     elif n == self._MAX_LIVE_DISPLAY + 1:
                         self.console.print(f"    [dim]… +more lines (running)[/dim]")
@@ -828,7 +1532,10 @@ class ToolHandlers:
     def _read_log_file(self, log_path: str) -> str:
         """Read the entire contents of a log file."""
         try:
-            return Path(log_path).read_text(encoding="utf-8", errors="replace")
+            raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            cleaned = _decode_clixml_in_text(raw)
+            decoded = _decode_powershell_clixml(cleaned)
+            return decoded or raw
         except Exception:
             return ""
     
@@ -850,7 +1557,7 @@ class ToolHandlers:
             "log_file": log_path,
             "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
-        self.console.print(f"    [green]→ Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
         recent = "\n".join(output_lines[-30:])
         return (
             f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
@@ -859,159 +1566,11 @@ class ToolHandlers:
             f"Output so far:\n{recent}"
         )
 
-    async def create_plan(self, params: Dict[str, str], context_summary: str = "") -> str:
-        """Delegate a complex reasoning task to Claude CLI (Opus 4.6).
-        
-        Auto-attaches context summary (todos, recent files, workspace info).
-        
-        NOTE: This does NOT go through execute_command.  The prompt may contain
-        newlines, quotes, pipes, angle brackets, etc. that would be mangled by
-        shell quoting / redirect.  Instead we launch the claude CLI directly
-        via create_subprocess_exec and pipe the prompt through a temp file
-        passed with the -p flag reading from file, or via stdin.
-        """
-        prompt = params.get("prompt", "").strip()
-        if not prompt:
-            return "Error: 'prompt' is required for create_plan."
-        
-        # Build full prompt with context
-        full_prompt = prompt
-        if context_summary:
-            full_prompt = f"CONTEXT:\n{context_summary}\n\nTASK:\n{prompt}"
-        
-        # Write prompt to a temp file to avoid all shell quoting issues.
-        # Claude CLI reads -p from the command line, but we can pipe via stdin
-        # using the '-' convention or just pass a sanitized file reference.
-        # Safest approach: write to file, pass via stdin with --pipe flag.
-        import tempfile
-        prompt_file = None
-        try:
-            # Write prompt to temp file
-            prompt_file = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.txt', prefix='harness_plan_',
-                dir=self._output_dir, delete=False, encoding='utf-8'
-            )
-            prompt_file.write(full_prompt)
-            prompt_file.close()
-            prompt_path = prompt_file.name
-            
-            # Build args: claude reads prompt from stdin via -p "$(cat file)"
-            # Actually simplest: use -p @file or just pipe stdin.
-            # Claude CLI supports: echo "prompt" | claude -p -
-            # But safest: claude -p with the file contents piped via stdin
-            args = ["claude", "-p", "-", "--dangerously-skip-permissions"]
-            
-            # Use configured model if available
-            claude_model = getattr(self, '_claude_model', None)
-            if claude_model:
-                args.extend(["--model", claude_model])
-            
-            log.info("create_plan: launching Claude CLI with %d-char prompt via stdin", len(full_prompt))
-            self.console.print(f"[bold yellow]{'─' * 4} create_plan (Claude CLI) {'─' * 25}[/bold yellow]")
-            self.console.print(f"[dim]  Prompt: {len(full_prompt)} chars | Model: {claude_model or 'default'}[/dim]")
-            
-            # Launch directly (no shell) with stdin pipe for the prompt
-            # and stdout/stderr piped for capture
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.workspace_path,
-            )
-            
-            # Send prompt via stdin and collect output
-            output_chunks = []
-            start_time = time.time()
-            
-            # Write prompt to stdin, then close it
-            proc.stdin.write(full_prompt.encode('utf-8'))
-            await proc.stdin.drain()
-            proc.stdin.close()
-            
-            # Read output line by line with live display
-            while True:
-                try:
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    if proc.returncode is not None:
-                        break
-                    # Check for interrupt
-                    from .interrupt import is_interrupted
-                    if is_interrupted():
-                        self._kill_proc(proc)
-                        self.console.print(f"\n[yellow][STOP] create_plan interrupted[/yellow]")
-                        partial = "\n".join(output_chunks)
-                        return f"create_plan interrupted after {time.time() - start_time:.0f}s.\nPartial output:\n{partial}"
-                    continue
-                
-                if not line:
-                    break
-                
-                decoded = line.decode('utf-8', errors='replace').rstrip()
-                output_chunks.append(decoded)
-                safe_line = sanitize_terminal_output(decoded)
-                self.console.print(f"[dim]  {safe_line}[/dim]")
-            
-            await proc.wait()
-            elapsed = time.time() - start_time
-            exit_code = proc.returncode
-            
-            self.console.print(f"[bold yellow]{'─' * 4} create_plan done {'─' * 32}[/bold yellow]")
-            
-            raw_output = "\n".join(output_chunks)
-            
-            if exit_code != 0:
-                log.warning("create_plan failed: exit=%d elapsed=%.1fs output_len=%d",
-                           exit_code, elapsed, len(raw_output))
-                self.console.print(f"[red][X] Claude CLI exit code: {exit_code}[/red]")
-                return f"Error: Claude CLI failed (exit code {exit_code}).\nOutput:\n{raw_output}" if raw_output else f"Error: Claude CLI failed (exit code {exit_code}, no output)"
-            
-            log.info("create_plan success: elapsed=%.1fs output_len=%d", elapsed, len(raw_output))
-            
-            if not raw_output.strip():
-                return "Error: Claude CLI returned empty output."
-            
-            # Save plan to persistent file for audit trail
-            plan_dir = os.path.join(self._output_dir, "plans")
-            os.makedirs(plan_dir, exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            plan_path = os.path.join(plan_dir, f"plan_{ts}.md")
-            Path(plan_path).write_text(
-                f"# create_plan — {ts}\n\n"
-                f"**Model**: {claude_model or 'default'}\n"
-                f"**Elapsed**: {elapsed:.1f}s\n\n"
-                f"## Prompt\n\n{full_prompt}\n\n"
-                f"## Response\n\n{raw_output}\n",
-                encoding='utf-8'
-            )
-            log.info("Plan saved to: %s", plan_path)
-            self.console.print(f"[dim]  Plan saved: {plan_path}[/dim]")
-            
-            # Truncate for context if very large
-            output = truncate_output(raw_output, max_lines=300, keep_start=80, keep_end=80)
-            output = self.spill_output_to_file(output, "create_plan")
-
-            # Prepend plan file path so the agent can read the full output
-            output = f"Plan saved to: {plan_path}\nRead this file to see exactly what the planner did before taking any action.\n\n{output}"
-
-            # Add to context
-            if len(output_chunks) > 3:
-                ctx_id = self.context.add("command_output", "create_plan", output)
-                return f"[Context ID: {ctx_id}]\n{output}"
-            return output
-            
-        finally:
-            # Clean up temp prompt file
-            if prompt_file and os.path.exists(prompt_file.name):
-                try:
-                    os.unlink(prompt_file.name)
-                except Exception:
-                    pass
-    
     async def _run_background_command(self, command: str) -> str:
         """Run a command in background with output redirected to a log file."""
         log.info("_run_background_command: cmd=%s", log_truncate(command, 120))
+        if not command.strip():
+            return "Error: execute_command requires a non-empty <command> parameter."
         
         proc_id = self._next_bg_id
         self._next_bg_id += 1
@@ -1021,7 +1580,7 @@ class ToolHandlers:
         Path(log_path).write_text("", encoding="utf-8")
 
         # Shell-level redirect to log file (no cmd /c wrapper — see execute_command)
-        wrapped = f'{command} > "{log_path}" 2>&1'
+        wrapped = self._wrap_shell_command(command, log_path)
         
         proc = await asyncio.create_subprocess_shell(
             wrapped,
@@ -1036,6 +1595,7 @@ class ToolHandlers:
         initial_output = []
         try:
             data = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            data = _decode_clixml_in_text(data)
             initial_output = data.splitlines()[-10:]
             for line in initial_output:
                 safe_line = sanitize_terminal_output(line)
@@ -1052,7 +1612,7 @@ class ToolHandlers:
             "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
         }
         
-        self.console.print(f"    [green]→ Running in background (ID: {proc_id}, PID: {proc.pid})[/green]")
+        self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
         return (
             f"Command started in background (ID: {proc_id}, PID: {proc.pid}).\n"
             f"Log file: {log_path}\n"
@@ -1386,22 +1946,31 @@ class ToolHandlers:
         parsed = urlparse(self.config.api_url)
         search_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
         
-        payload = {
-            "model": "glm-4.7",
-            "messages": [{"role": "user", "content": f"Search the web for: {query}"}],
-            "temperature": 0.7,
-            "max_tokens": 2048,
-            "stream": False,
-            "tools": [{
-                "type": "web_search",
-                "web_search": {
-                    "enable": True,
-                    "search_engine": "search-prime",
-                    "search_result": True,
-                    "count": str(count),
-                }
-            }]
-        }
+        def _build_payload(q: str, attempt: int) -> dict:
+            msg = f"Search the web for: {q}"
+            # Retry hint when the model returns unresolved function metadata.
+            if attempt > 0:
+                msg = (
+                    f"Search the web for: {q}\n"
+                    "Return final search results and summary text directly. "
+                    "Do not return tool/function call metadata."
+                )
+            return {
+                "model": "glm-4.7",
+                "messages": [{"role": "user", "content": msg}],
+                "temperature": 0.4 if attempt > 0 else 0.7,
+                "max_tokens": 2048,
+                "stream": False,
+                "tools": [{
+                    "type": "web_search",
+                    "web_search": {
+                        "enable": True,
+                        "search_engine": "search-prime",
+                        "search_result": True,
+                        "count": str(count),
+                    }
+                }]
+            }
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
@@ -1410,17 +1979,49 @@ class ToolHandlers:
         
         try:
             async with httpx.AsyncClient(timeout=120.0) as http_client:
-                response = await http_client.post(search_url, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                
-                results = data.get("web_search", [])
+                data = {}
+                results = []
                 content = ""
-                if "choices" in data and data["choices"]:
-                    content = data["choices"][0].get("message", {}).get("content", "")
-                
+                raw_fc_content = ""
+                for attempt in range(2):
+                    payload = _build_payload(query, attempt)
+                    response = await http_client.post(search_url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+
+                    results = data.get("web_search", [])
+                    content = ""
+                    if "choices" in data and data["choices"]:
+                        content = data["choices"][0].get("message", {}).get("content", "")
+
+                    # Some responses occasionally return unresolved function-call JSON
+                    # like {"function":"google_search","arguments":"..."} in content.
+                    unresolved_fc = False
+                    raw_fc_content = ""
+                    if isinstance(content, str):
+                        ct = content.strip()
+                        if ct.startswith("{") and ct.endswith("}"):
+                            try:
+                                parsed = json.loads(ct)
+                                if isinstance(parsed, dict) and "function" in parsed and "arguments" in parsed:
+                                    unresolved_fc = True
+                                    raw_fc_content = ct
+                            except Exception:
+                                pass
+
+                    if unresolved_fc and not results and attempt == 0:
+                        # Transient backend behavior: retry once with clearer instruction.
+                        continue
+                    break
+
                 if not results and not content:
                     return f"No results found for: {query}"
+                if not results and raw_fc_content:
+                    return (
+                        "Search backend returned unresolved function-call metadata instead of final results. "
+                        "Please retry once.\n\n"
+                        f"Raw content: {raw_fc_content[:300]}"
+                    )
                 
                 # Format results
                 output = [f"Web Search Results for: {query}\n"]
@@ -1462,3 +2063,49 @@ class ToolHandlers:
             import traceback
             tb = traceback.format_exc()
             return f"Error searching web: {type(e).__name__}: {e}\n{tb}"
+    
+    async def retrieve_tool_result(self, params: Dict[str, str]) -> str:
+        """Retrieve the full content of a previously compacted tool result.
+        
+        When tool results are compacted to save context space, they're stored
+        with a unique ID. Use this tool to retrieve the full result when needed.
+        
+        Args:
+            result_id: The ID of the stored result (e.g., res_abc123_456)
+            
+        Returns:
+            The full tool result content, or an error message if not found
+        """
+        result_id = params.get("result_id", "").strip()
+        if not result_id:
+            return "Error: result_id is required. Example: res_abc123_456"
+        
+        # Check if context_manager is available
+        if not self._context_manager:
+            return "Error: Context manager not available for result retrieval"
+        
+        # Retrieve the stored result
+        stored = self._context_manager.result_storage.get_result(result_id)
+        if not stored:
+            return (
+                f"Error: Result {result_id} not found. "
+                f"It may have been evicted due to age or memory limits."
+            )
+        
+        # Format the result with metadata
+        age_seconds = time.time() - stored.timestamp
+        age_str = f"{age_seconds:.0f}s" if age_seconds < 60 else f"{age_seconds/60:.0f}m"
+        
+        result = (
+            f"[Retrieved tool result: {stored.tool_name}]\n"
+            f"Result ID: {result_id}\n"
+            f"Age: {age_str} ago\n"
+            f"Size: {stored.tokens:,} tokens (~{len(stored.original_content):,} chars)\n"
+            f"{'='*60}\n"
+            f"{stored.original_content}"
+        )
+        
+        log.info("retrieve_tool_result: result_id=%s tool=%s tokens=%d age=%s",
+                 result_id, stored.tool_name, stored.tokens, age_str)
+        
+        return result

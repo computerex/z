@@ -7,7 +7,7 @@ import sys
 import os
 
 # Ensure src is on path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from harness.todo_manager import TodoManager, TodoItem, TodoStatus
 from harness.smart_context import (
@@ -22,6 +22,7 @@ from harness.smart_context import (
 # ============================================================
 # TodoManager Tests
 # ============================================================
+
 
 class TestTodoManager:
     def test_add_todo(self):
@@ -50,7 +51,7 @@ class TestTodoManager:
         item = mgr.add("Task")
         mgr.update(item.id, status="in-progress")
         assert mgr.get(item.id).status == TodoStatus.IN_PROGRESS
-        
+
         mgr.update(item.id, status="completed")
         assert mgr.get(item.id).status == TodoStatus.COMPLETED
         assert mgr.get(item.id).completed_at is not None
@@ -116,7 +117,7 @@ class TestTodoManager:
         mgr.update(t2.id, status="in-progress")
         t3 = mgr.add("Task 3")
         mgr.update(t3.id, status="completed")
-        
+
         summary = mgr.get_progress_summary()
         assert "1/3 complete" in summary
         assert "1 in progress" in summary
@@ -126,7 +127,7 @@ class TestTodoManager:
         mgr.set_original_request("Build the feature")
         mgr.add("Step 1")
         mgr.add("Step 2")
-        
+
         text = mgr.format_list()
         assert "TODO LIST:" in text
         assert "Step 1" in text
@@ -139,10 +140,10 @@ class TestTodoManager:
         mgr.add("Task 1", context_refs=["a.py"])
         t2 = mgr.add("Task 2")
         mgr.update(t2.id, status="completed", notes="Done!")
-        
+
         data = mgr.to_dict()
         json_str = json.dumps(data)
-        
+
         mgr2 = TodoManager.from_dict(json.loads(json_str))
         assert len(mgr2.list_all()) == 2
         assert mgr2.original_request == "Test request"
@@ -171,9 +172,12 @@ class TestTodoManager:
 # CompactionTrace Tests
 # ============================================================
 
+
 class TestCompactionTrace:
     def test_file_read_notice(self):
-        trace = CompactionTrace("file_read", "src/auth.py", "Auth module", tokens_freed=500)
+        trace = CompactionTrace(
+            "file_read", "src/auth.py", "Auth module", tokens_freed=500
+        )
         text = trace.format_notice()
         assert COMPACT_MARKER in text
         assert "src/auth.py" in text
@@ -181,27 +185,35 @@ class TestCompactionTrace:
         assert "Re-read" in text
 
     def test_command_output_notice(self):
-        trace = CompactionTrace("command_output", "npm test", "All 42 tests pass", tokens_freed=300)
+        trace = CompactionTrace(
+            "command_output", "npm test", "All 42 tests pass", tokens_freed=300
+        )
         text = trace.format_notice()
         assert COMPACT_MARKER in text
         assert "npm test" in text
         assert "Re-run" in text
 
     def test_duplicate_read_notice(self):
-        trace = CompactionTrace("duplicate_read", "src/main.py", "Superseded", tokens_freed=200)
+        trace = CompactionTrace(
+            "duplicate_read", "src/main.py", "Superseded", tokens_freed=200
+        )
         text = trace.format_notice()
         assert COMPACT_MARKER in text
         assert "Duplicate read" in text
         assert "later in conversation" in text
 
     def test_assistant_notice(self):
-        trace = CompactionTrace("assistant", "reasoning", "JWT refresh was broken", tokens_freed=150)
+        trace = CompactionTrace(
+            "assistant", "reasoning", "JWT refresh was broken", tokens_freed=150
+        )
         text = trace.format_notice()
         assert COMPACT_MARKER in text
         assert "JWT refresh was broken" in text
 
     def test_search_result_notice(self):
-        trace = CompactionTrace("search_result", "search", "5 matches", tokens_freed=100)
+        trace = CompactionTrace(
+            "search_result", "search", "5 matches", tokens_freed=100
+        )
         text = trace.format_notice()
         assert COMPACT_MARKER in text
         assert "Re-search" in text
@@ -211,8 +223,10 @@ class TestCompactionTrace:
 # SmartContextManager Tests
 # ============================================================
 
+
 class MockMessage:
     """Mock message for testing."""
+
     def __init__(self, role, content):
         self.role = role
         self.content = content
@@ -239,7 +253,9 @@ class TestSmartContextManager:
         tm = TodoManager()
         sc = SmartContextManager(tm)
 
-        file_content = "\n".join([f"   {i} | def function_{i}(): pass" for i in range(50)])
+        file_content = "\n".join(
+            [f"   {i} | def function_{i}(): pass" for i in range(50)]
+        )
 
         msgs = [
             MockMessage("system", "System"),
@@ -248,7 +264,10 @@ class TestSmartContextManager:
             MockMessage("user", f"[read_file result]\nsrc/auth.py\n{file_content}"),
             MockMessage("assistant", "I see the auth module"),
             MockMessage("user", "Read it again"),
-            MockMessage("user", f"[read_file result]\nsrc/auth.py\n{file_content}\ndef refresh(): pass"),
+            MockMessage(
+                "user",
+                f"[read_file result]\nsrc/auth.py\n{file_content}\ndef refresh(): pass",
+            ),
         ]
 
         msgs, freed = sc._consolidate_duplicates(msgs)
@@ -271,8 +290,14 @@ class TestSmartContextManager:
         ]
         # Add lots of big messages to exceed any reasonable budget
         for i in range(20):
-            msgs.append(MockMessage("user", f"[read_file result]\nfile_{i}.py\n{file_content}"))
-            msgs.append(MockMessage("assistant", f"Analysis of file_{i}: " + "detailed reasoning " * 60))
+            msgs.append(
+                MockMessage("user", f"[read_file result]\nfile_{i}.py\n{file_content}")
+            )
+            msgs.append(
+                MockMessage(
+                    "assistant", f"Analysis of file_{i}: " + "detailed reasoning " * 60
+                )
+            )
 
         total_tokens = sum(len(m.content) // 4 for m in msgs)
         # Set a budget much lower than the total
@@ -334,7 +359,7 @@ class TestSmartContextManager:
     def test_classify_assistant_tool_call(self):
         msg_type, source = SmartContextManager._classify(
             "I'll read that file now.\n<read_file>\n<path>src/main.py</path>\n</read_file>",
-            "assistant"
+            "assistant",
         )
         assert msg_type == "assistant_tool_call"
         assert source == "tool_call"
@@ -342,7 +367,7 @@ class TestSmartContextManager:
     def test_classify_assistant_analysis(self):
         msg_type, source = SmartContextManager._classify(
             "After reviewing the code, I think the issue is in the auth flow.",
-            "assistant"
+            "assistant",
         )
         assert msg_type == "assistant_analysis"
         assert source == "analysis"
@@ -353,12 +378,69 @@ class TestSmartContextManager:
         )
         assert msg_type == "todo_result"
 
+    def test_classify_structured_guidance_nudge(self):
+        msg_type, source = SmartContextManager._classify(
+            "[GUIDANCE_NUDGE type=introspect severity=strong calls=12]\n"
+            "[IMPORTANT: You've made 12 tool calls without using introspect.]",
+            "user",
+        )
+        assert msg_type == "guidance_nudge"
+        assert source == "introspect"
+
+    def test_classify_legacy_guidance_nudge(self):
+        msg_type, source = SmartContextManager._classify(
+            "[Note: This result contains errors. Use introspect to analyze what went wrong before attempting fixes.]",
+            "user",
+        )
+        assert msg_type == "guidance_nudge"
+        assert source == "error-analysis"
+
+    def test_semantic_maintenance_prunes_stale_guidance(self):
+        tm = TodoManager()
+        sc = SmartContextManager(tm)
+        msgs = [
+            MockMessage("system", "System prompt"),
+            MockMessage("user", "First task"),
+            MockMessage("assistant", "OK"),
+            MockMessage(
+                "user",
+                "[GUIDANCE_NUDGE type=introspect severity=strong calls=18]\n"
+                "[IMPORTANT: You've made 18 tool calls without using introspect.]",
+            ),
+            MockMessage("assistant", "Some analysis and tool call planning " * 30),
+            MockMessage("user", "More working context " * 30),
+            MockMessage("assistant", "Recent response " * 20),
+            MockMessage("user", "Current turn context " * 20),
+            MockMessage("assistant", "Newest response " * 20),
+            MockMessage("user", "Newest user context " * 20),
+            MockMessage("assistant", "Tail response " * 20),
+            MockMessage("user", "Tail user context " * 20),
+        ]
+        before = sum(len(m.content) // 4 for m in msgs)
+        out, freed, report = sc.semantic_maintenance_tick(
+            msgs, max_tokens=200000, current_tokens=before
+        )
+        assert freed > 0
+        assert "Guidance lifecycle pruning" in report
+        # old guidance should be compacted
+        assert "Guidance note archived" in out[3].content
+
     def test_serialization(self):
         tm = TodoManager()
         sc = SmartContextManager(tm)
         sc.compaction_traces.append(
             CompactionTrace("file_read", "test.py", "test file", tokens_freed=100)
         )
+        msgs = [
+            MockMessage("system", "System prompt"),
+            MockMessage("user", "Do work"),
+            MockMessage("assistant", "Acknowledged"),
+            MockMessage(
+                "user",
+                "[GUIDANCE_NUDGE type=introspect severity=gentle]\n[Tip: consider introspect]",
+            ),
+        ]
+        sc.semantic_maintenance_tick(msgs, max_tokens=200000)
 
         data = sc.to_dict()
         sc2 = SmartContextManager(tm)
@@ -366,6 +448,7 @@ class TestSmartContextManager:
 
         assert len(sc2.compaction_traces) == 1
         assert sc2.compaction_traces[0].source == "test.py"
+        assert len(sc2.node_metadata) >= 1
         assert sc2.compaction_traces[0].tokens_freed == 100
 
     def test_serialization_backward_compat(self):
@@ -398,8 +481,7 @@ class TestSmartContextManager:
         sc = SmartContextManager(tm)
 
         system_content = (
-            "You are an assistant.\n"
-            "[read_file result]\nsrc/auth.py\nSome code here\n"
+            "You are an assistant.\n[read_file result]\nsrc/auth.py\nSome code here\n"
         )
         file_content = "\n".join([f"   {i} | line" for i in range(50)])
 
@@ -409,7 +491,9 @@ class TestSmartContextManager:
             MockMessage("assistant", "Acknowledged"),
             MockMessage("user", f"[read_file result]\nsrc/auth.py\n{file_content}"),
             MockMessage("assistant", "I see auth"),
-            MockMessage("user", f"[read_file result]\nsrc/auth.py\n{file_content}\nmore"),
+            MockMessage(
+                "user", f"[read_file result]\nsrc/auth.py\n{file_content}\nmore"
+            ),
         ]
 
         msgs, freed = sc._consolidate_duplicates(msgs)
@@ -428,7 +512,9 @@ class TestSmartContextManager:
             MockMessage("system", "You are an assistant."),
             MockMessage("user", first_user),
             MockMessage("assistant", first_assistant),
-            MockMessage("user", f"[read_file result]\nsrc/main.py\n{file_content}\nupdated"),
+            MockMessage(
+                "user", f"[read_file result]\nsrc/main.py\n{file_content}\nupdated"
+            ),
         ]
 
         msgs, freed = sc._consolidate_duplicates(msgs)
@@ -450,8 +536,14 @@ class TestSmartContextManager:
             MockMessage("assistant", "Working on it"),
         ]
         for i in range(20):
-            msgs.append(MockMessage("user", f"[read_file result]\nsrc/file_{i % 3}.py\n{file_content}"))
-            msgs.append(MockMessage("assistant", f"Unrelated response about topic {i} " * 30))
+            msgs.append(
+                MockMessage(
+                    "user", f"[read_file result]\nsrc/file_{i % 3}.py\n{file_content}"
+                )
+            )
+            msgs.append(
+                MockMessage("assistant", f"Unrelated response about topic {i} " * 30)
+            )
 
         msgs, freed, report = sc.compact_context(msgs, 50000)
         assert msgs[0].content == system_content
@@ -471,7 +563,9 @@ class TestSmartContextManager:
             MockMessage("assistant", "OK"),
         ]
         for i in range(10):
-            msgs.append(MockMessage("user", f"[read_file result]\nfile_{i}.py\n{file_content}"))
+            msgs.append(
+                MockMessage("user", f"[read_file result]\nfile_{i}.py\n{file_content}")
+            )
             msgs.append(MockMessage("assistant", f"Analysis {i}: " + "detail " * 100))
 
         # Save the content of the last 4 messages
@@ -492,9 +586,13 @@ class TestSmartContextManager:
             MockMessage("system", "System"),
             MockMessage("user", "Task"),
             MockMessage("assistant", "Acknowledged"),
-            MockMessage("assistant", "After deep analysis of the authentication flow, "
-                        "I found that the JWT token refresh mechanism has a race condition "
-                        "where two concurrent requests can invalidate each other's tokens. " * 10),
+            MockMessage(
+                "assistant",
+                "After deep analysis of the authentication flow, "
+                "I found that the JWT token refresh mechanism has a race condition "
+                "where two concurrent requests can invalidate each other's tokens. "
+                * 10,
+            ),
             MockMessage("user", "padding " * 100),
             MockMessage("assistant", "padding " * 100),
             MockMessage("user", "padding " * 100),
@@ -519,7 +617,7 @@ class TestSmartContextManager:
         """SmartContextManager must have protected_indices property containing {0, 1, 2}."""
         tm = TodoManager()
         sc = SmartContextManager(tm)
-        assert hasattr(sc, 'protected_indices')
+        assert hasattr(sc, "protected_indices")
         assert 0 in sc.protected_indices
         assert 1 in sc.protected_indices
         assert 2 in sc.protected_indices
@@ -577,7 +675,7 @@ class TestSmartContextManager:
 
         score = scorer.score_relevance(
             "def authenticate_user(): jwt.decode(token)",
-            "Fix authentication bug | src/auth.py"
+            "Fix authentication bug | src/auth.py",
         )
         assert 0.0 <= score <= 1.0
         assert score > 0.0  # Should find keyword overlap
@@ -609,12 +707,14 @@ class TestSmartContextManager:
 
         for i in range(10):
             sc.compaction_traces.append(
-                CompactionTrace("file_read", f"file_{i}.py", f"file {i}", tokens_freed=10)
+                CompactionTrace(
+                    "file_read", f"file_{i}.py", f"file {i}", tokens_freed=10
+                )
             )
 
         # Simulate the trim that happens in compact_context
         if len(sc.compaction_traces) > sc._max_traces:
-            sc.compaction_traces = sc.compaction_traces[-sc._max_traces:]
+            sc.compaction_traces = sc.compaction_traces[-sc._max_traces :]
 
         assert len(sc.compaction_traces) == 5
         assert sc.compaction_traces[0].source == "file_5.py"
