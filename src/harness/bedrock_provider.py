@@ -177,57 +177,54 @@ class BedrockClient:
             else:
                 raise
 
-            # Parse response
-            result = {
-                "content": "",
-                "thinking": None,
-                "usage": {},
-                "finish_reason": "stop",
+        # Parse response
+        result = {
+            "content": "",
+            "thinking": None,
+            "usage": {},
+            "finish_reason": "stop",
+        }
+
+        # Extract content
+        if "output" in response and "message" in response["output"]:
+            message = response["output"]["message"]
+            content_blocks = message.get("content", [])
+
+            text_parts = []
+            thinking_parts = []
+
+            for block in content_blocks:
+                if isinstance(block, dict):
+                    if "text" in block:
+                        text_parts.append(block["text"])
+                        if on_content:
+                            on_content(block["text"])
+                    elif "reasoningContent" in block:
+                        # Handle reasoning content if present
+                        reasoning = block["reasoningContent"]
+                        if isinstance(reasoning, dict) and "text" in reasoning:
+                            thinking_parts.append(reasoning["text"])
+                            if on_thinking:
+                                on_thinking(reasoning["text"])
+
+            result["content"] = "".join(text_parts)
+            if thinking_parts:
+                result["thinking"] = "".join(thinking_parts)
+
+        # Extract usage
+        if "usage" in response:
+            usage = response["usage"]
+            result["usage"] = {
+                "prompt_tokens": usage.get("inputTokens", 0),
+                "completion_tokens": usage.get("outputTokens", 0),
+                "total_tokens": usage.get("totalTokens", 0),
             }
 
-            # Extract content
-            if "output" in response and "message" in response["output"]:
-                message = response["output"]["message"]
-                content_blocks = message.get("content", [])
+        # Extract stop reason
+        if "stopReason" in response:
+            result["finish_reason"] = response["stopReason"].lower()
 
-                text_parts = []
-                thinking_parts = []
-
-                for block in content_blocks:
-                    if isinstance(block, dict):
-                        if "text" in block:
-                            text_parts.append(block["text"])
-                            if on_content:
-                                on_content(block["text"])
-                        elif "reasoningContent" in block:
-                            # Handle reasoning content if present
-                            reasoning = block["reasoningContent"]
-                            if isinstance(reasoning, dict) and "text" in reasoning:
-                                thinking_parts.append(reasoning["text"])
-                                if on_thinking:
-                                    on_thinking(reasoning["text"])
-
-                result["content"] = "".join(text_parts)
-                if thinking_parts:
-                    result["thinking"] = "".join(thinking_parts)
-
-            # Extract usage
-            if "usage" in response:
-                usage = response["usage"]
-                result["usage"] = {
-                    "prompt_tokens": usage.get("inputTokens", 0),
-                    "completion_tokens": usage.get("outputTokens", 0),
-                    "total_tokens": usage.get("totalTokens", 0),
-                }
-
-            # Extract stop reason
-            if "stopReason" in response:
-                result["finish_reason"] = response["stopReason"].lower()
-
-            return result
-
-        except Exception as e:
-            raise RuntimeError(f"Bedrock API error: {e}")
+        return result
 
     def chat_stream(
         self,
@@ -280,49 +277,46 @@ class BedrockClient:
             else:
                 raise
 
-            content_buffer = []
-            thinking_buffer = []
-            usage = {}
-            finish_reason = "stop"
+        content_buffer = []
+        thinking_buffer = []
+        usage = {}
+        finish_reason = "stop"
 
-            # Process stream
-            stream = response.get("stream", [])
-            for event in stream:
-                # Handle content block delta
-                if "contentBlockDelta" in event:
-                    delta = event["contentBlockDelta"]["delta"]
-                    if "text" in delta:
-                        text = delta["text"]
-                        content_buffer.append(text)
-                        if on_content:
-                            on_content(text)
-                    elif "reasoningContent" in delta:
-                        reasoning = delta["reasoningContent"]
-                        if "text" in reasoning:
-                            thinking_buffer.append(reasoning["text"])
-                            if on_thinking:
-                                on_thinking(reasoning["text"])
+        # Process stream
+        stream = response.get("stream", [])
+        for event in stream:
+            # Handle content block delta
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"]["delta"]
+                if "text" in delta:
+                    text = delta["text"]
+                    content_buffer.append(text)
+                    if on_content:
+                        on_content(text)
+                elif "reasoningContent" in delta:
+                    reasoning = delta["reasoningContent"]
+                    if "text" in reasoning:
+                        thinking_buffer.append(reasoning["text"])
+                        if on_thinking:
+                            on_thinking(reasoning["text"])
 
-                # Handle metadata
-                elif "metadata" in event:
-                    metadata = event["metadata"]
-                    if "usage" in metadata:
-                        u = metadata["usage"]
-                        usage = {
-                            "prompt_tokens": u.get("inputTokens", 0),
-                            "completion_tokens": u.get("outputTokens", 0),
-                            "total_tokens": u.get("totalTokens", 0),
-                        }
+            # Handle metadata
+            elif "metadata" in event:
+                metadata = event["metadata"]
+                if "usage" in metadata:
+                    u = metadata["usage"]
+                    usage = {
+                        "prompt_tokens": u.get("inputTokens", 0),
+                        "completion_tokens": u.get("outputTokens", 0),
+                        "total_tokens": u.get("totalTokens", 0),
+                    }
 
-            return {
-                "content": "".join(content_buffer),
-                "thinking": "".join(thinking_buffer) if thinking_buffer else None,
-                "usage": usage,
-                "finish_reason": finish_reason,
-            }
-
-        except Exception as e:
-            raise RuntimeError(f"Bedrock streaming error: {e}")
+        return {
+            "content": "".join(content_buffer),
+            "thinking": "".join(thinking_buffer) if thinking_buffer else None,
+            "usage": usage,
+            "finish_reason": finish_reason,
+        }
 
 
 def is_bedrock_url(url: str) -> bool:
