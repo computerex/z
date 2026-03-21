@@ -1283,13 +1283,11 @@ def run_model_switch_wizard(
             mids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=True)
         except Exception as e:
             return f"Model fetch failed: {e}"
-        shown = mids[:100]
+        shown = mids
         console.print(f"\n  [bold]Models[/bold] [dim]({len(mids)} total)[/dim]\n")
         for m in shown:
             marker = "[cyan]\u25cf[/cyan]" if m == agent.config.model else " "
             console.print(f"  {marker} {m}")
-        if len(mids) > len(shown):
-            console.print(f"  [dim]... and {len(mids) - len(shown)} more[/dim]")
         console.print()
         return ""
 
@@ -1451,7 +1449,7 @@ def run_model_switch_wizard(
             )
         )
 
-    shown = matches[:60]
+    shown = matches
     _LAST_MODEL_SEARCH_QUERY = query
     _LAST_MODEL_SEARCH_RESULTS = [
         {
@@ -1464,7 +1462,7 @@ def run_model_switch_wizard(
     ]
 
     console.print(
-        f"\n  [bold]Model Search[/bold] [dim]'{query}' \u2014 {len(matches)} match(es), showing {len(shown)}[/dim]\n"
+        f"\n  [bold]Model Search[/bold] [dim]'{query}' \u2014 {len(matches)} match(es)[/dim]\n"
     )
     tbl = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
     tbl.add_column(width=2)
