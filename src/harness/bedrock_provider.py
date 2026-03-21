@@ -6,6 +6,7 @@ Uses boto3 with bearer token authentication.
 
 import os
 import json
+import base64 as _base64
 from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass
 
@@ -50,7 +51,7 @@ class BedrockMessage:
                                     {
                                         "image": {
                                             "format": media_type.split("/")[-1],
-                                            "source": {"bytes": b64},
+                                            "source": {"bytes": _base64.b64decode(b64)},
                                         }
                                     }
                                 )
