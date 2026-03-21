@@ -299,7 +299,11 @@ class BedrockClient:
                 elif "reasoningContent" in delta:
                     reasoning = delta["reasoningContent"]
                     if "text" in reasoning:
+                        _reasoning_event_count += 1
                         reasoning_text = reasoning["text"]
+                        # Debug: log reasoning events to help diagnose duplication
+                        import sys
+                        print(f"\n[DEBUG] reasoning event #{_reasoning_event_count}: {len(reasoning_text)} chars, preview: {reasoning_text[:50]!r}...", file=sys.stderr)
                         thinking_buffer.append(reasoning_text)
                         if on_thinking:
                             on_thinking(reasoning_text)
