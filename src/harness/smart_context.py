@@ -723,6 +723,51 @@ class SmartContextManager:
         report_parts: List[str] = []
         total_freed = 0
 
+        # Phase 0: strip image data from old multimodal messages.
+        # Keep the text portion but replace base64 image blocks with a placeholder.
+        # Only strip images that are NOT in the most recent user message.
+        last_user_idx = max(
+            (i for i, m in enumerate(messages)
+             if (m.role if hasattr(m, "role") else m.get("role", "")) == "user"),
+            default=-1,
+        )
+        for i, msg in enumerate(messages):
+            if i in PROTECTED_INDICES or i == last_user_idx:
+                continue
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            # Check if this list has image_url blocks
+            has_images = any(
+                isinstance(b, dict) and b.get("type") == "image_url" for b in content
+            )
+            if not has_images:
+                continue
+            # Extract text, drop images
+            text_parts = []
+            img_count = 0
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif block.get("type") == "image_url":
+                        img_count += 1
+            replacement = "\n".join(text_parts) if text_parts else ""
+            if img_count:
+                replacement += f"\n[{img_count} image(s) removed from history to save context]"
+            old_tokens = estimate_tokens(content)
+            new_tokens = estimate_tokens(replacement)
+            freed = old_tokens - new_tokens
+            if freed > 0:
+                _set_content(msg, replacement)
+                total_freed += freed
+                log.debug("Stripped %d image(s) from message %d, freed ~%d tokens", img_count, i, freed)
+
+        if total_freed > 0:
+            report_parts.append(f"Stripped old images: -{total_freed:,} tok")
+        if total_freed >= excess:
+            return messages, total_freed, "; ".join(report_parts)
+
         # Phase 1: consolidate duplicate file reads (always safe, big wins)
         messages, dup_freed = self._consolidate_duplicates(messages)
         if dup_freed > 0:
