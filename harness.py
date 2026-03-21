@@ -993,6 +993,11 @@ def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
     elif "anthropic.com" in url:
         return search_litellm_models("anthropic/")
     elif "openrouter.ai" in url:
+        # Query OpenRouter's actual API (LiteLLM registry may be stale)
+        models = _fetch_models_from_provider_api(api_url, api_key)
+        if models:
+            # Prefix with openrouter/ for LiteLLM routing
+            return [f"openrouter/{m}" if not m.startswith("openrouter/") else m for m in models]
         return search_litellm_models("openrouter/")
     elif "together.xyz" in url:
         # Query Together's actual API (LiteLLM registry may be empty/stale)
