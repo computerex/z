@@ -682,15 +682,33 @@ def _build_multimodal_user_content(
 
 
 def get_sessions_dir(workspace: str) -> Path:
-    """Get sessions directory for a workspace."""
-    harness_dir = Path(__file__).parent
-    sessions_dir = harness_dir / ".sessions"
+    """Get sessions directory for a workspace.
+    
+    Sessions are stored globally in ~/.z/sessions/<workspace_hash>/ so that
+    both main harness and safe mode can access the same sessions.
+    """
+    # Use global ~/.z/sessions/ directory (not relative to harness installation)
+    # This ensures safe mode and main harness share the same sessions
+    sessions_dir = Path.home() / ".z" / "sessions"
     # Normalise the workspace path so that case differences on Windows
     # (e.g. C:\Projects\evoke vs c:\projects\evoke) map to the same hash.
     normalised = os.path.normcase(os.path.normpath(workspace))
     workspace_hash = hashlib.md5(normalised.encode()).hexdigest()[:12]
     workspace_sessions = sessions_dir / workspace_hash
     workspace_sessions.mkdir(parents=True, exist_ok=True)
+    
+    # Migrate from old location (harness_dir/.sessions/) if needed
+    old_sessions_dir = Path(__file__).parent / ".sessions" / workspace_hash
+    if old_sessions_dir.exists() and old_sessions_dir != workspace_sessions:
+        import shutil
+        for old_session in old_sessions_dir.glob("*.json"):
+            new_session = workspace_sessions / old_session.name
+            if not new_session.exists():
+                try:
+                    shutil.copy2(old_session, new_session)
+                except Exception:
+                    pass  # Ignore migration errors
+    
     return workspace_sessions
 
 
