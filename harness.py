@@ -3084,7 +3084,75 @@ def main():
         action="store_true",
         help="Enable debug mode with verbose logging",
     )
+    parser.add_argument(
+        "--safe-mode",
+        action="store_true",
+        help="Run frozen safe mode harness (for self-repair when main harness breaks)",
+    )
+    parser.add_argument(
+        "--freeze-safe",
+        action="store_true",
+        help="Freeze current harness as the new safe mode version",
+    )
     args = parser.parse_args()
+
+    # Safe mode handling
+    SAFE_MODE_DIR = Path.home() / ".z" / "safe"
+    
+    if args.freeze_safe:
+        # Freeze current harness as safe mode
+        import shutil
+        con = Console()
+        con.print("\n  [bold]Freezing current harness as safe mode...[/bold]\n")
+        
+        # Get the source directory (where this script lives)
+        src_dir = Path(__file__).parent.absolute()
+        
+        # Remove old safe mode if exists
+        if SAFE_MODE_DIR.exists():
+            shutil.rmtree(SAFE_MODE_DIR)
+        
+        # Create safe mode directory
+        SAFE_MODE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Copy harness.py
+        shutil.copy2(src_dir / "harness.py", SAFE_MODE_DIR / "harness.py")
+        con.print(f"  [green]✓[/green] Copied harness.py")
+        
+        # Copy src/harness/ directory
+        src_harness = src_dir / "src" / "harness"
+        dst_harness = SAFE_MODE_DIR / "src" / "harness"
+        if src_harness.exists():
+            shutil.copytree(src_harness, dst_harness)
+            con.print(f"  [green]✓[/green] Copied src/harness/ ({len(list(dst_harness.rglob('*.py')))} files)")
+        
+        con.print(f"\n  [bold green]Safe mode frozen to:[/bold green] {SAFE_MODE_DIR}")
+        con.print(f"  [dim]Run with:[/dim] z --safe-mode")
+        con.print()
+        return
+    
+    if args.safe_mode:
+        # Run the frozen safe mode harness
+        safe_harness = SAFE_MODE_DIR / "harness.py"
+        
+        if not safe_harness.exists():
+            con = Console()
+            con.print("\n  [red]✗[/red] Safe mode not found!")
+            con.print(f"  [dim]Expected at:[/dim] {safe_harness}")
+            con.print(f"\n  [yellow]Run first:[/yellow] z --freeze-safe")
+            con.print()
+            sys.exit(1)
+        
+        # Re-exec with the frozen harness, passing through all other args
+        # Remove --safe-mode from args to avoid infinite loop
+        new_argv = [str(safe_harness)] + [a for a in sys.argv[1:] if a != "--safe-mode"]
+        
+        # Add safe mode's src to path and exec
+        safe_src = SAFE_MODE_DIR / "src"
+        os.environ["PYTHONPATH"] = str(safe_src) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        
+        print(f"\n  [SAFE MODE] Running frozen harness from {SAFE_MODE_DIR}\n")
+        os.execv(sys.executable, [sys.executable] + new_argv)
 
     # Install mode - run setup wizard
     if args.install or args.api_url or args.api_key:
