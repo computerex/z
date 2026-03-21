@@ -2258,13 +2258,70 @@ class ClineAgent:
                     )
 
                 # Handle attempt_completion — agent signals it is done.
-                # Must be checked before the regular tool-execution loop so we
-                # can return cleanly without routing through _dispatch_tool.
+                # If attempt_completion appears alongside other tool calls,
+                # execute those tools FIRST, then process the completion.
+                # This prevents silent skipping of tool calls when the model
+                # emits tools + attempt_completion in the same response.
                 completion_call = next(
                     (tc for tc in all_tool_calls if tc.name == "attempt_completion"),
                     None,
                 )
                 if completion_call:
+                    # Filter out attempt_completion — execute remaining tools first
+                    actionable_tools = [tc for tc in all_tool_calls if tc.name != "attempt_completion"]
+                    if actionable_tools:
+                        log.info(
+                            "attempt_completion found alongside %d other tool(s) — executing tools first: %s",
+                            len(actionable_tools),
+                            ", ".join(tc.name for tc in actionable_tools),
+                        )
+                        tool_results_combined = []
+                        for tc_idx, tc in enumerate(actionable_tools):
+                            self.status.update(
+                                f"Executing: {tc.name}"
+                                + (
+                                    f" ({tc_idx + 1}/{len(actionable_tools)})"
+                                    if len(actionable_tools) > 1
+                                    else ""
+                                ),
+                                StatusLine.TOOL_EXEC,
+                            )
+                            tool_t0 = time.time()
+                            log.info(
+                                "Tool exec START (pre-completion): %s (%d/%d)",
+                                tc.name,
+                                tc_idx + 1,
+                                len(actionable_tools),
+                            )
+                            tc_result = await self._execute_tool(tc)
+                            tool_elapsed = time.time() - tool_t0
+                            log.info(
+                                "Tool exec DONE (pre-completion): %s elapsed=%.1fs result_len=%d",
+                                tc.name,
+                                tool_elapsed,
+                                len(tc_result or ""),
+                            )
+                            if is_interrupted():
+                                self.console.print(
+                                    "\n[yellow][STOP] Interrupted by user[/yellow]"
+                                )
+                                self.messages.append(
+                                    StreamingMessage(
+                                        role="assistant",
+                                        content=full_content,
+                                        provider_blocks=getattr(
+                                            response, "provider_content_blocks", None
+                                        ),
+                                    )
+                                )
+                                return "[Interrupted - session preserved. Type to continue or start new request]"
+                            tc_result = self.tool_handlers.spill_output_to_file(
+                                tc_result, tc.name
+                            )
+                            tool_results_combined.append(
+                                f"[{tc.name} result ({tc_idx + 1}/{len(actionable_tools)})]:\n{tc_result}"
+                            )
+
                     result_text = completion_call.parameters.get("result", "").strip()
                     command = completion_call.parameters.get("command", "").strip()
                     log.info(

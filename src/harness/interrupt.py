@@ -140,9 +140,19 @@ class KeyboardMonitor:
             if msvcrt.kbhit():
                 key = msvcrt.getch()
                 # Escape key = 0x1b (27)
+                # On modern Windows terminals (Windows Terminal, VS Code),
+                # VT sequences also start with 0x1b (e.g. arrow keys \x1b[A).
+                # Wait briefly to distinguish a standalone Escape from a VT sequence.
                 if key == b'\x1b':
-                    _interrupt_state.trigger("escape")
-                    # Don't break - keep monitoring for more keys
+                    self._stop_event.wait(0.05)  # 50ms — VT follow-up bytes arrive fast
+                    if msvcrt.kbhit():
+                        # More bytes followed — this is a VT sequence, not Escape.
+                        # Consume the rest of the sequence and discard it.
+                        while msvcrt.kbhit():
+                            msvcrt.getch()
+                    else:
+                        # Standalone Escape key — trigger interrupt
+                        _interrupt_state.trigger("escape")
                 # Ctrl+B = 0x02
                 elif key == b'\x02':
                     _interrupt_state.trigger_background()
