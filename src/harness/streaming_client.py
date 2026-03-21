@@ -751,10 +751,8 @@ class StreamingJSONClient:
         full_content = result.get("content", "")
         full_reasoning = result.get("thinking", "")
 
-        if on_content and full_content:
-            on_content(full_content)
-        if on_reasoning and full_reasoning:
-            on_reasoning(full_reasoning)
+        # Note: callbacks were already invoked during streaming in bedrock_provider.py
+        # Do NOT call them again here or content will be displayed twice
 
         return StreamingChatResponse(
             content=full_content,
