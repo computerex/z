@@ -350,17 +350,35 @@ class StreamingJSONClient:
             )
 
             if self._is_bedrock:
-                # Use custom Bedrock provider for bearer token auth
+                # Use custom Bedrock provider — prefer IAM SigV4 auth (full account
+                # quotas: 3M TPM) over bearer token (much lower rate limits).
                 try:
                     from .bedrock_provider import BedrockClient
 
                     # Bedrock models typically have 32K context, leave room for input
                     bedrock_max_tokens = min(max_tokens, 16000)  # Conservative default
+
+                    # Check for IAM credentials in provider config
+                    bedrock_kwargs = {}
+                    try:
+                        from .config import load_json_config, get_global_config_path
+                        gcfg = load_json_config(get_global_config_path())
+                        bcfg = gcfg.get("providers", {}).get("bedrock", {})
+                        if bcfg.get("aws_access_key_id"):
+                            bedrock_kwargs["aws_access_key_id"] = bcfg["aws_access_key_id"]
+                        if bcfg.get("aws_secret_access_key"):
+                            bedrock_kwargs["aws_secret_access_key"] = bcfg["aws_secret_access_key"]
+                        if bcfg.get("aws_profile"):
+                            bedrock_kwargs["aws_profile"] = bcfg["aws_profile"]
+                    except Exception:
+                        pass  # Fall back to bearer token / env vars
+
                     self._bedrock_client = BedrockClient(
                         api_key=api_key,
                         model=model,
                         temperature=temperature,
                         max_tokens=bedrock_max_tokens,
+                        **bedrock_kwargs,
                     )
                 except ImportError:
                     raise ImportError(

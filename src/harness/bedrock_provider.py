@@ -6,6 +6,7 @@ Uses boto3 with bearer token authentication.
 
 import os
 import json
+from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass
 
@@ -72,32 +73,66 @@ class BedrockClient:
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        aws_access_key_id: Optional[str] = None,
+        aws_secret_access_key: Optional[str] = None,
+        aws_profile: Optional[str] = None,
     ):
         self.region = region
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._client = None
+        self._aws_access_key_id = aws_access_key_id
+        self._aws_secret_access_key = aws_secret_access_key
+        self._aws_profile = aws_profile
 
-        # Set up bearer token
-        if api_key:
-            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = api_key
-        elif "BED_ROCK_API_KEY" in os.environ:
-            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = os.environ["BED_ROCK_API_KEY"]
+        # Prefer IAM credentials over bearer token (IAM gets full account quotas,
+        # bearer tokens have much lower rate limits).
+        # IAM credentials can come from:
+        #   1. Explicit aws_access_key_id/aws_secret_access_key in config
+        #   2. aws_profile in config (references ~/.aws/credentials profile)
+        #   3. ~/.aws/credentials default profile (auto-detected by boto3)
+        #   4. Environment variables AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+        # If none of the above are available, fall back to bearer token.
+        self._use_bearer_token = False
+        if not (aws_access_key_id or aws_profile or
+                os.environ.get("AWS_ACCESS_KEY_ID") or
+                (Path.home() / ".aws" / "credentials").exists()):
+            # No IAM credentials available, use bearer token
+            self._use_bearer_token = True
+            if api_key:
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = api_key
+            elif "BED_ROCK_API_KEY" in os.environ:
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = os.environ["BED_ROCK_API_KEY"]
 
     def _get_client(self):
-        """Get or create boto3 client."""
+        """Get or create boto3 client.
+
+        Prefers IAM SigV4 auth (full account quotas: 3M TPM) over
+        Bedrock API Keys / bearer tokens (much lower rate limits).
+        """
         if self._client is None:
             if not BOTO3_AVAILABLE:
                 raise ImportError(
                     "boto3 is required for Bedrock. Install with: pip install boto3"
                 )
 
-            self._client = boto3.client(
-                "bedrock-runtime",
-                region_name=self.region,
-                config=Config(retries={"max_attempts": 3}),
-            )
+            kwargs = {
+                "region_name": self.region,
+                "config": Config(retries={"max_attempts": 3}),
+            }
+
+            # Use explicit IAM credentials if provided
+            if self._aws_access_key_id and self._aws_secret_access_key:
+                kwargs["aws_access_key_id"] = self._aws_access_key_id
+                kwargs["aws_secret_access_key"] = self._aws_secret_access_key
+            elif self._aws_profile:
+                # Use named profile from ~/.aws/credentials
+                session = boto3.Session(profile_name=self._aws_profile)
+                self._client = session.client("bedrock-runtime", **kwargs)
+                return self._client
+
+            self._client = boto3.client("bedrock-runtime", **kwargs)
         return self._client
 
     def _resolve_model_id(self) -> str:
