@@ -1995,6 +1995,48 @@ class ClineAgent:
                             "ThrottlingException", "ServiceUnavailableException",
                         )
 
+                        # For Bedrock daily token quotas, try global inference profile
+                        # (global. prefix has a separate daily quota from us. prefix)
+                        if (is_throttle
+                                and "tokens per day" in err_str
+                                and hasattr(client, '_bedrock_client')
+                                and client._bedrock_client):
+                            current_model = getattr(client._bedrock_client, 'model', '')
+                            if current_model.startswith("us.") and not getattr(self, '_tried_global_fallback', False):
+                                global_model = "global." + current_model[3:]
+                                log.warning(
+                                    "Daily token quota hit for %s, trying global profile: %s",
+                                    current_model, global_model
+                                )
+                                self.console.print(
+                                    f"  [yellow]Daily quota hit for {current_model}, switching to {global_model}[/yellow]"
+                                )
+                                client._bedrock_client.model = global_model
+                                self._tried_global_fallback = True
+                                # Reset buffers and retry immediately (no backoff needed)
+                                full_content = ""
+                                full_reasoning = ""
+                                first_token = True
+                                _payload_announced = False
+                                _payload_next_report = _payload_progress_step
+                                _thinking_started = False
+                                _thinking_line_start = True
+                                _thinking_line_has_text = False
+                                _sf_suppressing = None
+                                _sf_thinking_suppress = False
+                                _sf_tag_buf = ""
+                                _sf_in_tag = False
+                                _sf_had_visible = False
+                                _stream_tool_stack.clear()
+                                _stream_in_tag = False
+                                _stream_tag_buf = ""
+                                _stream_in_payload = False
+                                _stream_payload_line = ""
+                                _stream_payload_header_printed = False
+                                _stream_payload_lines = 0
+                                api_t0 = time.time()
+                                continue  # Retry with global model immediately
+
                         if is_throttle and _throttle_attempt < _throttle_max_retries:
                             _throttle_attempt += 1
                             # Exponential backoff: 30s, 60s, 120s, ... capped at 5 min
