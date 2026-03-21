@@ -1030,9 +1030,11 @@ def _fetch_models_from_provider_api(api_url: str, api_key: str) -> List[str]:
         response.raise_for_status()
         data = response.json()
 
-        # Extract model IDs from OpenAI-compatible response format
+        # Extract model IDs - handle both OpenAI format {"data": [...]}
+        # and plain list format [...] (e.g. Together AI)
+        items = data if isinstance(data, list) else data.get("data", [])
         models = []
-        for item in data.get("data", []):
+        for item in items:
             if isinstance(item, dict) and "id" in item:
                 models.append(item["id"])
 
