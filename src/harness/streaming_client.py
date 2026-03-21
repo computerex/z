@@ -779,7 +779,7 @@ class StreamingJSONClient:
         chat_messages = []
 
         for m in messages:
-            content = str(m.content) if isinstance(m.content, str) else str(m.content)
+            content = m.content if isinstance(m.content, str) else str(m.content)
             if m.role == "system":
                 system_parts.append(content)
             else:
@@ -830,9 +830,7 @@ class StreamingJSONClient:
         for i, m in enumerate(messages):
             msg = CopilotMessage(
                 role=m.role,
-                content=str(m.content)
-                if isinstance(m.content, str)
-                else str(m.content),
+                content=m.content,
             )
             # For assistant messages, check if this is the last assistant message
             # and if we have a stored reasoning_opaque from the last response

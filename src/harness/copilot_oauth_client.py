@@ -12,7 +12,7 @@ Based on opencode's implementation:
 
 import json
 import asyncio
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass, field
 import aiohttp
 
@@ -61,7 +61,7 @@ class CopilotMessage:
     """Message for Copilot API with optional reasoning context."""
 
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]]
     # For assistant messages, store reasoning_opaque for multi-turn context
     reasoning_opaque: Optional[str] = None
     # Store reasoning text for display
@@ -175,6 +175,15 @@ class CopilotOAuthClient:
 
         return body
 
+    def _has_vision_content(self, messages: List[CopilotMessage]) -> bool:
+        """Check if any message contains image/vision content."""
+        for m in messages:
+            if isinstance(m.content, list):
+                for part in m.content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        return True
+        return False
+
     async def chat_stream(
         self,
         messages: List[CopilotMessage],
@@ -184,6 +193,8 @@ class CopilotOAuthClient:
     ) -> CopilotResponse:
         """Stream chat response from Copilot API with reasoning support."""
         headers = self._build_headers()
+        if self._has_vision_content(messages):
+            headers["Copilot-Vision-Request"] = "true"
         body = self._build_request_body(messages, stream=True)
 
         if not self._session:
