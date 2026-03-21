@@ -284,7 +284,10 @@ class BedrockClient:
 
         # Process stream
         stream = response.get("stream", [])
+        _event_count = 0
+        _reasoning_event_count = 0
         for event in stream:
+            _event_count += 1
             # Handle content block delta
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]
@@ -296,9 +299,14 @@ class BedrockClient:
                 elif "reasoningContent" in delta:
                     reasoning = delta["reasoningContent"]
                     if "text" in reasoning:
-                        thinking_buffer.append(reasoning["text"])
+                        _reasoning_event_count += 1
+                        reasoning_text = reasoning["text"]
+                        # Debug: log reasoning events to help diagnose duplication
+                        import sys
+                        print(f"\n[DEBUG] reasoning event #{_reasoning_event_count}: {len(reasoning_text)} chars, preview: {reasoning_text[:50]!r}...", file=sys.stderr)
+                        thinking_buffer.append(reasoning_text)
                         if on_thinking:
-                            on_thinking(reasoning["text"])
+                            on_thinking(reasoning_text)
 
             # Handle metadata
             elif "metadata" in event:

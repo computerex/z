@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from rich.console import Console
 from rich.markup import escape as rich_escape
 from rich.markdown import Markdown
+from rich.panel import Panel
 
 import time as _time_mod_agent
 
@@ -2265,7 +2266,7 @@ class ClineAgent:
                     if result_text:
                         if _defer_markdown_render:
                             self.console.print()
-                            self.console.print(Markdown(result_text))
+                            self.console.print(Panel(Markdown(result_text), border_style="dim", padding=(0, 1)))
                         else:
                             print(result_text)
                         if command:
@@ -2334,7 +2335,7 @@ class ClineAgent:
                         display_text = _normalize_display_text(display_text)
                         if display_text:
                             self.console.print()
-                            self.console.print(Markdown(display_text))
+                            self.console.print(Panel(Markdown(display_text), border_style="dim", padding=(0, 1)))
 
                     # Check for truly empty response and auto-retry with guidance.
                     # Only nudge when display_text is completely empty — short but
