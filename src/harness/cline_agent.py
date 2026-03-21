@@ -1995,24 +1995,31 @@ class ClineAgent:
                             "ThrottlingException", "ServiceUnavailableException",
                         )
 
-                        # For Bedrock daily token quotas, try global inference profile
-                        # (global. prefix has a separate daily quota from us. prefix)
+                        # For Bedrock token quotas, toggle between us./global. profiles
+                        # Each profile has its own independent token bucket that refills gradually.
                         if (is_throttle
                                 and "tokens per day" in err_str
                                 and hasattr(client, '_bedrock_client')
                                 and client._bedrock_client):
                             current_model = getattr(client._bedrock_client, 'model', '')
-                            if current_model.startswith("us.") and not getattr(self, '_tried_global_fallback', False):
-                                global_model = "global." + current_model[3:]
+                            # Toggle: us. → global. or global. → us.
+                            if current_model.startswith("us."):
+                                alt_model = "global." + current_model[3:]
+                            elif current_model.startswith("global."):
+                                alt_model = "us." + current_model[7:]
+                            else:
+                                alt_model = None
+
+                            if alt_model and not getattr(self, '_bedrock_alt_tried_this_attempt', False):
                                 log.warning(
-                                    "Daily token quota hit for %s, trying global profile: %s",
-                                    current_model, global_model
+                                    "Token quota hit for %s, switching to %s",
+                                    current_model, alt_model
                                 )
                                 self.console.print(
-                                    f"  [yellow]Daily quota hit for {current_model}, switching to {global_model}[/yellow]"
+                                    f"  [yellow]Token quota hit for {current_model}, trying {alt_model}[/yellow]"
                                 )
-                                client._bedrock_client.model = global_model
-                                self._tried_global_fallback = True
+                                client._bedrock_client.model = alt_model
+                                self._bedrock_alt_tried_this_attempt = True
                                 # Reset buffers and retry immediately (no backoff needed)
                                 full_content = ""
                                 full_reasoning = ""
@@ -2035,12 +2042,16 @@ class ClineAgent:
                                 _stream_payload_header_printed = False
                                 _stream_payload_lines = 0
                                 api_t0 = time.time()
-                                continue  # Retry with global model immediately
+                                continue  # Retry with alternate profile immediately
+                            else:
+                                # Both profiles exhausted — reset flag for next retry cycle
+                                self._bedrock_alt_tried_this_attempt = False
 
                         if is_throttle and _throttle_attempt < _throttle_max_retries:
                             _throttle_attempt += 1
-                            # Exponential backoff: 30s, 60s, 120s, ... capped at 5 min
-                            wait_time = min(_throttle_base_wait * (2 ** (_throttle_attempt - 1)), 300)
+                            # Tokens refill gradually (~350 tokens/minute observed).
+                            # Use moderate backoff: 30s, 60s, 90s, 120s capped at 2 min.
+                            wait_time = min(_throttle_base_wait + (30 * (_throttle_attempt - 1)), 120)
                             log.warning(
                                 "Throttling detected (attempt %d/%d): %s. Waiting %ds...",
                                 _throttle_attempt, _throttle_max_retries, str(e)[:100], wait_time
