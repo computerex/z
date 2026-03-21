@@ -779,11 +779,13 @@ class StreamingJSONClient:
         chat_messages = []
 
         for m in messages:
-            content = m.content if isinstance(m.content, str) else str(m.content)
             if m.role == "system":
-                system_parts.append(content)
+                # System content must be a string for the instructions field
+                sys_text = m.content if isinstance(m.content, str) else str(m.content)
+                system_parts.append(sys_text)
             else:
-                chat_messages.append(CodexMessage(role=m.role, content=content))
+                # Preserve multimodal content (list of text/image blocks) as-is
+                chat_messages.append(CodexMessage(role=m.role, content=m.content))
 
         system_prompt = "\n\n".join(system_parts) if system_parts else ""
 

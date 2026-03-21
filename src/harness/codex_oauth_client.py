@@ -13,7 +13,7 @@ Based on opencode's implementation:
 import json
 import time
 import asyncio
-from typing import Dict, List, Optional, Callable, Any, AsyncGenerator
+from typing import Dict, List, Optional, Callable, Any, AsyncGenerator, Union
 from dataclasses import dataclass
 import aiohttp
 
@@ -33,10 +33,28 @@ class CodexMessage:
     """Message for Codex API."""
 
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]]
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"role": self.role, "content": self.content}
+        if isinstance(self.content, str):
+            return {"role": self.role, "content": self.content}
+        # Convert multimodal content from Chat Completions format to
+        # Responses API format (input_text / input_image instead of
+        # text / image_url).
+        converted: List[Dict[str, Any]] = []
+        for block in self.content:
+            btype = block.get("type", "")
+            if btype == "text":
+                converted.append({"type": "input_text", "text": block.get("text", "")})
+            elif btype == "image_url":
+                url = block.get("image_url", {})
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                converted.append({"type": "input_image", "image_url": url})
+            else:
+                # Pass through unknown block types as-is
+                converted.append(block)
+        return {"role": self.role, "content": converted}
 
 
 @dataclass
