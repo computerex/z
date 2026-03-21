@@ -272,7 +272,7 @@ def run_install(
         elif choice == "4":
             base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
             provider = "Amazon Bedrock"
-            default_model = "qwen.qwen3-32b-v1:0"
+            default_model = "us.anthropic.claude-opus-4-6-v1"
             break
         elif choice == "5":
             base_url = "https://api.together.xyz/v1/"
@@ -452,6 +452,45 @@ def run_install(
         except Exception as e:
             con.print(f"  [red]✗[/red] OAuth error: {e}\n")
             return
+    elif provider == "Amazon Bedrock":
+        # Bedrock supports two auth methods:
+        # 1. IAM credentials (recommended — full account quotas: 3M TPM)
+        # 2. Bedrock API Key / bearer token (much lower rate limits)
+        con.print("  [bold]Authentication Method:[/bold]\n")
+        con.print("  [cyan][1][/cyan] IAM Access Keys [dim](recommended — full 3M TPM quota)[/dim]")
+        con.print("  [cyan][2][/cyan] Bedrock API Key [dim](bearer token — lower rate limits)[/dim]")
+        con.print()
+        auth_choice = ""
+        while auth_choice not in ("1", "2"):
+            auth_choice = input("  Enter choice [1/2]: ").strip()
+
+        _bedrock_iam_creds = {}
+        if auth_choice == "1":
+            con.print("\n  [dim]Enter IAM credentials (from AWS Console → IAM → Security credentials)[/dim]")
+            aws_access_key = ""
+            while not aws_access_key:
+                aws_access_key = input("  AWS Access Key ID: ").strip()
+            aws_secret_key = ""
+            while not aws_secret_key:
+                aws_secret_key = input("  AWS Secret Access Key: ").strip()
+            _bedrock_iam_creds = {
+                "aws_access_key_id": aws_access_key,
+                "aws_secret_access_key": aws_secret_key,
+            }
+            api_key = "iam-sigv4"  # Placeholder — IAM auth doesn't need an API key
+            con.print("  [green]✓[/green] Using IAM SigV4 authentication (full quota)\n")
+        else:
+            con.print("\n  [dim]Enter Bedrock API Key (from AWS Console → Bedrock → API keys)[/dim]")
+            con.print("  [yellow]⚠ Note: Bedrock API Keys have much lower rate limits than IAM.[/yellow]")
+            api_key = ""
+            while not api_key:
+                api_key = input("  Bedrock API Key: ").strip()
+            _bedrock_iam_creds = {}
+
+        # Ask for region
+        region_input = input(f"  AWS Region (default: us-east-1): ").strip()
+        if region_input:
+            base_url = f"https://bedrock-runtime.{region_input}.amazonaws.com"
     else:
         # API Key flow
         api_key = ""
@@ -511,16 +550,39 @@ def run_install(
         model_input = input(f"\nModel name (default: {default_model}): ").strip()
         model = model_input or default_model
 
-    # Build config
-    config_data = {
-        "api_url": base_url,
-        "api_key": api_key,
-        "model": model,
-    }
-
+    # Build config — merge with existing config to preserve other providers
     config_dir = Path.home()
     config_path = config_dir / ".z.json"
     location = "global"
+
+    # Load existing config to preserve providers and other settings
+    existing_config = {}
+    if config_path.exists():
+        try:
+            existing_config = json.loads(config_path.read_text())
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Set top-level active provider
+    existing_config["api_url"] = base_url
+    existing_config["api_key"] = api_key
+    existing_config["model"] = model
+
+    # For Bedrock with IAM credentials, save to providers section
+    if provider == "Amazon Bedrock":
+        providers = existing_config.setdefault("providers", {})
+        bedrock_provider_cfg = {
+            "api_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "max_tokens": 128000,
+            "temperature": 0.7,
+        }
+        if _bedrock_iam_creds:
+            bedrock_provider_cfg.update(_bedrock_iam_creds)
+        providers["bedrock"] = bedrock_provider_cfg
+
+    config_data = existing_config
 
     # Create directory if needed
     config_dir.mkdir(parents=True, exist_ok=True)
