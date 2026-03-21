@@ -2003,16 +2003,21 @@ class ClineAgent:
                                 "Throttling detected (attempt %d/%d): %s. Waiting %ds...",
                                 _throttle_attempt, _throttle_max_retries, str(e)[:100], wait_time
                             )
-                            self.status.set_retry(
-                                _throttle_attempt, _throttle_max_retries, wait_time,
-                                reason="quota/rate limit"
-                            )
-                            # Wait with interrupt checking
-                            for _ in range(int(wait_time * 10)):
+                            # Wait with interrupt checking and countdown display
+                            _wait_remaining = wait_time
+                            for _wi in range(int(wait_time * 10)):
                                 if is_interrupted():
                                     self.status.clear()
                                     self.console.print("\n  [yellow]Interrupted during retry wait[/yellow]")
                                     return "[Interrupted]"
+                                # Update countdown every second
+                                _wait_remaining = wait_time - (_wi * 0.1)
+                                if _wi % 10 == 0:
+                                    self.status.set_retry(
+                                        _throttle_attempt, _throttle_max_retries,
+                                        max(0, _wait_remaining),
+                                        reason="quota/rate limit"
+                                    )
                                 await asyncio.sleep(0.1)
                             self.status.update("Retrying request...", state=StatusLine.SENDING)
                             continue  # Retry
