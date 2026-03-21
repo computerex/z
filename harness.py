@@ -3145,14 +3145,24 @@ def main():
         
         # Re-exec with the frozen harness, passing through all other args
         # Remove --safe-mode from args to avoid infinite loop
-        new_argv = [str(safe_harness)] + [a for a in sys.argv[1:] if a != "--safe-mode"]
+        other_args = [a for a in sys.argv[1:] if a != "--safe-mode"]
         
-        # Add safe mode's src to path and exec
+        # Add safe mode's src to path
         safe_src = SAFE_MODE_DIR / "src"
-        os.environ["PYTHONPATH"] = str(safe_src) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(safe_src) + os.pathsep + env.get("PYTHONPATH", "")
+        # Mark that we're in safe mode (so the frozen harness knows)
+        env["HARNESS_SAFE_MODE"] = "1"
         
         print(f"\n  [SAFE MODE] Running frozen harness from {SAFE_MODE_DIR}\n")
-        os.execv(sys.executable, [sys.executable] + new_argv)
+        
+        # Use subprocess.run with inherited stdin/stdout/stderr for proper terminal handling
+        result = subprocess.run(
+            [sys.executable, str(safe_harness)] + other_args,
+            env=env,
+            cwd=os.getcwd(),
+        )
+        sys.exit(result.returncode)
 
     # Install mode - run setup wizard
     if args.install or args.api_url or args.api_key:
