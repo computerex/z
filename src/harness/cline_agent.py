@@ -1659,6 +1659,7 @@ class ClineAgent:
                 }  # Both variants: models use <think> or <thinking> for reasoning
                 _sf_suppressing: Optional[str] = None  # tool block being eaten
                 _sf_thinking_suppress = False  # eating content inside <thinking>/<think>
+                _sf_native_reasoning_active = False  # True if native reasoning_content is being used
                 _sf_tag_buf = ""
                 _sf_in_tag = False
                 _sf_had_visible = False
@@ -1701,13 +1702,17 @@ class ClineAgent:
                             close = f"</{tag}>"
                             if _sf_tag_buf.endswith(close):
                                 text = _sf_tag_buf[: -len(close)]
-                                if text:
+                                # Only route to on_reasoning if native reasoning is NOT active
+                                # to avoid double-printing thinking content
+                                if text and not _sf_native_reasoning_active:
                                     on_reasoning(text)
                                 _sf_thinking_suppress = False
                                 _sf_tag_buf = ""
                                 return
                         if len(_sf_tag_buf) > 200:
-                            on_reasoning(_sf_tag_buf[:-20])
+                            # Only route to on_reasoning if native reasoning is NOT active
+                            if not _sf_native_reasoning_active:
+                                on_reasoning(_sf_tag_buf[:-20])
                             _sf_tag_buf = _sf_tag_buf[-20:]
                         return
 
@@ -1726,6 +1731,15 @@ class ClineAgent:
                                     _sf_in_tag = False
                                     return
                                 elif tag in _sf_thinking_tags:
+                                    # Skip <thinking> tag extraction if native reasoning is active
+                                    # to avoid double-printing thinking content
+                                    if _sf_native_reasoning_active:
+                                        # Suppress the tags but don't route to on_reasoning
+                                        if not is_close:
+                                            _sf_thinking_suppress = True
+                                            _sf_tag_buf = ""
+                                        _sf_in_tag = False
+                                        return
                                     if is_close:
                                         # Orphaned close tag outside a thinking block
                                         # — display it as-is (may be user content)
@@ -1844,16 +1858,7 @@ class ClineAgent:
                     else "\nThinking:\n"
                 )
 
-                def on_reasoning(chunk: str):
-                    """Display native reasoning stream (reasoning_content)."""
-                    nonlocal \
-                        full_reasoning, \
-                        _thinking_started, \
-                        _thinking_line_start, \
-                        _thinking_line_has_text
-                    if not chunk:
-                        return
-                    full_reasoning += chunk
+
                     if len(full_reasoning) % 3000 == 0:
                         log.debug(
                             "on_reasoning: accumulated reasoning_len=%d chunk_len=%d",
@@ -1931,6 +1936,7 @@ class ClineAgent:
                         # Reset stream filter state
                         _sf_suppressing = None
                         _sf_thinking_suppress = False
+                        _sf_native_reasoning_active = False
                         _sf_tag_buf = ""
                         _sf_in_tag = False
                         _sf_had_visible = False
@@ -2032,6 +2038,7 @@ class ClineAgent:
                                 _thinking_line_has_text = False
                                 _sf_suppressing = None
                                 _sf_thinking_suppress = False
+                                _sf_native_reasoning_active = False
                                 _sf_tag_buf = ""
                                 _sf_in_tag = False
                                 _sf_had_visible = False
