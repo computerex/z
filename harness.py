@@ -995,6 +995,10 @@ def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
     elif "openrouter.ai" in url:
         return search_litellm_models("openrouter/")
     elif "together.xyz" in url:
+        # Query Together's actual API (LiteLLM registry may be empty/stale)
+        models = _fetch_models_from_provider_api(api_url, api_key)
+        if models:
+            return models
         return search_litellm_models("together_ai/")
     elif "minimax" in url:
         return search_litellm_models("minimax/")
