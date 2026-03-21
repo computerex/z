@@ -3372,11 +3372,15 @@ def main():
         _banner_effort = getattr(config, "reasoning_effort", "high")
         banner_table.add_row("reasoning", f"[bold]{_banner_effort}[/bold] [dim]Ctrl+T to toggle[/dim]")
         console.print()
+        # Check if running in safe mode
+        _is_safe_mode = os.environ.get("HARNESS_SAFE_MODE") == "1"
+        _banner_title = "[bold yellow] SAFE MODE [/bold yellow]" if _is_safe_mode else "[bold bright_blue] harness [/bold bright_blue]"
+        _banner_style = "yellow" if _is_safe_mode else "bright_blue"
         console.print(
             Panel(
                 banner_table,
-                title="[bold bright_blue] harness [/bold bright_blue]",
-                border_style="bright_blue",
+                title=_banner_title,
+                border_style=_banner_style,
                 padding=(1, 3),
                 width=50,
             )

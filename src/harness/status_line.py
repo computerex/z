@@ -37,7 +37,7 @@ class StatusLine:
     _SPINNER = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
     _ACCENT = "\033[38;5;75m"
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, safe_mode: bool = None):
         self._enabled = enabled and sys.stdout.isatty()
         self._text = ""
         self._state = self.IDLE
@@ -58,6 +58,9 @@ class StatusLine:
         # Background ticker for spinner animation and elapsed time
         self._tick_stop = threading.Event()
         self._ticker_thread: Optional[threading.Thread] = None
+        # Safe mode indicator (auto-detect from env if not specified)
+        import os
+        self._safe_mode = safe_mode if safe_mode is not None else os.environ.get("HARNESS_SAFE_MODE") == "1"
 
     @property
     def enabled(self) -> bool:
@@ -136,8 +139,9 @@ class StatusLine:
         if self._turn_start:
             turn_elapsed_str = self._format_elapsed(now - self._turn_start)
 
-        # Build compact line: icon text │ iter │ phase_elapsed │ total_elapsed
-        parts = [f"{icon} {self._text}"]
+        # Build compact line: [SAFE] icon text │ iter │ phase_elapsed │ total_elapsed
+        safe_prefix = "\033[93m[SAFE]\033[0m\033[2m " if self._safe_mode else ""
+        parts = [f"{safe_prefix}{icon} {self._text}"]
         if self._max_iterations > 0:
             parts.append(f"iter: {self._iteration}/{self._max_iterations}")
         if elapsed_str:
