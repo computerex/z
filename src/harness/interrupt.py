@@ -17,21 +17,33 @@ class InterruptState:
     interrupted: bool = False
     background: bool = False
     reason: str = ""
-    
+    _lock: threading.Lock = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        self._lock = threading.Lock()
+
     def reset(self):
-        self.interrupted = False
-        self.background = False
-        self.reason = ""
+        with self._lock:
+            self.interrupted = False
+            self.background = False
+            self.reason = ""
     
     def trigger(self, reason: str = "user"):
-        self.interrupted = True
-        self.reason = reason
+        with self._lock:
+            self.interrupted = True
+            self.reason = reason
         _log.info("INTERRUPT triggered: reason=%s", reason)
     
     def trigger_background(self):
-        self.background = True
-        self.reason = "background"
+        with self._lock:
+            self.background = True
+            self.reason = "background"
         _log.info("BACKGROUND requested")
+
+    def snapshot(self):
+        """Return (interrupted, reason) atomically."""
+        with self._lock:
+            return self.interrupted, self.reason
 
 
 # Global interrupt state
@@ -177,9 +189,7 @@ class KeyboardMonitor:
                 _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("_pad", ctypes.c_byte * 16)]
             _fields_ = [("EventType", wintypes.WORD), ("Event", _EVENT)]
 
-        handle = kernel32.GetStdHandle(wintypes.DWORD(-10 & 0xFFFFFFFF))
-        if handle in (0, -1, None):
-            raise RuntimeError("No console input handle")
+        _log.info("Win32 console API monitor started (handle=%s)", handle)
 
         # Flush stale events left over from previous user input
         kernel32.FlushConsoleInputBuffer(handle)
@@ -197,8 +207,9 @@ class KeyboardMonitor:
                 self._stop_event.wait(0.02)
                 continue
 
-            # Only process key-down events
+            # Log ALL event types for diagnosis
             if buf.EventType != KEY_EVENT:
+                _log.debug("Console event: type=%d (non-key, discarded)", buf.EventType)
                 continue  # Discard mouse, resize, focus, menu events
             ke = buf.Event.KeyEvent
             if not ke.bKeyDown:
@@ -207,6 +218,13 @@ class KeyboardMonitor:
             vk = ke.wVirtualKeyCode
             scan = ke.wVirtualScanCode
             ctrl = bool(ke.dwControlKeyState & CTRL_MASK)
+            char_val = ke.uChar.UnicodeChar
+
+            # Log every key-down event so we can diagnose phantom interrupts
+            _log.info(
+                "KEY_EVENT: vk=0x%02X scan=0x%02X ctrl=%s char=%r state=0x%08X",
+                vk, scan, ctrl, char_val, ke.dwControlKeyState,
+            )
 
             # Real Escape key: VK_ESCAPE with a non-zero scan code (0x01).
             # VT sequence bytes injected by the terminal (focus events,
