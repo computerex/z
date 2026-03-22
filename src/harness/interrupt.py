@@ -133,33 +133,105 @@ class KeyboardMonitor:
             self._monitor_unix()
     
     def _monitor_windows(self):
-        """Windows-specific keyboard monitoring."""
+        """Windows-specific keyboard monitoring using Win32 Console API.
+
+        Uses ReadConsoleInput to get proper KEY_EVENT_RECORD structures
+        with virtual key codes, completely avoiding the msvcrt.kbhit()/getch()
+        problem where VT escape sequences, terminal focus events, and other
+        injected bytes produce phantom 0x1b that looks like the Escape key.
+        """
+        try:
+            self._monitor_windows_console_api()
+        except Exception as e:
+            _log.warning("Win32 console API monitor failed (%s), falling back to msvcrt", e)
+            self._monitor_windows_msvcrt()
+
+    def _monitor_windows_console_api(self):
+        """Primary Windows monitor using Win32 ReadConsoleInput."""
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+
+        # Constants
+        KEY_EVENT = 0x0001
+        VK_ESCAPE = 0x1B
+        CTRL_MASK = 0x0008 | 0x0004  # LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED
+
+        # Win32 structures
+        class CHAR_UNION(ctypes.Union):
+            _fields_ = [("UnicodeChar", wintypes.WCHAR), ("AsciiChar", ctypes.c_char)]
+
+        class KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", wintypes.BOOL),
+                ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD),
+                ("wVirtualScanCode", wintypes.WORD),
+                ("uChar", CHAR_UNION),
+                ("dwControlKeyState", wintypes.DWORD),
+            ]
+
+        class INPUT_RECORD(ctypes.Structure):
+            class _EVENT(ctypes.Union):
+                _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("_pad", ctypes.c_byte * 16)]
+            _fields_ = [("EventType", wintypes.WORD), ("Event", _EVENT)]
+
+        handle = kernel32.GetStdHandle(wintypes.DWORD(-10 & 0xFFFFFFFF))
+        if handle in (0, -1, None):
+            raise RuntimeError("No console input handle")
+
+        # Flush stale events left over from previous user input
+        kernel32.FlushConsoleInputBuffer(handle)
+
+        buf = INPUT_RECORD()
+        n = wintypes.DWORD(0)
+
+        while self._running and not self._stop_event.is_set():
+            if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(n)) or n.value == 0:
+                self._stop_event.wait(0.02)
+                continue
+
+            # Read one event from the buffer
+            if not kernel32.ReadConsoleInputW(handle, ctypes.byref(buf), 1, ctypes.byref(n)) or n.value == 0:
+                self._stop_event.wait(0.02)
+                continue
+
+            # Only process key-down events
+            if buf.EventType != KEY_EVENT:
+                continue  # Discard mouse, resize, focus, menu events
+            ke = buf.Event.KeyEvent
+            if not ke.bKeyDown:
+                continue  # Discard key-up events
+
+            vk = ke.wVirtualKeyCode
+            scan = ke.wVirtualScanCode
+            ctrl = bool(ke.dwControlKeyState & CTRL_MASK)
+
+            # Real Escape key: VK_ESCAPE with a non-zero scan code (0x01).
+            # VT sequence bytes injected by the terminal (focus events,
+            # arrow keys in VT mode, etc.) have scan code 0.
+            if vk == VK_ESCAPE and scan != 0:
+                _interrupt_state.trigger("escape")
+            elif ctrl and vk == 0x42:  # Ctrl+B
+                _interrupt_state.trigger_background()
+            elif ctrl and vk == 0x43:  # Ctrl+C
+                _interrupt_state.trigger("ctrl-c")
+            # All other events are silently consumed and discarded
+
+    def _monitor_windows_msvcrt(self):
+        """Fallback Windows monitor using msvcrt (no Escape support)."""
         import msvcrt
-        
+
         while self._running and not self._stop_event.is_set():
             if msvcrt.kbhit():
                 key = msvcrt.getch()
-                # Escape key = 0x1b (27)
-                # On modern Windows terminals (Windows Terminal, VS Code),
-                # VT sequences also start with 0x1b (e.g. arrow keys \x1b[A).
-                # Wait briefly to distinguish a standalone Escape from a VT sequence.
-                if key == b'\x1b':
-                    self._stop_event.wait(0.05)  # 50ms — VT follow-up bytes arrive fast
-                    if msvcrt.kbhit():
-                        # More bytes followed — this is a VT sequence, not Escape.
-                        # Consume the rest of the sequence and discard it.
-                        while msvcrt.kbhit():
-                            msvcrt.getch()
-                    else:
-                        # Standalone Escape key — trigger interrupt
-                        _interrupt_state.trigger("escape")
-                # Ctrl+B = 0x02
-                elif key == b'\x02':
+                # Skip Escape entirely in fallback — too unreliable via msvcrt
+                if key == b'\x02':  # Ctrl+B
                     _interrupt_state.trigger_background()
-                # Ctrl+C = 0x03
-                elif key == b'\x03':
+                elif key == b'\x03':  # Ctrl+C
                     _interrupt_state.trigger("ctrl-c")
-            self._stop_event.wait(0.02)  # 20ms polling for more responsiveness
+            self._stop_event.wait(0.02)
     
     def _monitor_unix(self):
         """Unix-specific keyboard monitoring."""
