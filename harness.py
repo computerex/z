@@ -2539,7 +2539,7 @@ def list_sessions(workspace: str) -> list[tuple[str, datetime, int]]:
 
 
 class HarnessCompleter(Completer):
-    """Tab completer for commands, file paths, and history."""
+    """Tab completer for commands, file paths, and shell commands."""
 
     COMMANDS = [
         "/sessions",
@@ -2577,19 +2577,8 @@ class HarnessCompleter(Completer):
         "/q",
     ]
 
-    def __init__(self, workspace: Path, history: SafeFileHistory = None):
+    def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.history = history
-        self._history_cache = []
-        self._load_history()
-
-    def _load_history(self):
-        """Load history strings for completion."""
-        if self.history:
-            try:
-                self._history_cache = list(self.history.load_history_strings())
-            except Exception:
-                self._history_cache = []
 
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
@@ -2672,21 +2661,9 @@ class HarnessCompleter(Completer):
                             )
             return
 
-        # First, try history completion (if text doesn't start with /)
-        if not text.startswith("/") and text.strip():
-            prefix = text
-            for hist_item in self._history_cache:
-                if hist_item.startswith(prefix) and hist_item != prefix:
-                    yield Completion(
-                        hist_item,
-                        start_position=-len(prefix),
-                        display=hist_item[:40] + "..."
-                        if len(hist_item) > 40
-                        else hist_item,
-                    )
-            # Only show history if we have matches, otherwise continue
-            if any(h.startswith(prefix) for h in self._history_cache):
-                return
+        # Note: history-based ghost text is handled by AutoSuggestFromHistory
+        # (the inline gray suggestion). Don't duplicate it here in the completer
+        # because completer dropdown menus suppress the ghost text display.
 
         # Complete commands
         if text.startswith("/"):
@@ -2897,8 +2874,8 @@ def create_prompt_session(
     # Create history instance first
     history = SafeFileHistory(str(history_file))
 
-    # Create completer with history
-    completer = HarnessCompleter(workspace, history)
+    # Create completer for commands and file paths
+    completer = HarnessCompleter(workspace)
 
     return PromptSession(
         history=history,

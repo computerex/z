@@ -2337,6 +2337,30 @@ class ClineAgent:
                                 f"{len(ignored_pre)} additional tool call(s) were NOT executed: {skipped_names}. "
                                 f"The attempt_completion was also deferred. Re-issue remaining tools one at a time.]"
                             )
+                            # Feed the tool result + system notice back and
+                            # continue the loop so the model can re-issue the
+                            # dropped tools before completing.
+                            log.info(
+                                "Deferring attempt_completion — %d tool(s) were dropped, feeding result back",
+                                len(ignored_pre),
+                            )
+                            tool_result = "\n\n".join(tool_results_combined)
+                            self.messages.append(
+                                StreamingMessage(
+                                    role="assistant",
+                                    content=full_content,
+                                    provider_blocks=getattr(
+                                        response, "provider_content_blocks", None
+                                    ),
+                                )
+                            )
+                            self.messages.append(
+                                StreamingMessage(
+                                    role="user",
+                                    content=f"[{tc.name} result]\n{tool_result}",
+                                )
+                            )
+                            continue
 
                     result_text = completion_call.parameters.get("result", "").strip()
                     command = completion_call.parameters.get("command", "").strip()

@@ -198,7 +198,8 @@ class ToolHandlers:
     # Tools that manage their own output size and must NOT be spilled.
     # Spilling read_file results creates an infinite loop: the model reads
     # the spill file which gets spilled again, making content invisible.
-    _NO_SPILL_TOOLS = frozenset({"read_file"})
+    # search_files is capped at 100 matches internally — no need to spill.
+    _NO_SPILL_TOOLS = frozenset({"read_file", "search_files"})
     
     # Maximum tokens to include inline when output is spilled.
     OUTPUT_INLINE_PREVIEW_TOKENS = 300   # ~1,200 chars — enough for LLM to understand
@@ -852,15 +853,21 @@ class ToolHandlers:
         all_lines = content.splitlines()
         total_lines = len(all_lines)
 
-        # If file is too large and no line range was specified, reject with guidance
+        # If file is too large and no line range was specified, return the
+        # first chunk so the model gets real content (imports, class names,
+        # top-level structure) instead of a dead-end error message.
+        LARGE_FILE_PREVIEW_LINES = 300
         if not has_range and total_lines > self.MAX_FULL_READ_LINES:
+            preview = all_lines[:LARGE_FILE_PREVIEW_LINES]
+            numbered = [f"{i+1:4d} | {line}" for i, line in enumerate(preview)]
+            result = "\n".join(numbered)
+            result = truncate_file_content(result)
+            ctx_id = self.context.add("file", rel_path, result)
             return (
-                f"Error: File is too large to read in full ({total_lines:,} lines, "
-                f"~{len(content) // 4:,} tokens). Use start_line and end_line "
-                f"parameters to read specific sections.\n"
-                f"Example: <read_file><path>{rel_path}</path>"
-                f"<start_line>1</start_line><end_line>100</end_line></read_file>\n"
-                f"Total lines in file: {total_lines}"
+                f"[Context ID: {ctx_id}]\n"
+                f"(Showing first {LARGE_FILE_PREVIEW_LINES} of {total_lines:,} lines. "
+                f"Use start_line/end_line to read other sections.)\n\n"
+                f"{result}"
             )
 
         # Apply line range if specified

@@ -49,12 +49,21 @@ Always adhere to this format for the tool use to ensure proper parsing and execu
 # Tools
 
 ## read_file
-Description: Request to read the contents of a file at the specified path. Use this when you need to examine the contents of an existing file you do not know the contents of, for example to analyze code, review text files, or extract information from configuration files.
+Description: Request to read the contents of a file at the specified path. Use this when you need to examine the contents of an existing file you do not know the contents of, for example to analyze code, review text files, or extract information from configuration files. For large files (over 2000 lines), only the first 300 lines are returned unless you specify a line range with start_line/end_line.
 Parameters:
 - path: (required) The path of the file to read (relative to the current working directory {workspace_path})
+- start_line: (optional) The 1-based line number to start reading from. Use this to read a specific section of a large file.
+- end_line: (optional) The 1-based line number to stop reading at (inclusive). Use with start_line to read a specific range.
 Usage:
 <read_file>
 <path>File path here</path>
+</read_file>
+
+To read a specific line range (e.g. lines 200-300):
+<read_file>
+<path>File path here</path>
+<start_line>200</start_line>
+<end_line>300</end_line>
 </read_file>
 
 ## write_to_file
@@ -103,9 +112,16 @@ replacement code
 Description: Request to execute a CLI command on the system. Use this when you need to perform system operations or run specific commands to accomplish any step in the user's task. You must tailor your command to the user's system and provide a clear explanation of what the command does. Commands will be executed in the current working directory: {workspace_path}
 Parameters:
 - command: (required) The CLI command to execute. This should be valid for the current operating system. Ensure the command is properly formatted and does not contain any harmful instructions.
+- background: (optional) Set to "true" to run the command as a background process. Use for servers, watch commands, or other long-running processes. Check status with check_background_process.
 Usage:
 <execute_command>
 <command>Your command here</command>
+</execute_command>
+
+To run in background:
+<execute_command>
+<command>npm start</command>
+<background>true</background>
 </execute_command>
 
 ## list_files
@@ -188,11 +204,100 @@ Usage:
 <query>python asyncio wait_for cancel task</query>
 </web_search>
 
+## list_background_processes
+Description: List all background processes started with execute_command (ID, PID, status, elapsed time, command).
+Usage:
+<list_background_processes>
+</list_background_processes>
+
+## check_background_process
+Description: Check the status and recent log output of a background process. Don't poll in a tight loop — check once, do other work, then check later.
+Parameters:
+- id: (required) The ID of the background process to check.
+- lines: (optional) Number of recent log lines to return (default: 50).
+Usage:
+<check_background_process>
+<id>1</id>
+</check_background_process>
+
+## stop_background_process
+Description: Terminate a running background process. Only use when the user explicitly asks to stop a process.
+Parameters:
+- id: (required) The ID of the background process to stop.
+Usage:
+<stop_background_process>
+<id>1</id>
+</stop_background_process>
+
+## analyze_image
+Description: Analyze an image file (jpg, png, gif, webp) using a vision model. Use to understand screenshots, diagrams, or visual content.
+Parameters:
+- path: (required) The path of the image file to analyze (relative to the current working directory {workspace_path}).
+- question: (optional) A specific question about the image. If omitted, provides a general description.
+Usage:
+<analyze_image>
+<path>screenshot.png</path>
+<question>What error is shown in this screenshot?</question>
+</analyze_image>
+
+## mcp_search_tools
+Description: Semantically search tools exposed by a configured MCP server. Use this FIRST when you don't know the exact tool name — it finds relevant tools by description matching.
+Parameters:
+- server: (required) The name of the MCP server to search (as configured in settings).
+- query: (required) A natural language query describing what you want to do.
+- limit: (optional) Maximum number of results to return.
+Usage:
+<mcp_search_tools>
+<server>my-server</server>
+<query>create a new issue</query>
+</mcp_search_tools>
+
+## mcp_list_tools
+Description: List all tools exposed by a configured MCP server, including their required fields. Use to confirm a tool's input schema before calling it.
+Parameters:
+- server: (required) The name of the MCP server to list tools for.
+Usage:
+<mcp_list_tools>
+<server>my-server</server>
+</mcp_list_tools>
+
+## mcp_call_tool
+Description: Call a specific tool on a configured MCP server. Always invoke MCP tools through this tool rather than as direct XML tags.
+Parameters:
+- server: (required) The name of the MCP server.
+- tool: (required) The name of the tool to call.
+- arguments: (required) JSON object with the tool's input arguments.
+Usage:
+<mcp_call_tool>
+<server>my-server</server>
+<tool>create_issue</tool>
+<arguments>{{"title": "Bug fix", "body": "Details here"}}</arguments>
+</mcp_call_tool>
+
+## retrieve_tool_result
+Description: Retrieve a stored tool result by its context ID. Use this to access the output of previous tool executions that have been stored in the context, for example when a compaction summary references a result ID.
+Parameters:
+- result_id: (required) The ID of the stored tool result (e.g., res_abc123_456).
+Usage:
+<retrieve_tool_result>
+<result_id>res_abc123_456</result_id>
+</retrieve_tool_result>
+
+## introspect
+Description: Dedicated deep-thinking tool. Triggers a separate API call with no tools available so you can reason freely without constraints. Use when facing complex decisions, debugging tricky issues, or planning multi-step approaches.
+Parameters:
+- focus: (optional) A description of what to focus your thinking on.
+Usage:
+<introspect>
+<focus>Analyze the root cause of the race condition in the connection pool</focus>
+</introspect>
+
 ## attempt_completion
 Description: After each tool use, the user will respond with the result of that tool use. Once you've received the results of tool uses and can confirm that the task is complete, use this tool to present the result of your work to the user. The user may respond with feedback if they are not satisfied with the result, which you can use to make improvements and try again.
 IMPORTANT NOTE: This tool CANNOT be used until you've confirmed from the user that any previous tool uses were successful. Failure to do so will result in code corruption and system failure. Before using this tool, you must ask yourself in <thinking></thinking> tags if you've confirmed from the user that any previous tool uses were successful. If not, then DO NOT use this tool.
 Parameters:
 - result: (required) The result of the task. Formulate this result in a way that is final and does not require further input from the user. Don't end your result with questions or offers for further assistance.
+- command: (optional) A CLI command to demonstrate the result (e.g., open a browser, run a script).
 Usage:
 <attempt_completion>
 <result>
