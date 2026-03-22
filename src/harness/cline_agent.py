@@ -1976,17 +1976,16 @@ class ClineAgent:
                         )
                         watcher = asyncio.ensure_future(_interrupt_watcher(api_task))
                         try:
-                            response = await asyncio.wait_for(api_task, timeout=120.0)
+                            # No total timeout — httpx per-read timeout (120s idle)
+                            # handles stalled connections; _interrupt_watcher handles
+                            # user interrupts.  The old asyncio.wait_for(timeout=120)
+                            # was killing long-but-healthy streams because Python 3.12
+                            # returns the CancelledError-caught result instead of
+                            # raising TimeoutError, causing false "interrupted" flags.
+                            response = await api_task
                         finally:
                             watcher.cancel()
                         break  # Success — exit retry loop
-
-                    except asyncio.TimeoutError:
-                        log.error("API call timed out after 120s")
-                        self.console.print(
-                            "[red]Error: API call timed out after 2 minutes[/red]"
-                        )
-                        return "[Error - API timeout. Check connection and try again]"
 
                     except asyncio.CancelledError:
                         # This happens when user presses Ctrl+C - client was closed
@@ -2153,7 +2152,13 @@ class ClineAgent:
                         _int_flag, _int_reason,
                     )
                     self.status.clear()
-                    print(f"\n[STOP] Interrupted (reason: {_int_reason or 'unknown'})")
+                    if _int_flag:
+                        print(f"\n[STOP] Interrupted ({_int_reason})")
+                    else:
+                        # Interrupted without InterruptState being set —
+                        # likely a task cancellation or unexpected condition.
+                        log.warning("response.interrupted=True but InterruptState not set")
+                        print("\n[STOP] Interrupted")
                     # Save partial response to history
                     if full_content.strip():
                         self.messages.append(
