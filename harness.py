@@ -3327,6 +3327,7 @@ def main():
 
     # Checkpoint manager for undo/redo
     checkpoint_mgr = CheckpointManager(workspace)
+    checkpoint_mgr._workspace_index = agent.workspace_index
     agent.checkpoint_mgr = checkpoint_mgr
     if not checkpoint_mgr._check_git():
         console.print("  [dim]git not found — /undo and /redo disabled[/dim]")

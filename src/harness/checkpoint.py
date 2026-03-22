@@ -66,6 +66,8 @@ class CheckpointManager:
         self._redo_tree: Optional[str] = None
         # Whether git is available on this system
         self._git_available: Optional[bool] = None
+        # Cached result of workspace size check
+        self._too_large: Optional[bool] = None
 
     # ── Git plumbing ─────────────────────────────────────────────
 
@@ -88,7 +90,7 @@ class CheckpointManager:
         return self._git_available
 
     def _git(self, *args, check: bool = True, capture: bool = True,
-             use_work_tree: bool = True) -> subprocess.CompletedProcess:
+             use_work_tree: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
         """Run a git command against the snapshot repo."""
         cmd = [
             "git",
@@ -98,16 +100,43 @@ class CheckpointManager:
             cmd.append(f"--work-tree={self.workspace_path}")
         cmd.extend(args)
         try:
-            return subprocess.run(
-                cmd,
-                capture_output=capture,
+            # Use Popen + communicate for reliable timeout handling.
+            # subprocess.run with timeout on Windows can hang if the child
+            # process spawns helpers that inherit stdout/stderr handles.
+            kwargs = dict(
                 text=True,
-                check=check,
-                timeout=30,
                 cwd=self.workspace_path,
             )
+            if capture:
+                kwargs["stdout"] = subprocess.PIPE
+                kwargs["stderr"] = subprocess.PIPE
+            # On Windows, CREATE_NEW_PROCESS_GROUP lets us kill the tree
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            proc = subprocess.Popen(cmd, **kwargs)
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the entire process tree
+                try:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            capture_output=True, timeout=5,
+                        )
+                    else:
+                        proc.kill()
+                except Exception:
+                    proc.kill()
+                proc.wait(timeout=5)
+                log.error("Git command timed out after %ds: %s", timeout, " ".join(args[:3]))
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if check and proc.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, cmd, stdout, stderr,
+                )
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
         except subprocess.TimeoutExpired:
-            log.error("Git command timed out: %s", " ".join(args[:3]))
             raise
         except subprocess.CalledProcessError as e:
             log.error("Git command failed: %s\nstderr: %s", " ".join(args[:3]), e.stderr)
@@ -152,14 +181,66 @@ class CheckpointManager:
 
     # ── Snapshot operations ──────────────────────────────────────
 
+    def _workspace_too_large(self) -> bool:
+        """Quick heuristic to skip checkpointing for huge non-code directories.
+
+        First checks the WorkspaceIndex (if available) — if the index found
+        no git repo and used a shallow/depth-limited scan, the workspace is
+        not a code project and checkpointing is skipped.
+
+        Falls back to a filesystem scan that bails at 500 MB or 500 files.
+        """
+        if self._too_large is not None:
+            return self._too_large
+
+        # Check workspace index if the agent linked one
+        idx = getattr(self, '_workspace_index', None)
+        if idx is not None:
+            if not idx._is_git and idx._is_shallow:
+                log.info(
+                    "Workspace not a git project (shallow index) — "
+                    "skipping checkpointing"
+                )
+                self._too_large = True
+                return True
+
+        # Fallback: quick filesystem scan
+        try:
+            top = Path(self.workspace_path)
+            total_size = 0
+            file_count = 0
+            MAX_FILES = 500
+            MAX_SIZE = 500 * 1024 * 1024  # 500 MB
+            for entry in top.rglob("*"):
+                if entry.is_file():
+                    total_size += entry.stat().st_size
+                    file_count += 1
+                    if total_size > MAX_SIZE:
+                        log.info(
+                            "Workspace too large for checkpointing: >%dMB after %d files",
+                            MAX_SIZE // (1024 * 1024), file_count,
+                        )
+                        self._too_large = True
+                        return True
+                    if file_count > MAX_FILES:
+                        break  # Don't spend forever scanning
+        except Exception:
+            pass
+        self._too_large = False
+        return False
+
     def take_snapshot(self, user_input: str, message_count: int, model: str = "") -> Optional[str]:
         """Capture current workspace state. Returns tree hash or None on failure."""
         if not self._ensure_repo():
             return None
 
+        # Skip huge directories (game installs, media libraries, etc.)
+        if self._workspace_too_large():
+            return None
+
         try:
             # Stage all files (respecting .gitignore via exclude)
-            self._git("add", "-A")
+            self._git("add", "-A", timeout=15)
 
             # Write tree object (lightweight — no commit overhead)
             result = self._git("write-tree")
