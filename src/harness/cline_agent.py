@@ -29,6 +29,7 @@ from .interrupt import (
     is_interrupted,
     is_background_requested,
     reset_interrupt,
+    get_interrupt_state,
     start_monitoring,
     stop_monitoring,
 )
@@ -1963,6 +1964,11 @@ class ClineAgent:
                         api_t0 = time.time()
 
                     try:
+                        # Reset interrupt flag immediately before the API call.
+                        # Stale interrupts from keyboard events during context
+                        # management or compaction must not abort the stream.
+                        reset_interrupt()
+
                         api_task = asyncio.ensure_future(
                             client.chat_stream_raw(
                                 messages=self.messages,
@@ -2146,8 +2152,13 @@ class ClineAgent:
 
                 # Handle interrupt
                 if response.interrupted:
+                    istate = get_interrupt_state()
+                    log.warning(
+                        "Stream interrupted: reason=%s",
+                        istate.reason,
+                    )
                     self.status.clear()
-                    print("\n[STOP] Interrupted")
+                    print(f"\n[STOP] Interrupted (reason: {istate.reason})")
                     # Save partial response to history
                     if full_content.strip():
                         self.messages.append(
