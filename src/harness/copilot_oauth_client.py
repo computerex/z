@@ -213,7 +213,14 @@ class CopilotOAuthClient:
                 url,
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                # Use sock_read (idle timeout) instead of total timeout.
+                # total= kills long-but-active streams; sock_read= only
+                # fires when no data arrives for N seconds.
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    sock_connect=30,
+                    sock_read=self.timeout,
+                ),
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -288,8 +295,19 @@ class CopilotOAuthClient:
         except asyncio.CancelledError:
             interrupted = True
             finish_reason = "interrupted"
+        except asyncio.TimeoutError:
+            # Idle timeout — no data from API for self.timeout seconds.
+            # If we have partial content, return it as interrupted rather
+            # than crashing.
+            if full_content:
+                interrupted = True
+                finish_reason = "interrupted"
+            else:
+                raise RuntimeError(
+                    f"Copilot streaming error: read timeout after {self.timeout}s with no data"
+                )
         except Exception as e:
-            raise RuntimeError(f"Copilot streaming error: {e}")
+            raise RuntimeError(f"Copilot streaming error: {type(e).__name__}: {e}")
 
         return CopilotResponse(
             content=full_content,
