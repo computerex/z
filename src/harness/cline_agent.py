@@ -2267,59 +2267,63 @@ class ClineAgent:
                     None,
                 )
                 if completion_call:
-                    # Filter out attempt_completion — execute remaining tools first
+                    # Filter out attempt_completion — execute only the FIRST remaining tool (1-per-turn policy)
                     actionable_tools = [tc for tc in all_tool_calls if tc.name != "attempt_completion"]
                     if actionable_tools:
+                        tc = actionable_tools[0]
+                        ignored_pre = actionable_tools[1:]
                         log.info(
-                            "attempt_completion found alongside %d other tool(s) — executing tools first: %s",
+                            "attempt_completion found alongside %d other tool(s) — executing first tool only: %s",
                             len(actionable_tools),
-                            ", ".join(tc.name for tc in actionable_tools),
+                            tc.name,
                         )
+                        if ignored_pre:
+                            log.info(
+                                "1-tool-per-turn policy (pre-completion): ignoring %d extra call(s): %s",
+                                len(ignored_pre),
+                                ", ".join(t.name for t in ignored_pre),
+                            )
                         tool_results_combined = []
-                        for tc_idx, tc in enumerate(actionable_tools):
-                            self.status.update(
-                                f"Executing: {tc.name}"
-                                + (
-                                    f" ({tc_idx + 1}/{len(actionable_tools)})"
-                                    if len(actionable_tools) > 1
-                                    else ""
-                                ),
-                                StatusLine.TOOL_EXEC,
+                        self.status.update(
+                            f"Executing: {tc.name}",
+                            StatusLine.TOOL_EXEC,
+                        )
+                        tool_t0 = time.time()
+                        log.info("Tool exec START (pre-completion): %s", tc.name)
+                        tc_result = await self._execute_tool(tc)
+                        tool_elapsed = time.time() - tool_t0
+                        log.info(
+                            "Tool exec DONE (pre-completion): %s elapsed=%.1fs result_len=%d",
+                            tc.name,
+                            tool_elapsed,
+                            len(tc_result or ""),
+                        )
+                        if is_interrupted():
+                            self.console.print(
+                                "\n[yellow][STOP] Interrupted by user[/yellow]"
                             )
-                            tool_t0 = time.time()
-                            log.info(
-                                "Tool exec START (pre-completion): %s (%d/%d)",
-                                tc.name,
-                                tc_idx + 1,
-                                len(actionable_tools),
-                            )
-                            tc_result = await self._execute_tool(tc)
-                            tool_elapsed = time.time() - tool_t0
-                            log.info(
-                                "Tool exec DONE (pre-completion): %s elapsed=%.1fs result_len=%d",
-                                tc.name,
-                                tool_elapsed,
-                                len(tc_result or ""),
-                            )
-                            if is_interrupted():
-                                self.console.print(
-                                    "\n[yellow][STOP] Interrupted by user[/yellow]"
+                            self.messages.append(
+                                StreamingMessage(
+                                    role="assistant",
+                                    content=full_content,
+                                    provider_blocks=getattr(
+                                        response, "provider_content_blocks", None
+                                    ),
                                 )
-                                self.messages.append(
-                                    StreamingMessage(
-                                        role="assistant",
-                                        content=full_content,
-                                        provider_blocks=getattr(
-                                            response, "provider_content_blocks", None
-                                        ),
-                                    )
-                                )
-                                return "[Interrupted - session preserved. Type to continue or start new request]"
-                            tc_result = self.tool_handlers.spill_output_to_file(
-                                tc_result, tc.name
                             )
+                            return "[Interrupted - session preserved. Type to continue or start new request]"
+                        tc_result = self.tool_handlers.spill_output_to_file(
+                            tc_result, tc.name
+                        )
+                        tool_results_combined.append(
+                            f"[{tc.name} result (1/1)]:\n{tc_result}"
+                        )
+                        if ignored_pre:
+                            skipped_names = ", ".join(t.name for t in ignored_pre)
                             tool_results_combined.append(
-                                f"[{tc.name} result ({tc_idx + 1}/{len(actionable_tools)})]:\n{tc_result}"
+                                f"[SYSTEM: Only 1 tool call is executed per turn. "
+                                f"{len(ignored_pre)} additional tool call(s) were NOT executed: {skipped_names}. "
+                                f"The attempt_completion was also deferred. Re-issue remaining tools one at a time.]"
                             )
 
                     result_text = completion_call.parameters.get("result", "").strip()
@@ -2535,63 +2539,65 @@ class ClineAgent:
                     )
                     return full_content
 
-                # Execute tool(s) — if multiple calls found, run them all
-                tool_results_combined = []
-                _mode_switched = False
-                for tc_idx, tc in enumerate(all_tool_calls):
-                    self.status.update(
-                        f"Executing: {tc.name}"
-                        + (
-                            f" ({tc_idx + 1}/{len(all_tool_calls)})"
-                            if len(all_tool_calls) > 1
-                            else ""
-                        ),
-                        StatusLine.TOOL_EXEC,
-                    )
-                    tool_t0 = time.time()
+                # Execute only the FIRST tool call per turn (1 tool per turn policy).
+                # If the model emitted multiple tool calls, only the first is executed;
+                # the rest are reported back so the model can re-issue them.
+                tc = all_tool_calls[0]
+                ignored_tools = all_tool_calls[1:]
+
+                if ignored_tools:
                     log.info(
-                        "Tool exec START: %s (%d/%d)",
+                        "1-tool-per-turn policy: executing %s, ignoring %d extra call(s): %s",
                         tc.name,
-                        tc_idx + 1,
-                        len(all_tool_calls),
-                    )
-                    tc_result = await self._execute_tool(tc)
-                    tool_elapsed = time.time() - tool_t0
-                    log.info(
-                        "Tool exec DONE: %s elapsed=%.1fs result_len=%d",
-                        tc.name,
-                        tool_elapsed,
-                        len(tc_result or ""),
+                        len(ignored_tools),
+                        ", ".join(t.name for t in ignored_tools),
                     )
 
-                    # Check for interrupt between tool calls
-                    if is_interrupted():
-                        self.console.print(
-                            "\n[yellow][STOP] Interrupted by user[/yellow]"
-                        )
-                        self.messages.append(
-                            StreamingMessage(
-                                role="assistant",
-                                content=full_content,
-                                provider_blocks=getattr(
-                                    response, "provider_content_blocks", None
-                                ),
-                            )
-                        )
-                        return "[Interrupted - session preserved. Type to continue or start new request]"
+                self.status.update(
+                    f"Executing: {tc.name}",
+                    StatusLine.TOOL_EXEC,
+                )
+                tool_t0 = time.time()
+                log.info("Tool exec START: %s", tc.name)
+                tc_result = await self._execute_tool(tc)
+                tool_elapsed = time.time() - tool_t0
+                log.info(
+                    "Tool exec DONE: %s elapsed=%.1fs result_len=%d",
+                    tc.name,
+                    tool_elapsed,
+                    len(tc_result or ""),
+                )
 
-                    # Spill each individual result BEFORE combining, so that
-                    # small results stay inline even when there are many calls.
-                    tc_result = self.tool_handlers.spill_output_to_file(
-                        tc_result, tc.name
+                # Check for interrupt
+                if is_interrupted():
+                    self.console.print(
+                        "\n[yellow][STOP] Interrupted by user[/yellow]"
                     )
-
-                    if len(all_tool_calls) > 1:
-                        tool_results_combined.append(
-                            f"[{tc.name} result ({tc_idx + 1}/{len(all_tool_calls)})]:\n{tc_result}"
+                    self.messages.append(
+                        StreamingMessage(
+                            role="assistant",
+                            content=full_content,
+                            provider_blocks=getattr(
+                                response, "provider_content_blocks", None
+                            ),
                         )
-                    else:
-                        tool_results_combined.append(tc_result)
+                    )
+                    return "[Interrupted - session preserved. Type to continue or start new request]"
+
+                tc_result = self.tool_handlers.spill_output_to_file(
+                    tc_result, tc.name
+                )
+
+                tool_results_combined = [tc_result]
+
+                # If extra tool calls were ignored, inform the model
+                if ignored_tools:
+                    skipped_names = ", ".join(t.name for t in ignored_tools)
+                    tool_results_combined.append(
+                        f"[SYSTEM: Only 1 tool call is executed per turn. "
+                        f"The following {len(ignored_tools)} tool call(s) were NOT executed: {skipped_names}. "
+                        f"Please re-issue them one at a time in subsequent turns.]"
+                    )
 
                 tool_result = "\n\n".join(tool_results_combined)
 
@@ -2708,8 +2714,13 @@ class ClineAgent:
                 path = tool.parameters.get("path", "")
                 result = await self.tool_handlers.read_file(tool.parameters)
                 lines = result.count("\n") + 1
+                start_line = tool.parameters.get("start_line", "")
+                end_line = tool.parameters.get("end_line", "")
+                line_range_info = ""
+                if start_line or end_line:
+                    line_range_info = f" L{start_line or '1'}-{end_line or 'end'}"
                 self.console.print(
-                    f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}  ({lines} lines)[/dim]"
+                    f"  [dim]•[/dim] [cyan]Read[/cyan] [dim]{rich_escape(path)}{line_range_info}  ({lines} lines)[/dim]"
                 )
 
             elif tool.name == "write_to_file":
