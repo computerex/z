@@ -10,7 +10,6 @@ Storage: ~/.z/checkpoints/<project_hash>/  (separate git repo per project)
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -20,6 +19,186 @@ from typing import Dict, List, Optional, Tuple
 from .logger import get_logger
 
 log = get_logger("checkpoint")
+
+# ── Binary / non-text patterns for git exclude ───────────────────
+# Only text source code and config files should be checkpointed.
+# Everything else is excluded so `git add -A` never stages binaries.
+_BINARY_EXCLUDE_PATTERNS = """
+# ── Executables & shared libraries ──
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+*.lib
+*.com
+*.msi
+*.app
+
+# ── Compiled / bytecode ──
+*.pyc
+*.pyo
+*.class
+*.jar
+*.war
+*.ear
+*.elc
+*.beam
+*.wasm
+
+# ── Archives & compressed ──
+*.zip
+*.tar
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.cab
+*.iso
+*.dmg
+*.pkg
+*.deb
+*.rpm
+
+# ── Images ──
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.ico
+*.webp
+*.tiff
+*.tif
+*.psd
+*.ai
+*.eps
+*.raw
+*.cr2
+*.nef
+*.heic
+*.avif
+
+# ── Audio ──
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.aac
+*.wma
+*.m4a
+*.opus
+
+# ── Video ──
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.mpeg
+*.mpg
+*.vob
+
+# ── Fonts ──
+*.woff
+*.woff2
+*.ttf
+*.otf
+*.eot
+
+# ── Documents (binary formats) ──
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.odt
+*.ods
+*.odp
+
+# ── Databases ──
+*.db
+*.sqlite
+*.sqlite3
+*.mdb
+*.accdb
+*.ldf
+*.mdf
+
+# ── Data / blobs ──
+*.bin
+*.dat
+*.pak
+*.vri
+*.bak
+*.dump
+*.img
+*.vhd
+*.vhdx
+*.qcow2
+*.vmdk
+
+# ── ML models ──
+*.model
+*.onnx
+*.pt
+*.pth
+*.h5
+*.tflite
+*.pb
+*.safetensors
+*.gguf
+*.ggml
+
+# ── Game / media assets ──
+*.unity3d
+*.unitypackage
+*.asset
+*.prefab
+*.fbx
+*.obj
+*.blend
+*.max
+*.3ds
+*.dds
+*.ktx
+*.pvr
+*.astc
+
+# ── Node / build artifacts ──
+node_modules/
+.git/
+__pycache__/
+.venv/
+venv/
+env/
+.env
+build/
+dist/
+target/
+.next/
+.nuxt/
+.output/
+coverage/
+.tox/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ── OS junk ──
+Thumbs.db
+.DS_Store
+desktop.ini
+"""
 
 
 @dataclass
@@ -160,18 +339,20 @@ class CheckpointManager:
                 self._git("config", "gc.auto", "0")
                 log.info("Initialized checkpoint repo at %s", self.git_dir)
 
-            # Sync .gitignore from project if it exists
+            # Build exclude file: always include binary patterns, plus project .gitignore
             project_gitignore = Path(self.workspace_path) / ".gitignore"
             exclude_file = self.git_dir / "info" / "exclude"
             exclude_file.parent.mkdir(parents=True, exist_ok=True)
+            exclude_parts = [_BINARY_EXCLUDE_PATTERNS.strip()]
             if project_gitignore.exists():
-                shutil.copy2(project_gitignore, exclude_file)
-            elif not exclude_file.exists():
-                exclude_file.write_text(
-                    # Sensible defaults
-                    "node_modules/\n.git/\n__pycache__/\n*.pyc\n.env\n"
-                    "venv/\n.venv/\nbuild/\ndist/\n.next/\ntarget/\n"
-                )
+                try:
+                    exclude_parts.append(
+                        "\n# ── Project .gitignore ──\n"
+                        + project_gitignore.read_text(errors="replace")
+                    )
+                except OSError:
+                    pass
+            exclude_file.write_text("\n".join(exclude_parts) + "\n")
 
             self._initialized = True
             return True
