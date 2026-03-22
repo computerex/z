@@ -193,7 +193,12 @@ class ToolHandlers:
     # -- Output spill helpers --------------------------------------------------
     
     # Threshold in estimated tokens above which output is spilled to a file.
-    OUTPUT_SPILL_TOKEN_THRESHOLD = 3000  # ~12,000 chars
+    OUTPUT_SPILL_TOKEN_THRESHOLD = 8000  # ~32,000 chars
+
+    # Tools that manage their own output size and must NOT be spilled.
+    # Spilling read_file results creates an infinite loop: the model reads
+    # the spill file which gets spilled again, making content invisible.
+    _NO_SPILL_TOOLS = frozenset({"read_file"})
     
     # Maximum tokens to include inline when output is spilled.
     OUTPUT_INLINE_PREVIEW_TOKENS = 300   # ~1,200 chars — enough for LLM to understand

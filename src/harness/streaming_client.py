@@ -568,6 +568,7 @@ class StreamingJSONClient:
                 usage=usage if usage else None,
                 finish_reason=finish_reason,
                 interrupted=interrupted,
+                is_truncated=finish_reason == "length",
             )
 
         except _SSEFallback:
@@ -705,6 +706,7 @@ class StreamingJSONClient:
                 usage=usage if usage else None,
                 finish_reason=finish_reason,
                 interrupted=interrupted,
+                is_truncated=finish_reason == "length",
             )
 
         except asyncio.CancelledError:
@@ -761,6 +763,7 @@ class StreamingJSONClient:
             usage=result.get("usage", {}),
             finish_reason=result.get("finish_reason", "stop"),
             interrupted=False,
+            is_truncated=result.get("finish_reason") == "length",
         )
 
     async def _chat_stream_codex(
@@ -812,6 +815,7 @@ class StreamingJSONClient:
             usage=response.usage,
             finish_reason=response.finish_reason,
             interrupted=response.interrupted,
+            is_truncated=response.finish_reason == "length",
         )
 
     async def _chat_stream_copilot(
@@ -867,6 +871,7 @@ class StreamingJSONClient:
             usage=response.usage,
             finish_reason=response.finish_reason,
             interrupted=response.interrupted,
+            is_truncated=response.finish_reason == "length",
         )
 
     async def chat_stream_raw(

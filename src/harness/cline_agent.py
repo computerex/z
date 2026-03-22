@@ -2323,9 +2323,10 @@ class ClineAgent:
                                 )
                             )
                             return "[Interrupted - session preserved. Type to continue or start new request]"
-                        tc_result = self.tool_handlers.spill_output_to_file(
-                            tc_result, tc.name
-                        )
+                        if tc.name not in self.tool_handlers._NO_SPILL_TOOLS:
+                            tc_result = self.tool_handlers.spill_output_to_file(
+                                tc_result, tc.name
+                            )
                         tool_results_combined.append(
                             f"[{tc.name} result (1/1)]:\n{tc_result}"
                         )
@@ -2595,9 +2596,10 @@ class ClineAgent:
                     )
                     return "[Interrupted - session preserved. Type to continue or start new request]"
 
-                tc_result = self.tool_handlers.spill_output_to_file(
-                    tc_result, tc.name
-                )
+                if tc.name not in self.tool_handlers._NO_SPILL_TOOLS:
+                    tc_result = self.tool_handlers.spill_output_to_file(
+                        tc_result, tc.name
+                    )
 
                 tool_results_combined = [tc_result]
 
