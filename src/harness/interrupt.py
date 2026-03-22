@@ -72,7 +72,8 @@ def is_background_requested() -> bool:
 
 def reset_background():
     """Reset only the background flag (used after sending command to background)."""
-    _interrupt_state.background = False
+    with _interrupt_state._lock:
+        _interrupt_state.background = False
 
 
 def trigger_interrupt(reason: str = "user"):
@@ -165,6 +166,12 @@ class KeyboardMonitor:
 
         kernel32 = ctypes.windll.kernel32
 
+        # Get console input handle
+        STD_INPUT_HANDLE = -10
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        if handle is None or handle == -1:
+            raise RuntimeError("Failed to get console input handle")
+
         # Constants
         KEY_EVENT = 0x0001
         VK_ESCAPE = 0x1B
@@ -220,8 +227,7 @@ class KeyboardMonitor:
             ctrl = bool(ke.dwControlKeyState & CTRL_MASK)
             char_val = ke.uChar.UnicodeChar
 
-            # Log every key-down event so we can diagnose phantom interrupts
-            _log.info(
+            _log.debug(
                 "KEY_EVENT: vk=0x%02X scan=0x%02X ctrl=%s char=%r state=0x%08X",
                 vk, scan, ctrl, char_val, ke.dwControlKeyState,
             )
