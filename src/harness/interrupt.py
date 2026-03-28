@@ -89,22 +89,28 @@ class KeyboardMonitor:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._original_sigint = None
+        self._generation = 0  # Prevent zombie threads from prior start/stop cycles
     
     def start(self):
         """Start monitoring for keys."""
+        # ALWAYS reset interrupt state, even if already running, to clear
+        # stale ctrl-c / escape flags from a previous turn.
+        reset_interrupt()
+
         if self._running and self._thread and self._thread.is_alive():
             _log.debug("KeyboardMonitor.start() — already running")
             return
         
         _log.debug("KeyboardMonitor.start()")
+        self._generation += 1
+        gen = self._generation
         self._running = True
         self._stop_event.clear()
-        reset_interrupt()
         
         # Install Ctrl+C handler
         self._original_sigint = signal.signal(signal.SIGINT, self._sigint_handler)
         
-        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread = threading.Thread(target=self._monitor_loop, args=(gen,), daemon=True)
         self._thread.start()
     
     def _sigint_handler(self, signum, frame):
@@ -138,14 +144,17 @@ class KeyboardMonitor:
             self._thread.join(timeout=0.2)
             self._thread = None
     
-    def _monitor_loop(self):
+    def _monitor_loop(self, gen: int):
         """Monitor for keys in background thread."""
+        if gen != self._generation:
+            _log.debug("Stale monitor thread (gen=%d, current=%d) — exiting", gen, self._generation)
+            return
         if sys.platform == 'win32':
-            self._monitor_windows()
+            self._monitor_windows(gen)
         else:
-            self._monitor_unix()
+            self._monitor_unix(gen)
     
-    def _monitor_windows(self):
+    def _monitor_windows(self, gen: int):
         """Windows-specific keyboard monitoring using Win32 Console API.
 
         Uses ReadConsoleInput to get proper KEY_EVENT_RECORD structures
@@ -154,12 +163,12 @@ class KeyboardMonitor:
         injected bytes produce phantom 0x1b that looks like the Escape key.
         """
         try:
-            self._monitor_windows_console_api()
+            self._monitor_windows_console_api(gen)
         except Exception as e:
             _log.warning("Win32 console API monitor failed (%s), falling back to msvcrt", e)
-            self._monitor_windows_msvcrt()
+            self._monitor_windows_msvcrt(gen)
 
-    def _monitor_windows_console_api(self):
+    def _monitor_windows_console_api(self, gen: int):
         """Primary Windows monitor using Win32 ReadConsoleInput."""
         import ctypes
         from ctypes import wintypes
@@ -204,7 +213,7 @@ class KeyboardMonitor:
         buf = INPUT_RECORD()
         n = wintypes.DWORD(0)
 
-        while self._running and not self._stop_event.is_set():
+        while self._running and not self._stop_event.is_set() and gen == self._generation:
             if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(n)) or n.value == 0:
                 self._stop_event.wait(0.02)
                 continue
@@ -213,6 +222,11 @@ class KeyboardMonitor:
             if not kernel32.ReadConsoleInputW(handle, ctypes.byref(buf), 1, ctypes.byref(n)) or n.value == 0:
                 self._stop_event.wait(0.02)
                 continue
+
+            # Bail if a new generation started while we were blocked in ReadConsoleInputW
+            if gen != self._generation:
+                _log.debug("Zombie monitor thread detected (gen=%d, current=%d) — exiting", gen, self._generation)
+                return
 
             # Log ALL event types for diagnosis
             if buf.EventType != KEY_EVENT:
@@ -232,10 +246,14 @@ class KeyboardMonitor:
                 vk, scan, ctrl, char_val, ke.dwControlKeyState,
             )
 
-            # Real Escape key: VK_ESCAPE with a non-zero scan code (0x01).
-            # VT sequence bytes injected by the terminal (focus events,
-            # arrow keys in VT mode, etc.) have scan code 0.
-            if vk == VK_ESCAPE and scan != 0:
+            # Real key presses have a non-zero scan code.  VT sequence bytes
+            # injected by the terminal (focus events, cursor keys in VT mode,
+            # etc.) have scan code 0 — reject those for ALL shortcut checks
+            # to avoid phantom interrupts.
+            if scan == 0:
+                continue
+
+            if vk == VK_ESCAPE:
                 _interrupt_state.trigger("escape")
             elif ctrl and vk == 0x42:  # Ctrl+B
                 _interrupt_state.trigger_background()
@@ -243,11 +261,11 @@ class KeyboardMonitor:
                 _interrupt_state.trigger("ctrl-c")
             # All other events are silently consumed and discarded
 
-    def _monitor_windows_msvcrt(self):
+    def _monitor_windows_msvcrt(self, gen: int):
         """Fallback Windows monitor using msvcrt (no Escape support)."""
         import msvcrt
 
-        while self._running and not self._stop_event.is_set():
+        while self._running and not self._stop_event.is_set() and gen == self._generation:
             if msvcrt.kbhit():
                 key = msvcrt.getch()
                 # Skip Escape entirely in fallback — too unreliable via msvcrt
@@ -257,7 +275,7 @@ class KeyboardMonitor:
                     _interrupt_state.trigger("ctrl-c")
             self._stop_event.wait(0.02)
     
-    def _monitor_unix(self):
+    def _monitor_unix(self, gen: int):
         """Unix-specific keyboard monitoring."""
         import select
         import termios
@@ -268,7 +286,7 @@ class KeyboardMonitor:
             old_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
             
-            while self._running and not self._stop_event.is_set():
+            while self._running and not self._stop_event.is_set() and gen == self._generation:
                 if select.select([sys.stdin], [], [], 0.02)[0]:
                     key = sys.stdin.read(1)
                     if key == '\x1b':  # Escape
