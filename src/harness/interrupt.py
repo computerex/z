@@ -257,8 +257,12 @@ class KeyboardMonitor:
                 _interrupt_state.trigger("escape")
             elif ctrl and vk == 0x42:  # Ctrl+B
                 _interrupt_state.trigger_background()
-            elif ctrl and vk == 0x43:  # Ctrl+C
-                _interrupt_state.trigger("ctrl-c")
+            # NOTE: Ctrl+C (VK_C with ctrl) is intentionally NOT handled here.
+            # Ctrl+C is reliably delivered as SIGINT via SetConsoleCtrlHandler
+            # (independent of ENABLE_PROCESSED_INPUT mode), and our _sigint_handler
+            # already handles it.  Processing KEY_EVENTs for Ctrl+C here causes
+            # phantom interrupts from stale events, ConPTY-injected sequences, and
+            # zombie monitor threads.
             # All other events are silently consumed and discarded
 
     def _monitor_windows_msvcrt(self, gen: int):
@@ -268,11 +272,10 @@ class KeyboardMonitor:
         while self._running and not self._stop_event.is_set() and gen == self._generation:
             if msvcrt.kbhit():
                 key = msvcrt.getch()
-                # Skip Escape entirely in fallback — too unreliable via msvcrt
+                # Skip Escape entirely in fallback — too unreliable via msvcrt.
+                # Skip Ctrl+C — handled by _sigint_handler via SIGINT.
                 if key == b'\x02':  # Ctrl+B
                     _interrupt_state.trigger_background()
-                elif key == b'\x03':  # Ctrl+C
-                    _interrupt_state.trigger("ctrl-c")
             self._stop_event.wait(0.02)
     
     def _monitor_unix(self, gen: int):
@@ -294,8 +297,10 @@ class KeyboardMonitor:
                         # Don't break - keep monitoring
                     elif key == '\x02':  # Ctrl+B
                         _interrupt_state.trigger_background()
-                    elif key == '\x03':  # Ctrl+C
-                        _interrupt_state.trigger("ctrl-c")
+                    # NOTE: Ctrl+C (0x03) is NOT handled here.
+                    # setcbreak() keeps ISIG, so Ctrl+C still generates SIGINT;
+                    # the 0x03 byte never reaches stdin.read().
+                    # _sigint_handler handles Ctrl+C reliably.
         except:
             pass
         finally:
