@@ -56,6 +56,7 @@ _agent_t3 = _time_mod_agent.perf_counter()
 
 from .status_line import StatusLine
 from .workspace_index import WorkspaceIndex
+from .instruction_loader import load_instruction_hierarchy, load_subdirectory_instructions
 from .tool_registry import (
     get_tool_names,
     get_complex_content_tools,
@@ -228,13 +229,33 @@ class ParsedToolCall:
 
 
 def strip_thinking_blocks(content: str) -> str:
-    """Remove <thinking>/<think> reasoning blocks and orphaned </thinking> tags from content."""
-    content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL)
-    content = re.sub(r"</thinking>\s*", "", content)
-    # Also strip <think>...</think> blocks (used by many open-source reasoning models)
-    # but do NOT strip orphaned </think> — those may be legitimate user content
-    content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
-    return content
+    """Remove <thinking>/<think> reasoning blocks from content.
+
+    IMPORTANT: Only strips think blocks that appear OUTSIDE tool call tags.
+    Think tags inside tool parameters (e.g. old_text containing literal
+    ``<think>`` in source code) must be preserved — otherwise the tool
+    parser receives mangled content and file edits silently corrupt data.
+    """
+    # Find the first tool-call opening tag.  Everything before it is the
+    # model's preamble / reasoning area where think blocks should be stripped.
+    # Everything from that tag onward is tool XML where literal <think> tags
+    # inside parameters must be left intact.
+    tool_names = get_tool_names()
+    first_tool_pos = len(content)
+    for name in tool_names:
+        idx = content.find(f"<{name}>")
+        if idx != -1 and idx < first_tool_pos:
+            first_tool_pos = idx
+
+    preamble = content[:first_tool_pos]
+    rest = content[first_tool_pos:]
+
+    # Strip think blocks only in the preamble
+    preamble = re.sub(r"<thinking>.*?</thinking>\s*", "", preamble, flags=re.DOTALL)
+    preamble = re.sub(r"</thinking>\s*", "", preamble)
+    preamble = re.sub(r"<think>.*?</think>\s*", "", preamble, flags=re.DOTALL)
+
+    return preamble + rest
 
 
 def _normalize_tool_xml(content: str) -> str:
@@ -504,6 +525,9 @@ class ClineAgent:
 
         self._active_client = None  # set during _run_loop for introspect tool access
 
+        # Track which instruction files have been loaded (for on-demand subdir loading)
+        self._loaded_instruction_paths: set = set()
+
         # Tool handlers - delegates all tool execution logic
         self.tool_handlers = ToolHandlers(
             config=self.config,
@@ -540,6 +564,33 @@ class ClineAgent:
         if plugin_tool_defs:
             register_plugin_tools(plugin_tool_defs)
             log.info("Registered %d plugin tool(s) into global registry", len(plugin_tool_defs))
+
+    def _load_instruction_files(self) -> str:
+        """Load the full CLAUDE.md inheritance hierarchy.
+
+        Mirrors Claude Code's model: walks up directory tree, loads
+        ~/.claude/CLAUDE.md, project CLAUDE.md, .claude/rules/,
+        agent.md, and resolves @path imports.
+        """
+        text, loaded_paths = load_instruction_hierarchy(self.workspace_path)
+        self._loaded_instruction_paths = loaded_paths
+        return text
+
+    def _check_subdirectory_instructions(self, file_path: str) -> None:
+        """Check for CLAUDE.md in subdirectories when reading a file.
+
+        If new instruction files are found, inject them into the system
+        prompt by refreshing it.
+        """
+        new_text = load_subdirectory_instructions(
+            self.workspace_path, file_path, self._loaded_instruction_paths
+        )
+        if not new_text:
+            return
+        # Inject into the system message
+        if self.messages and self.messages[0].role == "system":
+            self.messages[0].content += "\n\n====\n\nSUBDIRECTORY INSTRUCTIONS\n\n" + new_text
+            log.info("Loaded subdirectory instructions for %s", file_path)
 
     def _system_prompt(self) -> str:
         """Return the system prompt for this agent."""
@@ -579,6 +630,11 @@ class ClineAgent:
         plugin_docs = self.plugin_manager.get_tool_prompt_docs()
         if plugin_docs:
             result += "\n\n====\n\nPLUGIN TOOLS\n\n" + plugin_docs
+
+        # Append workspace instruction files (CLAUDE.md, agent.md)
+        instructions = self._load_instruction_files()
+        if instructions:
+            result += "\n\n====\n\nWORKSPACE INSTRUCTIONS\n\n" + instructions
 
         return result
 
@@ -1560,6 +1616,10 @@ class ClineAgent:
                     tag = raw_tag.strip()
                     m = re.match(r"</?\s*([a-zA-Z_][a-zA-Z0-9_]*)", tag)
                     if not m:
+                        # Not a recognized tag shape — if inside a payload,
+                        # emit the raw text (it's literal content like "<1>").
+                        if _stream_in_payload:
+                            _stream_payload_line += raw_tag
                         return
                     name = m.group(1)
                     is_close = tag.startswith("</")
@@ -1579,6 +1639,11 @@ class ClineAgent:
                     active_tool = _stream_tool_stack[-1]
                     expected_param = _stream_tool_param.get(active_tool)
                     if not expected_param or name != expected_param:
+                        # Unrecognized tag inside a tool payload (e.g. literal
+                        # <think> in source code) — emit it as-is so the
+                        # "Streaming changes" preview isn't mangled.
+                        if _stream_in_payload:
+                            _stream_payload_line += raw_tag
                         return
 
                     if is_close:
@@ -1994,18 +2059,22 @@ class ClineAgent:
                         return "[Interrupted]"
 
                     except RuntimeError as e:
-                        if "closed" in str(e).lower():
+                        err_lower = str(e).lower()
+                        if "closed" in err_lower:
                             # Client was closed due to interrupt
                             log.info("HTTP client closed due to interrupt")
                             self.console.print("\n  [yellow]Interrupted[/yellow]")
                             return "[Interrupted]"
+                        # Treat read timeouts as transient — retry instead of crashing
+                        if "timeout" in err_lower or "timed out" in err_lower:
+                            raise  # Fall through to Exception handler below
                         raise
 
                     except Exception as e:
                         err_str = str(e).lower()
                         err_type = type(e).__name__
 
-                        # Check for throttling/rate limit errors
+                        # Check for throttling/rate limit errors OR transient timeouts
                         is_throttle = any(kw in err_str for kw in (
                             "throttling", "throttled", "rate limit", "rate_limit",
                             "too many requests", "too many tokens", "quota",
@@ -2013,6 +2082,17 @@ class ClineAgent:
                         )) or "429" in err_str or err_type in (
                             "ThrottlingException", "ServiceUnavailableException",
                         )
+
+                        # Read timeouts and connection errors are transient —
+                        # the server may have dropped the connection or been
+                        # temporarily unavailable.  Retry with a short backoff.
+                        is_transient = (not is_throttle) and any(kw in err_str for kw in (
+                            "timeout", "timed out", "read timeout",
+                            "connect timeout", "connection reset",
+                            "connection refused", "connection closed",
+                            "server disconnected", "remotedisconnected",
+                            "unexpected eof", "incomplete chunked read",
+                        ))
 
                         # For Bedrock token quotas, toggle between us./global. profiles
                         # Each profile has its own independent token bucket that refills gradually.
@@ -2750,6 +2830,8 @@ class ClineAgent:
             if tool.name == "read_file":
                 path = tool.parameters.get("path", "")
                 result = await self.tool_handlers.read_file(tool.parameters)
+                # On-demand subdirectory CLAUDE.md loading
+                self._check_subdirectory_instructions(path)
                 lines = result.count("\n") + 1
                 start_line = tool.parameters.get("start_line", "")
                 end_line = tool.parameters.get("end_line", "")
