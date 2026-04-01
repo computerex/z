@@ -215,3 +215,55 @@ class StatusLine:
         while not self._tick_stop.wait(0.12):
             if self._text:
                 self.tick()
+
+    def print_safe(self, console, *args, **kwargs):
+        """Print to console while temporarily clearing the status line.
+        
+        Usage:
+            status.print_safe(console, "Hello world")
+            status.print_safe(console, Panel(...))
+        """
+        if not self._enabled or not self._visible:
+            console.print(*args, **kwargs)
+            return
+        
+        # Clear status line before printing
+        with self._lock:
+            if self._visible:
+                cols = shutil.get_terminal_size().columns
+                sys.stdout.write(f"\r{' ' * cols}\r")
+                sys.stdout.flush()
+                self._visible = False
+        
+        # Print the content
+        console.print(*args, **kwargs)
+        
+        # Move to new line and restore status line at the bottom
+        with self._lock:
+            if self._text:  # Only if we have status to show
+                sys.stdout.write("\n")
+                self._render()
+
+    def wrap_console(self, console):
+        """Return a wrapped console that clears/restores status line on print.
+        
+        Usage:
+            wrapped_console = status.wrap_console(console)
+            wrapped_console.print("Hello")  # Status line handled automatically
+        """
+        if not self._enabled:
+            return console
+        
+        class StatusAwareConsole:
+            def __init__(status_self, status_line, real_console):
+                status_self._status = status_line
+                status_self._console = real_console
+            
+            def print(status_self, *args, **kwargs):
+                status_self._status.print_safe(status_self._console, *args, **kwargs)
+            
+            def __getattr__(status_self, name):
+                # Delegate all other attributes to the real console
+                return getattr(status_self._console, name)
+        
+        return StatusAwareConsole(self, console)

@@ -22,6 +22,7 @@ dependencies = [
     "aiofiles>=23.0.0",
     "rich>=13.0.0",
     "pathspec>=0.11.0",
+    "litellm==1.65.7",
 ]
 
 [project.optional-dependencies]

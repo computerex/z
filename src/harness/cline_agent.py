@@ -518,6 +518,8 @@ class ClineAgent:
 
         # Persistent bottom status line
         self.status = StatusLine(enabled=sys.stdin.isatty())
+        # Wrap console so prints automatically clear/restore status line
+        self.console = self.status.wrap_console(self.console)
 
         # Thrash detection: track consecutive edit failures per file
         # {filepath: {"failures": int, "last_error": str}}
@@ -743,13 +745,7 @@ class ClineAgent:
             _in_tag = False  # currently inside a < ... > sequence
             _suppress = False  # current tag should be suppressed
 
-            def _flush_tag_buf():
-                """Flush buffered tag to stdout (it wasn't a tool tag)."""
-                nonlocal _tag_buf
-                if _tag_buf:
-                    sys.stdout.write(_tag_buf)
-                    sys.stdout.flush()
-                    _tag_buf = ""
+
 
             def on_chunk(c: str):
                 nonlocal chunk_text, first_token, _tag_buf, _in_tag, _suppress
@@ -785,6 +781,7 @@ class ClineAgent:
                         _in_tag = False
                     return
 
+                self.status.clear()
                 sys.stdout.write(c)
                 sys.stdout.flush()
 
@@ -1731,15 +1728,16 @@ class ClineAgent:
                 _sf_had_visible = False
 
                 def _sf_flush():
-                    nonlocal _sf_tag_buf, _sf_had_visible
+                    """Flush buffered tag content to stdout."""
+                    nonlocal _sf_tag_buf, _sf_in_tag, _sf_had_visible
                     if _sf_tag_buf:
-                        # In deferred mode only thinking content is shown live;
-                        # non-thinking buffered tags are rendered via Markdown later.
                         if not _defer_markdown_render:
+                            self.status.clear()
                             sys.stdout.write(_sf_tag_buf)
                             sys.stdout.flush()
                             _sf_had_visible = True
                         _sf_tag_buf = ""
+                        _sf_in_tag = False
 
                 def _sf_char(c: str):
                     """Process a single character through the filter."""
@@ -1833,6 +1831,7 @@ class ClineAgent:
                     # Markdown after the full response; only thinking content
                     # (routed through on_reasoning above) is shown live.
                     if not _defer_markdown_render:
+                        self.status.clear()
                         sys.stdout.write(c)
                         sys.stdout.flush()
                         _sf_had_visible = True
@@ -1951,6 +1950,8 @@ class ClineAgent:
                         sys.stdout.flush()
                         _thinking_started = True
                         _thinking_line_start = True
+                    # Clear status before writing thinking content
+                    self.status.clear()
                     for c in chunk:
                         if _thinking_line_start:
                             # Skip leading blank lines so the block starts tight.
