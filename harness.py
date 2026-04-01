@@ -2789,7 +2789,7 @@ def create_prompt_session(
     - Enter: Submit input
     - Ctrl+Enter: Insert newline (for multiline input)
     - Paste: Multiline paste works automatically
-    - Tab: Complete commands and file paths
+    - Tab: Accept ghost text suggestion, or complete commands and file paths
     - Ctrl+Z: Undo last turn (when prompt is empty)
     - Ctrl+Y: Redo (when prompt is empty)
     - Ctrl+T: Toggle reasoning effort
@@ -2870,6 +2870,20 @@ def create_prompt_session(
                     print(f"  reasoning effort → {new_level}")
                 pt_run_in_terminal(_show)
             event.app.invalidate()
+
+    @bindings.add("tab", eager=True)
+    def _(event):
+        """Tab: accept ghost text suggestion, or cycle/open completions."""
+        buffer = event.current_buffer
+        if buffer.complete_state:
+            # Completion menu is already open — cycle to next item
+            buffer.complete_next()
+        elif buffer.suggestion and buffer.suggestion.text:
+            # Ghost text (auto-suggest) is visible — accept it
+            buffer.insert_text(buffer.suggestion.text)
+        else:
+            # No ghost text, no menu — open the completion dropdown
+            buffer.start_completion()
 
     # Create session with history
     history_file.parent.mkdir(parents=True, exist_ok=True)
