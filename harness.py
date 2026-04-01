@@ -8,6 +8,8 @@ import warnings
 
 # Suppress Pydantic serialization warnings from LiteLLM
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.main")
+# Suppress requests/urllib3 version mismatch warning
+warnings.filterwarnings("ignore", message="urllib3.*doesn't match a supported version", category=Warning)
 
 _BOOT_T0 = _time_mod.perf_counter()
 _boot_marks: list = []  # [(label, elapsed_since_boot)]
@@ -2554,6 +2556,7 @@ class HarnessCompleter(Completer):
         "/tokens",
         "/compact",
         "/cost",
+        "/usage",
         "/maxctx",
         "/todo",
         "/smart",
@@ -3643,6 +3646,18 @@ def main():
                         _render_cost_report(console)
                         continue
 
+                    elif cmd == "/usage":
+                        from harness.usage_report import open_usage_report
+                        from harness.cost_tracker import get_global_tracker
+                        prov_name = _infer_active_provider_profile(agent, providers) or ""
+                        rpath = open_usage_report(
+                            get_global_tracker(),
+                            provider_name=prov_name,
+                            session_name=current_session,
+                        )
+                        console.print(f"  [dim]Opened usage report in browser[/dim]")
+                        continue
+
                     elif cmd == "/bg":
                         procs = agent.list_background_procs()
                         if not procs:
@@ -3891,7 +3906,6 @@ def main():
                                 "replace_in_file",
                                 "execute_command",
                                 "manage_todos",
-                                "create_plan",
                             ]
                             tools_missing = [
                                 t for t in expected_tools if t not in sys_content
@@ -4468,6 +4482,9 @@ def main():
                         )
                         console.print(
                             "  [cyan]/cost[/cyan]                [dim]API usage and cost totals[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/usage[/cyan]               [dim]Open HTML usage report in browser[/dim]"
                         )
                         console.print(
                             "  [cyan]/smart[/cyan]               [dim]Smart context analysis[/dim]"
