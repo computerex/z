@@ -167,7 +167,11 @@ class CodexOAuthClient:
         return headers
 
     def _build_request_body(
-        self, messages: List[CodexMessage], stream: bool = True, system_prompt: str = ""
+        self,
+        messages: List[CodexMessage],
+        stream: bool = True,
+        system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Build request body for Codex API (OpenAI Responses API format).
 
@@ -212,6 +216,10 @@ class CodexOAuthClient:
         # Note: Codex models don't support temperature or max_tokens parameters
         # They use fixed settings optimized for coding tasks
 
+        # Native tool calling
+        if tools:
+            body["tools"] = tools
+
         return body
 
     async def chat_stream(
@@ -221,6 +229,7 @@ class CodexOAuthClient:
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
         system_prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> CodexResponse:
         """Stream chat response from Codex API.
 
@@ -236,7 +245,7 @@ class CodexOAuthClient:
         access_token = await self._ensure_token_valid()
         headers = self._build_headers(access_token)
         body = self._build_request_body(
-            messages, stream=True, system_prompt=system_prompt
+            messages, stream=True, system_prompt=system_prompt, tools=tools
         )
 
         if not self._session:

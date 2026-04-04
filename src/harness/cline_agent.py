@@ -1,4 +1,4 @@
-"""Streaming agent using Cline-style XML tool format."""
+"""Streaming agent with native tool calling via litellm."""
 
 import asyncio
 import sys
@@ -7,7 +7,6 @@ import re
 import time
 import json
 import datetime
-import html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
@@ -59,10 +58,8 @@ from .workspace_index import WorkspaceIndex
 from .instruction_loader import load_instruction_hierarchy, load_subdirectory_instructions
 from .tool_registry import (
     get_tool_names,
-    get_complex_content_tools,
     get_metrics,
-    get_tool_def,
-    get_param_names,
+    tool_defs_to_openai_tools,
 )
 from .logger import get_logger, log_exception, truncate as log_truncate
 
@@ -222,260 +219,15 @@ class ContextContainer:
 
 @dataclass
 class ParsedToolCall:
-    """Parsed tool call from XML format."""
+    """Parsed tool call from model response."""
 
     name: str
     parameters: Dict[str, str]
-
-
-def strip_thinking_blocks(content: str) -> str:
-    """Remove <thinking>/<think> reasoning blocks from content.
-
-    IMPORTANT: Only strips think blocks that appear OUTSIDE tool call tags.
-    Think tags inside tool parameters (e.g. old_text containing literal
-    ``<think>`` in source code) must be preserved — otherwise the tool
-    parser receives mangled content and file edits silently corrupt data.
-    """
-    # Find the first tool-call opening tag.  Everything before it is the
-    # model's preamble / reasoning area where think blocks should be stripped.
-    # Everything from that tag onward is tool XML where literal <think> tags
-    # inside parameters must be left intact.
-    tool_names = get_tool_names()
-    first_tool_pos = len(content)
-    for name in tool_names:
-        idx = content.find(f"<{name}>")
-        if idx != -1 and idx < first_tool_pos:
-            first_tool_pos = idx
-
-    preamble = content[:first_tool_pos]
-    rest = content[first_tool_pos:]
-
-    # Strip think blocks only in the preamble
-    preamble = re.sub(r"<thinking>.*?</thinking>\s*", "", preamble, flags=re.DOTALL)
-    preamble = re.sub(r"</thinking>\s*", "", preamble)
-    preamble = re.sub(r"<think>.*?</think>\s*", "", preamble, flags=re.DOTALL)
-
-    return preamble + rest
-
-
-def _normalize_tool_xml(content: str) -> str:
-    """Fix common model hallucinations in tool call XML.
-
-    Handles the <tool_call>tool_name> hybrid format where the model wraps
-    a standard tool call in <tool_call> instead of using <tool_name> directly.
-    Converts: <tool_call>tool_name>..params..</tool_name>
-    Into:     <tool_name>..params..</tool_name>
-    """
-    tool_names = get_tool_names()
-    tool_names_alt = "|".join(re.escape(n) for n in tool_names)
-    pattern = rf"<tool_call>\s*({tool_names_alt})\s*>"
-    content = re.sub(pattern, lambda m: f"<{m.group(1)}>", content)
-    return content
-
-
-def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
-    """Parse Cline-style XML tool call from content.
-
-    Uses smart matching to handle XML examples embedded in content.
-    For tools with complex content (write_to_file, replace_in_file), uses
-    greedy matching to get the full content including any nested examples.
-    """
-    content = strip_thinking_blocks(content)
-    content = _normalize_tool_xml(content)
-
-    tool_names = get_tool_names()
-
-    # Compatibility parser for shorthand style:
-    # <tool_call>list_files path="." recursive="true" />
-    shorthand_matches = []
-    shorthand_pattern = (
-        r"<tool_call>\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*([^<]*?)(?:/>\s*|>\s*</tool_call>)"
-    )
-    for m in re.finditer(shorthand_pattern, content, re.DOTALL):
-        tool_name = m.group(1)
-        if tool_name not in tool_names:
-            continue
-
-        attr_blob = m.group(2) or ""
-        params: Dict[str, str] = {}
-        for attr in re.finditer(
-            r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))',
-            attr_blob,
-            re.DOTALL,
-        ):
-            key = attr.group(1)
-            value = attr.group(2) or attr.group(3) or attr.group(4) or ""
-            params[key] = html.unescape(value)
-
-        shorthand_matches.append(
-            (m.end(), ParsedToolCall(name=tool_name, parameters=params))
-        )
-
-    if shorthand_matches:
-        shorthand_matches.sort(key=lambda x: x[0], reverse=True)
-        return shorthand_matches[0][1]
-
-    # Tools that may have nested XML examples in their content
-    complex_content_tools = set(get_complex_content_tools())
-
-    # Find ALL tool matches across ALL tool types, track by end position
-    all_matches = []  # (end_pos, tool_name, match)
-
-    for tool_name in tool_names:
-        if tool_name in complex_content_tools:
-            # For complex tools with nested XML examples in content:
-            # Find FIRST opening tag and LAST closing tag to get the outermost block
-            open_tag = f"<{tool_name}>"
-            close_tag = f"</{tool_name}>"
-
-            # Find the FIRST opening tag (the real tool call, not an inner example)
-            first_open = content.find(open_tag)
-            if first_open == -1:
-                continue
-
-            # Find the LAST closing tag (the real closing, not an inner example)
-            last_close = content.rfind(close_tag)
-            if last_close == -1 or last_close < first_open:
-                continue
-
-            # Create a match-like object
-            inner_start = first_open + len(open_tag)
-            inner_content = content[inner_start:last_close]
-
-            class FakeMatch:
-                def __init__(self, start_pos, end_pos, inner):
-                    self._start = start_pos
-                    self._end = end_pos
-                    self._inner = inner
-
-                def end(self):
-                    return self._end
-
-                def group(self, n):
-                    return self._inner if n == 1 else content[self._start : self._end]
-
-            fake_match = FakeMatch(
-                first_open, last_close + len(close_tag), inner_content
-            )
-            all_matches.append((fake_match.end(), tool_name, fake_match))
-        else:
-            # For simple tools, use non-greedy matching
-            pattern = rf"<{tool_name}>(.*?)</{tool_name}>"
-            for match in re.finditer(pattern, content, re.DOTALL):
-                all_matches.append((match.end(), tool_name, match))
-
-    if not all_matches:
-        return None
-
-    # Use the match with the highest end position (last in content)
-    all_matches.sort(key=lambda x: x[0], reverse=True)
-    _, tool_name, match = all_matches[0]
-
-    inner = match.group(1)
-    params = {}
-
-    # Parse parameters - order matters because large payload params may contain nested XML.
-    # Use canonical tool definitions so parser stays aligned with the registry.
-    tool_def = get_tool_def(tool_name)
-    param_names = [p.name for p in tool_def.params] if tool_def else []
-    complex_param_names = {"content", "diff", "replacement", "arguments", "old_text", "new_text"}
-    complex_params = [p for p in param_names if p in complex_param_names]
-    simple_params = [p for p in param_names if p not in complex_param_names]
-
-    # For tools with complex content (write_to_file, replace_in_file),
-    # extract the content/diff FIRST, then only search for other params
-    # in the portion BEFORE <content> or <diff> starts
-    search_area = inner  # default: search entire inner block
-
-    # Find where complex params start (to avoid extracting example XML from content)
-    for cp in complex_params:
-        open_tag = f"<{cp}>"
-        start = inner.find(open_tag)
-        if start != -1:
-            # Only search for simple params BEFORE the complex param starts
-            search_area = inner[:start]
-            break
-
-    for param_name in simple_params:
-        open_tag = f"<{param_name}>"
-        close_tag = f"</{param_name}>"
-        start = search_area.find(open_tag)
-        if start == -1:
-            continue
-        # Use FIRST closing tag for simple params
-        end = search_area.find(close_tag, start)
-        if end == -1:
-            continue
-        value = search_area[start + len(open_tag) : end]
-        value = value.strip("\n")
-        params[param_name] = value
-
-    for param_name in complex_params:
-        open_tag = f"<{param_name}>"
-        close_tag = f"</{param_name}>"
-        start = inner.find(open_tag)
-        if start == -1:
-            continue
-        # Use LAST closing tag for complex params (content may have nested examples)
-        end = inner.rfind(close_tag)
-        if end == -1 or end < start:
-            continue
-        value = inner[start + len(open_tag) : end]
-        # Only strip leading/trailing newlines for complex content, preserve internal structure
-        if param_name in complex_param_names:
-            # For complex content like file content, preserve internal structure but clean edges
-            value = value.strip("\n")
-        else:
-            # For simple params, strip all whitespace
-            value = value.strip()
-        params[param_name] = value
-
-    return ParsedToolCall(name=tool_name, parameters=params)
-
-
-def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
-    """Parse ALL tool calls from content, in the order they appear.
-
-    Unlike parse_xml_tool (which returns only the last match),
-    this returns every non-overlapping tool call so that the agent
-    can execute them sequentially. This is essential for batched
-    operations like adding multiple todo items in one response.
-    """
-    stripped = strip_thinking_blocks(content)
-    stripped = _normalize_tool_xml(stripped)
-
-    tool_names = get_tool_names()
-
-    # Find all <tool_name>...</tool_name> blocks with their positions
-    matches = []  # (start_pos, end_pos, tool_name)
-    for tool_name in tool_names:
-        pattern = rf"<{tool_name}>(.*?)</{tool_name}>"
-        for m in re.finditer(pattern, stripped, re.DOTALL):
-            matches.append((m.start(), m.end(), tool_name, m.group(0)))
-
-    # Sort by start position (order of appearance)
-    matches.sort(key=lambda x: x[0])
-
-    # Remove overlapping matches (keep earliest)
-    filtered = []
-    last_end = -1
-    for start, end, tool_name, raw in matches:
-        if start >= last_end:
-            filtered.append((start, end, tool_name, raw))
-            last_end = end
-
-    # Parse each match into a ParsedToolCall using the existing parser
-    results = []
-    for start, end, tool_name, raw in filtered:
-        parsed = parse_xml_tool(raw)
-        if parsed:
-            results.append(parsed)
-
-    return results
+    tool_call_id: Optional[str] = None
 
 
 class ClineAgent:
-    """Agent using Cline-style XML tool format with streaming."""
+    """Agent using native tool calling with streaming via litellm."""
 
     def __init__(
         self,
@@ -664,9 +416,8 @@ class ClineAgent:
             "You are a highly skilled software engineer in deep analysis mode. "
             "You've been working on a coding task and have gathered information. "
             "Your job right now is to THINK DEEPLY — not to act.\n\n"
-            "CRITICAL: No tools are available. Do NOT output any XML tags like "
-            "<introspect>, <read_file>, <execute_command>, etc. "
-            "Write ONLY natural language prose. Any XML tags will be stripped.\n\n"
+            "CRITICAL: No tools are available in this mode. "
+            "Write ONLY natural language prose.\n\n"
             "Write an extended reasoning monologue — multiple paragraphs. This is your "
             "working memory. Use it to organize your understanding, trace through "
             "details, identify patterns, catch issues, and plan your approach.\n\n"
@@ -745,7 +496,13 @@ class ClineAgent:
             _in_tag = False  # currently inside a < ... > sequence
             _suppress = False  # current tag should be suppressed
 
-
+            def _flush_tag_buf():
+                """Flush buffered tag to stdout (it wasn't a tool tag)."""
+                nonlocal _tag_buf
+                if _tag_buf:
+                    sys.stdout.write(_tag_buf)
+                    sys.stdout.flush()
+                    _tag_buf = ""
 
             def on_chunk(c: str):
                 nonlocal chunk_text, first_token, _tag_buf, _in_tag, _suppress
@@ -971,6 +728,21 @@ class ClineAgent:
                         if getattr(m, "provider_blocks", None)
                         else {}
                     ),
+                    **(
+                        {"tool_calls": m.tool_calls}
+                        if getattr(m, "tool_calls", None)
+                        else {}
+                    ),
+                    **(
+                        {"tool_call_id": m.tool_call_id}
+                        if getattr(m, "tool_call_id", None)
+                        else {}
+                    ),
+                    **(
+                        {"name": m.name}
+                        if getattr(m, "name", None)
+                        else {}
+                    ),
                 }
                 for m in self.messages
             ],
@@ -1003,6 +775,9 @@ class ClineAgent:
                     role=m["role"],
                     content=m["content"],
                     provider_blocks=m.get("provider_blocks"),
+                    tool_calls=m.get("tool_calls"),
+                    tool_call_id=m.get("tool_call_id"),
+                    name=m.get("name"),
                 )
                 for m in data["messages"]
             ]
@@ -1023,7 +798,6 @@ class ClineAgent:
                 if (
                     not isinstance(sys_content, str)
                     or "TOOL USE" not in sys_content
-                    or "read_file" not in sys_content
                 ):
                     self.console.print(
                         "[yellow][!] System prompt appears corrupted - replacing with fresh one[/yellow]"
@@ -1105,15 +879,20 @@ class ClineAgent:
         for msg in reversed(self.messages):
             text = msg.content if isinstance(msg.content, str) else ""
             if msg.role == "assistant":
-                # Extract tool name if any
-                if "<read_file>" in text:
-                    last_action = "reading files"
-                elif "<write_to_file>" in text:
-                    last_action = "writing files"
-                elif "<execute_command>" in text:
-                    last_action = "executing commands"
-                elif "<search_files>" in text:
-                    last_action = "searching code"
+                # Check tool_calls attribute for native tool calling
+                tc_list = getattr(msg, 'tool_calls', None)
+                if tc_list:
+                    tc_names = [tc.get('function', {}).get('name', '') for tc in tc_list if isinstance(tc, dict)]
+                    if any(n in ('read_file',) for n in tc_names):
+                        last_action = "reading files"
+                    elif any(n in ('write_to_file',) for n in tc_names):
+                        last_action = "writing files"
+                    elif any(n in ('execute_command',) for n in tc_names):
+                        last_action = "executing commands"
+                    elif any(n in ('search_files',) for n in tc_names):
+                        last_action = "searching code"
+                    else:
+                        last_action = tc_names[0] if tc_names else "responding"
                 else:
                     last_action = "responding"
                 break
@@ -1435,6 +1214,9 @@ class ClineAgent:
             self._active_client = client
             _client_model = config_key
 
+        # Build native tool definitions for the API tools parameter
+        native_tools = tool_defs_to_openai_tools()
+
         try:
             _hidden_only_retry_count = 0
             _hidden_only_retry_max = 2
@@ -1585,142 +1367,14 @@ class ClineAgent:
                 full_content = ""
                 first_token = True
                 _defer_markdown_render = bool(sys.stdout.isatty())
-                _payload_progress_step = 32 * 1024
-                _payload_next_report = _payload_progress_step
-                _payload_announced = False
-                _stream_payload_enabled = (
-                    os.environ.get("HARNESS_STREAM_CODE_CHANGES", "1") != "0"
-                )
-                _stream_tool_param = {
-                    "write_to_file": "content",
-                    "replace_in_file": "old_text",
-                    "replace_between_anchors": "replacement",
-                }
-                _stream_tool_stack: List[str] = []
-                _stream_in_tag = False
-                _stream_tag_buf = ""
-                _stream_in_payload = False
-                _stream_payload_line = ""
-                _stream_payload_header_printed = False
-                _stream_payload_lines = 0
-                _stream_payload_line_limit = 220
 
-                def _stream_process_tag(raw_tag: str):
-                    nonlocal \
-                        _stream_tool_stack, \
-                        _stream_in_payload, \
-                        _stream_payload_line
-                    tag = raw_tag.strip()
-                    m = re.match(r"</?\s*([a-zA-Z_][a-zA-Z0-9_]*)", tag)
-                    if not m:
-                        # Not a recognized tag shape — if inside a payload,
-                        # emit the raw text (it's literal content like "<1>").
-                        if _stream_in_payload:
-                            _stream_payload_line += raw_tag
-                        return
-                    name = m.group(1)
-                    is_close = tag.startswith("</")
-                    is_self_closing = tag.endswith("/>")
-
-                    if name in _stream_tool_param:
-                        if is_close:
-                            if _stream_tool_stack and _stream_tool_stack[-1] == name:
-                                _stream_tool_stack.pop()
-                        elif not is_self_closing:
-                            _stream_tool_stack.append(name)
-                        return
-
-                    if not _stream_tool_stack:
-                        return
-
-                    active_tool = _stream_tool_stack[-1]
-                    expected_param = _stream_tool_param.get(active_tool)
-                    if not expected_param or name != expected_param:
-                        # Unrecognized tag inside a tool payload (e.g. literal
-                        # <think> in source code) — emit it as-is so the
-                        # "Streaming changes" preview isn't mangled.
-                        if _stream_in_payload:
-                            _stream_payload_line += raw_tag
-                        return
-
-                    if is_close:
-                        _stream_emit_payload_line(force=True)
-                        _stream_in_payload = False
-                    elif not is_self_closing:
-                        _stream_in_payload = True
-                        _stream_payload_line = ""
-
-                def _stream_emit_payload_line(force: bool = False):
-                    nonlocal _stream_payload_line, _stream_payload_lines
-                    nonlocal _stream_payload_header_printed
-
-                    if not _stream_payload_enabled:
-                        _stream_payload_line = ""
-                        return
-
-                    if not force and "\n" not in _stream_payload_line:
-                        return
-
-                    line = _stream_payload_line
-                    if not force:
-                        line, _stream_payload_line = line.split("\n", 1)
-                    else:
-                        _stream_payload_line = ""
-
-                    line = line.rstrip("\r")
-                    if not line.strip():
-                        return
-
-                    if not _stream_payload_header_printed:
-                        self.console.print()
-                        self.console.print("  [dim]• Streaming changes…[/dim]")
-                        _stream_payload_header_printed = True
-
-                    preview = line
-                    if len(preview) > _stream_payload_line_limit:
-                        preview = preview[:_stream_payload_line_limit] + " ..."
-                    self.console.print(f"    [dim]{rich_escape(preview)}[/dim]")
-                    _stream_payload_lines += 1
-
-                def _stream_process_chunk(chunk: str):
-                    nonlocal _stream_in_tag, _stream_tag_buf
-                    nonlocal _stream_in_payload, _stream_payload_line
-                    if not _stream_payload_enabled:
-                        return
-                    for c in chunk:
-                        if _stream_in_tag:
-                            _stream_tag_buf += c
-                            if c == ">":
-                                _stream_process_tag(_stream_tag_buf)
-                                _stream_tag_buf = ""
-                                _stream_in_tag = False
-                            continue
-
-                        if c == "<":
-                            _stream_in_tag = True
-                            _stream_tag_buf = "<"
-                            continue
-
-                        if _stream_in_payload:
-                            _stream_payload_line += c
-                            if c == "\n":
-                                _stream_emit_payload_line()
-                            elif (
-                                len(_stream_payload_line)
-                                >= _stream_payload_line_limit * 2
-                            ):
-                                _stream_emit_payload_line(force=True)
-
-                # ── XML stream filter ────────────────────────────────────
-                # Suppresses raw XML tool tags from the live terminal while
-                # full_content still accumulates everything for parsing.
-                # IMPORTANT: chat_stream_raw passes MULTI-CHARACTER chunks
-                # to on_chunk, so we iterate char-by-char internally.
-                _sf_tool_names = set(get_tool_names()) | {"tool_call"}
+                # ── Stream filter ────────────────────────────────────
+                # With native tool calling, tool invocations come via
+                # structured tool_calls, not in content text. The filter
+                # now only handles <thinking>/<think> tags.
                 _sf_thinking_tags = {
                     "thinking", "think"
                 }  # Both variants: models use <think> or <thinking> for reasoning
-                _sf_suppressing: Optional[str] = None  # tool block being eaten
                 _sf_thinking_suppress = False  # eating content inside <thinking>/<think>
                 _sf_native_reasoning_active = False  # True if native reasoning_content is being used
                 _sf_tag_buf = ""
@@ -1740,24 +1394,16 @@ class ClineAgent:
                         _sf_in_tag = False
 
                 def _sf_char(c: str):
-                    """Process a single character through the filter."""
+                    """Process a single character through the filter.
+
+                    Only handles <thinking>/<think> tag extraction now.
+                    Tool calls are handled via native tool_calls, not content text.
+                    """
                     nonlocal \
-                        _sf_suppressing, \
                         _sf_thinking_suppress, \
                         _sf_tag_buf, \
                         _sf_in_tag, \
                         _sf_had_visible
-
-                    # ── SUPPRESS_BLOCK: eat everything until </tool_name> ──
-                    if _sf_suppressing:
-                        _sf_tag_buf += c
-                        close = f"</{_sf_suppressing}>"
-                        if _sf_tag_buf.endswith(close):
-                            _sf_suppressing = None
-                            _sf_tag_buf = ""
-                        elif len(_sf_tag_buf) > len(close) + 30:
-                            _sf_tag_buf = _sf_tag_buf[-(len(close) + 10) :]
-                        return
 
                     # ── THINKING_SUPPRESS: route content to reasoning display ──
                     if _sf_thinking_suppress:
@@ -1766,15 +1412,12 @@ class ClineAgent:
                             close = f"</{tag}>"
                             if _sf_tag_buf.endswith(close):
                                 text = _sf_tag_buf[: -len(close)]
-                                # Only route to on_reasoning if native reasoning is NOT active
-                                # to avoid double-printing thinking content
                                 if text and not _sf_native_reasoning_active:
                                     on_reasoning(text)
                                 _sf_thinking_suppress = False
                                 _sf_tag_buf = ""
                                 return
                         if len(_sf_tag_buf) > 200:
-                            # Only route to on_reasoning if native reasoning is NOT active
                             if not _sf_native_reasoning_active:
                                 on_reasoning(_sf_tag_buf[:-20])
                             _sf_tag_buf = _sf_tag_buf[-20:]
@@ -1788,13 +1431,7 @@ class ClineAgent:
                             if m:
                                 tag = m.group(1)
                                 is_close = _sf_tag_buf.startswith("</")
-                                if tag in _sf_tool_names:
-                                    if not is_close:
-                                        _sf_suppressing = tag
-                                    _sf_tag_buf = ""
-                                    _sf_in_tag = False
-                                    return
-                                elif tag in _sf_thinking_tags:
+                                if tag in _sf_thinking_tags:
                                     # Skip <thinking> tag extraction if native reasoning is active
                                     # to avoid double-printing thinking content
                                     if _sf_native_reasoning_active:
@@ -1838,11 +1475,7 @@ class ClineAgent:
 
                 def on_chunk(chunk: str):
                     """Handle a (possibly multi-char) streaming chunk."""
-                    nonlocal \
-                        full_content, \
-                        first_token, \
-                        _payload_next_report, \
-                        _payload_announced
+                    nonlocal full_content, first_token
                     full_content += chunk
                     if len(full_content) % 5000 == 0:
                         log.debug(
@@ -1850,7 +1483,6 @@ class ClineAgent:
                             len(full_content),
                             len(chunk),
                         )
-                    _stream_process_chunk(chunk)
                     if first_token:
                         # If native reasoning already started, don't repaint the
                         # status line here; \r-based status updates can overwrite
@@ -1862,49 +1494,7 @@ class ClineAgent:
                         else:
                             self.status.clear()
                         first_token = False
-                    if _defer_markdown_render:
-                        # Always scan every char through the filter so that:
-                        # 1. <think>/<thinking> tags in content are extracted
-                        #    and forwarded to on_reasoning for live display.
-                        # 2. In deferred mode, _sf_char's NORMAL path suppresses
-                        #    stdout writes, so regular content is not doubled.
-                        for c in chunk:
-                            _sf_char(c)
-                        # Payload progress tracking — skip while thinking is live
-                        # to avoid status-line noise interrupting the reasoning display.
-                        if not _thinking_started:
-                            active_tool = None
-                            payload_bytes = 0
-                            for tname in (
-                                "write_to_file",
-                                "replace_in_file",
-                                "replace_between_anchors",
-                            ):
-                                open_tag = f"<{tname}>"
-                                close_tag = f"</{tname}>"
-                                open_pos = full_content.rfind(open_tag)
-                                if open_pos == -1:
-                                    continue
-                                close_pos = full_content.rfind(close_tag)
-                                if close_pos > open_pos:
-                                    continue
-                                active_tool = tname
-                                payload_bytes = len(full_content) - open_pos
-                                break
-
-                            if active_tool and payload_bytes >= _payload_next_report:
-                                if not _payload_announced:
-                                    self.console.print(
-                                        f"  [dim]• Receiving {active_tool}…[/dim]"
-                                    )
-                                    _payload_announced = True
-                                kb = max(1, payload_bytes // 1024)
-                                self.status.update(
-                                    f"Receiving {active_tool} payload ({kb} KB)...",
-                                    StatusLine.STREAMING,
-                                )
-                                _payload_next_report += _payload_progress_step
-                        return
+                    # Scan chars through the filter for <thinking>/<think> extraction
                     for c in chunk:
                         _sf_char(c)
 
@@ -2007,26 +1597,15 @@ class ClineAgent:
                         full_content = ""
                         full_reasoning = ""
                         first_token = True
-                        _payload_announced = False
-                        _payload_next_report = _payload_progress_step
                         _thinking_started = False
                         _thinking_line_start = True
                         _thinking_line_has_text = False
                         # Reset stream filter state
-                        _sf_suppressing = None
                         _sf_thinking_suppress = False
                         _sf_native_reasoning_active = False
                         _sf_tag_buf = ""
                         _sf_in_tag = False
                         _sf_had_visible = False
-                        # Reset payload stream state
-                        _stream_tool_stack.clear()
-                        _stream_in_tag = False
-                        _stream_tag_buf = ""
-                        _stream_in_payload = False
-                        _stream_payload_line = ""
-                        _stream_payload_header_printed = False
-                        _stream_payload_lines = 0
                         api_t0 = time.time()
 
                     try:
@@ -2038,6 +1617,7 @@ class ClineAgent:
                                 check_interrupt=is_interrupted,
                                 enable_web_search=False,
                                 status_line=self.status,
+                                tools=native_tools,
                             )
                         )
                         watcher = asyncio.ensure_future(_interrupt_watcher(api_task))
@@ -2124,24 +1704,14 @@ class ClineAgent:
                                 full_content = ""
                                 full_reasoning = ""
                                 first_token = True
-                                _payload_announced = False
-                                _payload_next_report = _payload_progress_step
                                 _thinking_started = False
                                 _thinking_line_start = True
                                 _thinking_line_has_text = False
-                                _sf_suppressing = None
                                 _sf_thinking_suppress = False
                                 _sf_native_reasoning_active = False
                                 _sf_tag_buf = ""
                                 _sf_in_tag = False
                                 _sf_had_visible = False
-                                _stream_tool_stack.clear()
-                                _stream_in_tag = False
-                                _stream_tag_buf = ""
-                                _stream_in_payload = False
-                                _stream_payload_line = ""
-                                _stream_payload_header_printed = False
-                                _stream_payload_lines = 0
                                 api_t0 = time.time()
                                 continue  # Retry with alternate profile immediately
                             else:
@@ -2206,7 +1776,6 @@ class ClineAgent:
                 if _sf_thinking_suppress and _sf_tag_buf:
                     on_reasoning(_sf_tag_buf)
                     _sf_tag_buf = ""
-                _stream_emit_payload_line(force=True)
                 if _thinking_started:
                     if not _thinking_line_start:
                         sys.stdout.write("\n")
@@ -2290,16 +1859,10 @@ class ClineAgent:
                     response.finish_reason,
                 )
 
-                # Detect truncated output: the model hit max_tokens mid-response.
-                # Only trigger continuation if there's an UNCLOSED tool tag —
-                # meaning the model was genuinely cut off mid-tool-call.
-                # If finish_reason is "length" but all tags are closed, the
-                # response is usable; don't waste iterations on continuation.
-                has_unclosed = self._has_unclosed_tool_tag(full_content)
-
-                if has_unclosed:
+                # Detect truncated output: model hit max_tokens mid-response.
+                if response.is_truncated and not response.tool_calls:
                     log.warning(
-                        "Output truncated (unclosed tool tag) at iteration %d (content_len=%d)",
+                        "Output truncated at iteration %d (content_len=%d, no tool_calls)",
                         iteration + 1,
                         len(full_content),
                     )
@@ -2318,22 +1881,27 @@ class ClineAgent:
                             role="user",
                             content=(
                                 "[SYSTEM: Your output was truncated before completing the tool call. "
-                                "Please continue from where you left off. Do NOT repeat what you already wrote — "
-                                "just output the remaining XML to complete the tool call.]"
+                                "Please continue from where you left off.]"
                             ),
                         )
                     )
                     continue  # next iteration will get the continuation
-                elif response.is_truncated:
-                    # finish_reason was "length" but all tool tags are closed.
-                    # The model finished its work; just log it and proceed.
-                    log.info(
-                        "finish_reason=length but all tool tags closed — proceeding normally (content_len=%d)",
-                        len(full_content),
-                    )
 
-                # Parse ALL XML tool calls from content (not just the last one)
-                all_tool_calls = parse_all_xml_tools(full_content)
+                # Convert native tool_calls from response to ParsedToolCall objects
+                all_tool_calls = []
+                if response.tool_calls:
+                    for _tc_raw in response.tool_calls:
+                        try:
+                            _tc_name = _tc_raw["function"]["name"]
+                            _tc_args_str = _tc_raw["function"].get("arguments", "{}")
+                            _tc_args = json.loads(_tc_args_str) if _tc_args_str else {}
+                            all_tool_calls.append(ParsedToolCall(
+                                name=_tc_name,
+                                parameters=_tc_args,
+                                tool_call_id=_tc_raw.get("id"),
+                            ))
+                        except (KeyError, json.JSONDecodeError) as e:
+                            log.warning("Failed to parse tool call: %s — %s", _tc_raw, e)
                 tool_call = all_tool_calls[-1] if all_tool_calls else None
 
                 if all_tool_calls:
@@ -2426,10 +1994,12 @@ class ClineAgent:
                                 len(ignored_pre),
                             )
                             tool_result = "\n\n".join(tool_results_combined)
+                            _raw_tool_calls = response.tool_calls if response.tool_calls else None
                             self.messages.append(
                                 StreamingMessage(
                                     role="assistant",
                                     content=full_content,
+                                    tool_calls=_raw_tool_calls,
                                     provider_blocks=getattr(
                                         response, "provider_content_blocks", None
                                     ),
@@ -2437,8 +2007,29 @@ class ClineAgent:
                             )
                             self.messages.append(
                                 StreamingMessage(
-                                    role="user",
-                                    content=f"[{tc.name} result]\n{tool_result}",
+                                    role="tool",
+                                    content=tool_result,
+                                    tool_call_id=tc.tool_call_id,
+                                    name=tc.name,
+                                )
+                            )
+                            # Synthetic results for all other ignored tool calls
+                            for _ign in ignored_pre:
+                                self.messages.append(
+                                    StreamingMessage(
+                                        role="tool",
+                                        content="[Not executed — re-issue this tool call.]",
+                                        tool_call_id=_ign.tool_call_id or f"fallback_{_ign.name}",
+                                        name=_ign.name,
+                                    )
+                                )
+                            # Synthetic result for the deferred attempt_completion
+                            self.messages.append(
+                                StreamingMessage(
+                                    role="tool",
+                                    content="[Deferred — complete remaining tools first.]",
+                                    tool_call_id=completion_call.tool_call_id or f"fallback_{completion_call.name}",
+                                    name="attempt_completion",
                                 )
                             )
                             continue
@@ -2450,15 +2041,29 @@ class ClineAgent:
                         len(result_text),
                         bool(command),
                     )
+                    _raw_tool_calls = response.tool_calls if response.tool_calls else None
                     self.messages.append(
                         StreamingMessage(
                             role="assistant",
                             content=full_content,
+                            tool_calls=_raw_tool_calls,
                             provider_blocks=getattr(
                                 response, "provider_content_blocks", None
                             ),
                         )
                     )
+                    # Add a synthetic tool result so every tool_calls has a
+                    # matching role="tool" message.  Without this, providers
+                    # like Copilot reject the next request with 400 Bad Request.
+                    if _raw_tool_calls:
+                        self.messages.append(
+                            StreamingMessage(
+                                role="tool",
+                                content=result_text or "[Task completed]",
+                                tool_call_id=completion_call.tool_call_id or f"fallback_{completion_call.name}",
+                                name="attempt_completion",
+                            )
+                        )
                     # Render the result — stream filter suppressed it during streaming
                     if result_text:
                         if _defer_markdown_render:
@@ -2485,48 +2090,11 @@ class ClineAgent:
                             f.write(f"  tool={tc.name}, params={tc.parameters}\n")
                     print(f"[DEBUG] Saved model output to {debug_file}")
                     print(
-                        f"[DEBUG] parse_all_xml_tools returned: {len(all_tool_calls)} calls"
+                        f"[DEBUG] native tool_calls returned: {len(all_tool_calls)} calls"
                     )
 
                 if not tool_call:
-                    # Detect invalid direct MCP tool-tag usage (e.g. <browser_navigate>).
-                    # MCP tools must be invoked via mcp_call_tool, not direct tags.
-                    tool_names_set = set(get_tool_names())
-                    param_names_set = set(get_param_names())
-                    invalid_tag_names: List[str] = []
-                    for m in re.finditer(r"<([a-zA-Z_][a-zA-Z0-9_]*)>", full_content):
-                        tag = m.group(1)
-                        if tag in tool_names_set or tag in param_names_set:
-                            continue
-                        if tag in ("thinking", "think", "tool_call"):
-                            continue
-                        if "_" in tag:
-                            invalid_tag_names.append(tag)
-
-                    if invalid_tag_names:
-                        bad = ", ".join(sorted(set(invalid_tag_names))[:5])
-                        self.messages.append(
-                            StreamingMessage(
-                                role="assistant",
-                                content=full_content,
-                                provider_blocks=getattr(
-                                    response, "provider_content_blocks", None
-                                ),
-                            )
-                        )
-                        self.messages.append(
-                            StreamingMessage(
-                                role="user",
-                                content=(
-                                    "[SYSTEM: Invalid tool format. Do NOT emit direct tool tags like "
-                                    f"{bad}. MCP tools must be called via <mcp_call_tool> with "
-                                    "<server>, <tool>, and <arguments> JSON. Re-issue only valid harness tool XML.]"
-                                ),
-                            )
-                        )
-                        continue
-
-                    display_text = strip_thinking_blocks(full_content).strip()
+                    display_text = full_content.strip()
 
                     if _defer_markdown_render:
                         display_text = _normalize_display_text(display_text)
@@ -2602,7 +2170,7 @@ class ClineAgent:
                             guidance_msg = (
                                 "Your previous response was incomplete or contained only internal thinking. "
                                 "Please provide a clear, written response to complete the user's request. "
-                                "If you need to use a tool, emit the appropriate tool call in XML format."
+                                "If you need to use a tool, call the appropriate tool."
                             )
                             self.messages.append(
                                 StreamingMessage(role="user", content=guidance_msg)
@@ -2613,36 +2181,6 @@ class ClineAgent:
 
                             # Continue to next iteration to try again
                             continue
-
-                    # If the model tried native function calling (tool_calls finish_reason)
-                    # but no XML tool calls were found, nudge it to use XML format.
-                    if response.finish_reason == "tool_calls" and not all_tool_calls:
-                        log.warning(
-                            "Model used native tool_calls instead of XML — sending format nudge"
-                        )
-                        self.messages.append(
-                            StreamingMessage(
-                                role="assistant",
-                                content=full_content,
-                                provider_blocks=getattr(
-                                    response, "provider_content_blocks", None
-                                ),
-                            )
-                        )
-                        self.messages.append(
-                            StreamingMessage(
-                                role="user",
-                                content=(
-                                    "[SYSTEM: You used native function calling, but this system requires XML tool format. "
-                                    "Re-issue your tool call as XML. Example:\n"
-                                    "<read_file>\n<path>filename</path>\n</read_file>"
-                                ),
-                            )
-                        )
-                        self.console.print(
-                            "\n  [dim]→ Model used native tool calling. Nudging to use XML format...[/dim]\n"
-                        )
-                        continue
 
                     # No tool call — final response to user
                     self.messages.append(
@@ -2719,18 +2257,20 @@ class ClineAgent:
 
                 tool_result = "\n\n".join(tool_results_combined)
 
-                # Add to history
+                # Add assistant message with tool_calls to history
+                _raw_tool_calls = response.tool_calls if response.tool_calls else None
                 self.messages.append(
                     StreamingMessage(
                         role="assistant",
                         content=full_content,
+                        tool_calls=_raw_tool_calls,
                         provider_blocks=getattr(
                             response, "provider_content_blocks", None
                         ),
                     )
                 )
 
-                # Build tool result message
+                # Build tool result message as role="tool" with tool_call_id
                 header_parts = []
 
                 # Active todos at top for grounding
@@ -2756,20 +2296,32 @@ class ClineAgent:
                     header_parts.append(todo_hint)
 
                 header = "\n".join(header_parts)
-                # Label: for multi-tool batches show count; for single tool
-                # use the actual tool name (tc is the last *executed* tool).
-                if len(tool_results_combined) > 1:
-                    _result_label = f"tool results ({len(tool_results_combined)} calls)"
-                else:
-                    _result_label = f"{tc.name} result"
                 if header:
-                    result_content = f"{header}\n\n[{_result_label}]\n{tool_result}"
+                    result_content = f"{header}\n\n{tool_result}"
                 else:
-                    result_content = f"[{_result_label}]\n{tool_result}"
+                    result_content = tool_result
 
                 self.messages.append(
-                    StreamingMessage(role="user", content=result_content)
+                    StreamingMessage(
+                        role="tool",
+                        content=result_content,
+                        tool_call_id=tc.tool_call_id,
+                        name=tc.name,
+                    )
                 )
+
+                # Add synthetic tool results for ignored tool calls so every
+                # tool_calls entry has a matching role="tool" message.
+                # Without this, APIs like Copilot reject with 400.
+                for _ignored_tc in ignored_tools:
+                    self.messages.append(
+                        StreamingMessage(
+                            role="tool",
+                            content="[Not executed — 1 tool per turn policy. Re-issue this tool call.]",
+                            tool_call_id=_ignored_tc.tool_call_id or f"fallback_{_ignored_tc.name}",
+                            name=_ignored_tc.name,
+                        )
+                    )
 
             log.warning("Max iterations reached (%d)", self.max_iterations)
             self.status.clear()
@@ -2778,23 +2330,6 @@ class ClineAgent:
             self._active_client = None
             if client is not None:
                 await client.__aexit__(None, None, None)
-
-    # Tool tag names — derived from the single registry
-    _TOOL_TAGS = get_tool_names()
-
-    @staticmethod
-    def _has_unclosed_tool_tag(content: str) -> bool:
-        """Detect if the content has an opening tool XML tag without a matching close.
-
-        This indicates the model's output was truncated mid-tool-call,
-        even if finish_reason wasn't set to 'length' by the API.
-        """
-        for tag in ClineAgent._TOOL_TAGS:
-            open_tag = f"<{tag}>"
-            close_tag = f"</{tag}>"
-            if open_tag in content and close_tag not in content:
-                return True
-        return False
 
     async def _execute_tool(self, tool: ParsedToolCall) -> str:
         """Execute a tool call and return the result."""

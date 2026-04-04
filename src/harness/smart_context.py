@@ -1518,20 +1518,9 @@ class SmartContextManager:
         if content.startswith("[Deep analysis complete"):
             return "introspect_result", "introspect"
 
-        # Assistant messages
+        # Assistant messages (with native tool calling, tool calls are in
+        # the tool_calls field, not embedded as XML in the content)
         if role == "assistant":
-            has_tool_xml = bool(
-                re.search(
-                    r"<(?:read_file|write_to_file|replace_in_file|execute_command"
-                    r"|search_files|list_files|manage_todos"
-                    r"|list_context|remove_from_context|analyze_image|web_search"
-                    r"|check_background_process|stop_background_process"
-                    r"|list_background_processes|introspect)\b",
-                    content,
-                )
-            )
-            if has_tool_xml:
-                return "assistant_tool_call", "tool_call"
             return "assistant_analysis", "analysis"
 
         return "other", ""
@@ -1624,29 +1613,9 @@ class SmartContextManager:
             return notice, summary
 
         if msg_type == "assistant_tool_call":
-            # Keep the XML tool call, compress the reasoning before it.
-            xml_match = re.search(
-                r"(<(?:read_file|write_to_file|replace_in_file|execute_command"
-                r"|search_files|list_files|manage_todos"
-                r"|list_context|remove_from_context|analyze_image|web_search"
-                r"|check_background_process|stop_background_process"
-                r"|list_background_processes)\b.*)",
-                content,
-                re.DOTALL,
-            )
-            if xml_match:
-                xml_part = xml_match.group(1)
-                pre_xml = content[: xml_match.start()].strip()
-                if pre_xml:
-                    first_sentence = re.split(r"[.\n]", pre_xml)[0][:120]
-                    summary = first_sentence
-                    notice = f"[{COMPACT_MARKER} {first_sentence}]\n\n{xml_part}"
-                else:
-                    summary = "tool call"
-                    notice = xml_part
-                return notice, summary
-            # fallthrough
-            summary = lines[0][:120] if lines else "assistant response"
+            # With native tool calling, tool calls are in the tool_calls field,
+            # not embedded as XML in the content. Compact the reasoning text.
+            summary = lines[0][:120] if lines else "tool call"
             trace = CompactionTrace("assistant", source, summary)
             return trace.format_notice(), summary
 

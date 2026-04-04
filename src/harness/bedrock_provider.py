@@ -232,6 +232,7 @@ class BedrockClient:
         messages: List[BedrockMessage],
         on_content: Optional[callable] = None,
         on_thinking: Optional[callable] = None,
+        tools: Optional[list] = None,
     ):
         """Stream chat response from Bedrock.
 
@@ -265,6 +266,23 @@ class BedrockClient:
 
         if system_content:
             request["system"] = system_content
+
+        # Convert OpenAI tool format to Bedrock toolConfig format
+        if tools:
+            bedrock_tools = []
+            for t in tools:
+                fn = t.get("function", {})
+                bedrock_tools.append({
+                    "toolSpec": {
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description", ""),
+                        "inputSchema": {
+                            "json": fn.get("parameters", {}),
+                        },
+                    }
+                })
+            if bedrock_tools:
+                request["toolConfig"] = {"tools": bedrock_tools}
 
         # Stream from Bedrock, auto-retry with us. prefix if bare model ID is rejected
         try:

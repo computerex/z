@@ -73,32 +73,43 @@ litellm = None
 acompletion = None
 
 
-class _SSEFallback(Exception):
-    """Raised by _chat_stream_raw_sse to signal fallback to LiteLLM."""
-    pass
-
-
 class LiteLLMNotInstalled:
     def __init__(self, *args, **kwargs):
         raise ImportError("LiteLLM required. Install: pip install litellm")
 
 
 @dataclass
-@dataclass
 class StreamingMessage:
     """Message format for chat."""
 
-    role: str
+    role: str  # "system", "user", "assistant", "tool"
     content: Union[str, List[Dict[str, Any]]]
     provider_blocks: Optional[List[Dict[str, Any]]] = (
         None  # For compatibility with cline_agent
     )
+    # Native tool calling fields
+    tool_calls: Optional[List[Dict[str, Any]]] = None  # For assistant messages
+    tool_call_id: Optional[str] = None  # For tool result messages
+    name: Optional[str] = None  # Tool name for tool result messages
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for API."""
-        if isinstance(self.content, str):
-            return {"role": self.role, "content": self.content}
-        return {"role": self.role, "content": self.content}
+        d: Dict[str, Any] = {"role": self.role}
+        # Assistant messages with tool_calls: content can be null
+        if self.role == "assistant" and self.tool_calls:
+            d["content"] = self.content if self.content else None
+            d["tool_calls"] = self.tool_calls
+        elif self.role == "tool":
+            d["content"] = str(self.content) if self.content else ""
+            if self.tool_call_id:
+                d["tool_call_id"] = self.tool_call_id
+            if self.name:
+                d["name"] = self.name
+        else:
+            d["content"] = self.content
+            if self.tool_calls:
+                d["tool_calls"] = self.tool_calls
+        return d
 
 
 @dataclass
@@ -117,6 +128,8 @@ class StreamingChatResponse:
     web_search_results: Optional[List[Dict[str, Any]]] = (
         None  # For compatibility with cline_agent
     )
+    # Native tool calling
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 def _extract_reasoning_details_text(value: Any) -> str:
@@ -404,29 +417,6 @@ class StreamingJSONClient:
         else:
             return "litellm_openai_compat"
 
-    def _is_openai_compat_proxy(self) -> bool:
-        """Check if this is an OpenAI-compatible proxy (not a native provider).
-
-        Returns True when we should use raw SSE to preserve non-standard
-        fields like ``reasoning`` that LiteLLM's stream processor drops.
-        """
-        if not self.base_url:
-            return False
-        url = self.base_url.lower()
-        # These are native provider endpoints where LiteLLM handles
-        # reasoning correctly (or where raw SSE would break):
-        native_urls = [
-            "api.anthropic.com",
-            "api.deepseek.com",
-            "api.groq.com",
-            "localhost:11434",  # ollama
-        ]
-        # Bedrock is handled separately via _is_bedrock
-        for native in native_urls:
-            if native in url:
-                return False
-        return True
-
     async def __aenter__(self):
         """Async context manager entry."""
         return self
@@ -436,162 +426,13 @@ class StreamingJSONClient:
         # LiteLLM handles cleanup internally
         pass
 
-    async def _chat_stream_raw_sse(
-        self,
-        messages: List[StreamingMessage],
-        on_content: Optional[Callable[[str], None]] = None,
-        on_reasoning: Optional[Callable[[str], None]] = None,
-        check_interrupt: Optional[Callable[[], bool]] = None,
-    ) -> StreamingChatResponse:
-        """Stream chat via raw SSE for OpenAI-compatible APIs.
-
-        Bypasses LiteLLM's stream processing which drops non-standard fields
-        like ``reasoning`` (used by NanoGPT / kimi).  Falls back to the
-        LiteLLM path on any transport-level error so that provider-specific
-        quirks are still handled.
-        """
-        import httpx
-        import json as _json
-
-        full_content = ""
-        full_reasoning = ""
-        usage: Dict[str, int] = {}
-        finish_reason = "stop"
-        interrupted = False
-
-        url = self.base_url.rstrip("/") + "/chat/completions"
-        body: Dict[str, Any] = {
-            "model": self.model,  # Use original model name, not LiteLLM-normalized
-            "messages": [m.to_dict() for m in messages],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if self.reasoning_effort and self.reasoning_effort != "none":
-            body["reasoning_effort"] = self.reasoning_effort
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout)) as http:
-                async with http.stream(
-                    "POST", url, json=body, headers=headers,
-                ) as resp:
-                    if resp.status_code != 200:
-                        # Non-200 → let LiteLLM handle it (better error messages)
-                        raise _SSEFallback(f"HTTP {resp.status_code}")
-
-                    async for raw_line in resp.aiter_lines():
-                        if check_interrupt and check_interrupt():
-                            interrupted = True
-                            finish_reason = "interrupted"
-                            break
-
-                        line = raw_line.strip()
-                        if not line or not line.startswith("data: "):
-                            continue
-                        payload = line[6:]
-                        if payload == "[DONE]":
-                            break
-
-                        try:
-                            obj = _json.loads(payload)
-                        except _json.JSONDecodeError:
-                            continue
-
-                        choices = obj.get("choices") or []
-                        if not choices:
-                            # Usage-only chunk (some providers send usage after [DONE]-like choices)
-                            u = obj.get("usage")
-                            if u:
-                                usage = {
-                                    "prompt_tokens": u.get("prompt_tokens", 0),
-                                    "completion_tokens": u.get("completion_tokens", 0),
-                                    "total_tokens": u.get("total_tokens", 0),
-                                }
-                            continue
-
-                        delta = choices[0].get("delta", {})
-
-                        # -- reasoning (check all known field names) --
-                        r_text = (
-                            delta.get("reasoning_content")
-                            or delta.get("reasoning")
-                            or delta.get("thinking")
-                        )
-                        if not r_text:
-                            psf = delta.get("provider_specific_fields") or {}
-                            for _k in ("thinking", "reasoning", "reasoning_content"):
-                                if psf.get(_k):
-                                    r_text = psf[_k]
-                                    break
-                        if r_text:
-                            full_reasoning += r_text
-                            if on_reasoning:
-                                on_reasoning(r_text)
-
-                        # -- content --
-                        c_text = delta.get("content")
-                        if c_text:
-                            full_content += c_text
-                            if on_content:
-                                on_content(c_text)
-
-                        # -- debug --
-                        if os.environ.get("HARNESS_DEBUG_THINKING") and (r_text or c_text):
-                            import pathlib
-                            dbg_path = pathlib.Path.home() / ".harness_thinking_debug.txt"
-                            with open(dbg_path, "a", encoding="utf-8") as _f:
-                                if r_text:
-                                    _f.write(f"[REASONING] {r_text!r}\n")
-                                if c_text:
-                                    _f.write(f"[CONTENT]   {c_text!r}\n")
-
-                        # -- usage / finish_reason --
-                        u = obj.get("usage")
-                        if u:
-                            usage = {
-                                "prompt_tokens": u.get("prompt_tokens", 0),
-                                "completion_tokens": u.get("completion_tokens", 0),
-                                "total_tokens": u.get("total_tokens", 0),
-                            }
-                        fr = choices[0].get("finish_reason")
-                        if fr:
-                            finish_reason = fr
-
-            return StreamingChatResponse(
-                content=full_content,
-                thinking=full_reasoning or None,
-                raw_json=full_content,
-                usage=usage if usage else None,
-                finish_reason=finish_reason,
-                interrupted=interrupted,
-                is_truncated=finish_reason == "length",
-            )
-
-        except _SSEFallback:
-            raise  # Re-raise to trigger LiteLLM fallback in caller
-        except asyncio.CancelledError:
-            return StreamingChatResponse(
-                content=full_content,
-                thinking=full_reasoning or None,
-                raw_json=full_content,
-                usage=usage if usage else None,
-                finish_reason="interrupted",
-                interrupted=True,
-            )
-        except Exception as e:
-            # Connection errors, timeouts, etc → fall back to LiteLLM
-            raise _SSEFallback(str(e))
-
     async def _chat_stream_raw_litellm(
         self,
         messages: List[StreamingMessage],
         on_content: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> StreamingChatResponse:
         """Stream chat using LiteLLM."""
         full_content = ""
@@ -599,6 +440,10 @@ class StreamingJSONClient:
         usage = {}
         finish_reason = "stop"
         interrupted = False
+
+        # Accumulate tool_calls from streaming chunks
+        # Each tool call is identified by its index in the array
+        _tool_call_accum: Dict[int, Dict[str, Any]] = {}  # index -> {id, type, function: {name, arguments}}
 
         # Convert messages to LiteLLM format
         litellm_messages = [m.to_dict() for m in messages]
@@ -633,6 +478,11 @@ class StreamingJSONClient:
             kwargs["tool_stream"] = True
             kwargs["clear_thinking"] = False
 
+        # Pass reasoning_effort for providers that support it (e.g. OpenAI o-series).
+        # LiteLLM's drop_params=True will strip it for unsupported providers.
+        if self.reasoning_effort and self.reasoning_effort != "none":
+            kwargs["reasoning_effort"] = self.reasoning_effort
+
         # Add API key
         if self.api_key:
             kwargs["api_key"] = self.api_key
@@ -647,6 +497,10 @@ class StreamingJSONClient:
 
         # Add timeout
         kwargs["timeout"] = self.timeout
+
+        # Add native tool calling
+        if tools:
+            kwargs["tools"] = tools
 
         try:
             # Get streaming response (lazy import litellm)
@@ -682,6 +536,34 @@ class StreamingJSONClient:
                         if on_reasoning:
                             on_reasoning(reasoning_content)
 
+                    # Native tool calls (streaming)
+                    delta_tool_calls = getattr(delta, "tool_calls", None)
+                    if delta_tool_calls:
+                        for tc_chunk in delta_tool_calls:
+                            idx = getattr(tc_chunk, "index", 0) if hasattr(tc_chunk, "index") else (tc_chunk.get("index", 0) if isinstance(tc_chunk, dict) else 0)
+                            if idx not in _tool_call_accum:
+                                _tool_call_accum[idx] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            acc = _tool_call_accum[idx]
+                            # Extract fields (handle both object and dict)
+                            _tc_id = getattr(tc_chunk, "id", None) if hasattr(tc_chunk, "id") else (tc_chunk.get("id") if isinstance(tc_chunk, dict) else None)
+                            _tc_type = getattr(tc_chunk, "type", None) if hasattr(tc_chunk, "type") else (tc_chunk.get("type") if isinstance(tc_chunk, dict) else None)
+                            _tc_fn = getattr(tc_chunk, "function", None) if hasattr(tc_chunk, "function") else (tc_chunk.get("function") if isinstance(tc_chunk, dict) else None)
+                            if _tc_id:
+                                acc["id"] = _tc_id
+                            if _tc_type:
+                                acc["type"] = _tc_type
+                            if _tc_fn:
+                                fn_name = getattr(_tc_fn, "name", None) if hasattr(_tc_fn, "name") else (_tc_fn.get("name") if isinstance(_tc_fn, dict) else None)
+                                fn_args = getattr(_tc_fn, "arguments", None) if hasattr(_tc_fn, "arguments") else (_tc_fn.get("arguments") if isinstance(_tc_fn, dict) else None)
+                                if fn_name:
+                                    acc["function"]["name"] = fn_name
+                                if fn_args:
+                                    acc["function"]["arguments"] += fn_args
+
                 # Extract usage info
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage = {
@@ -699,6 +581,11 @@ class StreamingJSONClient:
                         or finish_reason
                     )
 
+            # Build final tool_calls list from accumulated chunks
+            final_tool_calls = None
+            if _tool_call_accum:
+                final_tool_calls = [_tool_call_accum[i] for i in sorted(_tool_call_accum.keys())]
+
             return StreamingChatResponse(
                 content=full_content,
                 thinking=full_reasoning or None,
@@ -707,6 +594,7 @@ class StreamingJSONClient:
                 finish_reason=finish_reason,
                 interrupted=interrupted,
                 is_truncated=finish_reason == "length",
+                tool_calls=final_tool_calls,
             )
 
         except asyncio.CancelledError:
@@ -729,6 +617,7 @@ class StreamingJSONClient:
         on_content: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> StreamingChatResponse:
         """Stream using custom Bedrock provider for bearer token auth."""
         import concurrent.futures
@@ -744,6 +633,7 @@ class StreamingJSONClient:
                 messages=bedrock_messages,
                 on_content=on_content,
                 on_thinking=on_reasoning,
+                tools=tools,
             )
 
         loop = asyncio.get_event_loop()
@@ -772,6 +662,7 @@ class StreamingJSONClient:
         on_content: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> StreamingChatResponse:
         """Stream using Codex OAuth client."""
         if not self._codex_client:
@@ -806,6 +697,7 @@ class StreamingJSONClient:
                 on_reasoning=on_reasoning,
                 check_interrupt=check_interrupt,
                 system_prompt=system_prompt,
+                tools=tools,
             )
 
         return StreamingChatResponse(
@@ -824,6 +716,7 @@ class StreamingJSONClient:
         on_content: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> StreamingChatResponse:
         """Stream using GitHub Copilot OAuth client."""
         if not self._copilot_client:
@@ -833,18 +726,26 @@ class StreamingJSONClient:
 
         # Convert StreamingMessage to CopilotMessage with reasoning context
         copilot_messages = []
+        # Find the index of the LAST assistant message to attach reasoning_opaque.
+        # Previously this checked `i == len(messages) - 1` which only worked when
+        # the last message was an assistant message.  In tool-calling flows the last
+        # message is a tool result (role="tool"), so reasoning_opaque was never sent
+        # back, degrading multi-turn reasoning context.
+        last_assistant_idx = -1
+        if self._copilot_reasoning_opaque:
+            for _i in range(len(messages) - 1, -1, -1):
+                if messages[_i].role == "assistant":
+                    last_assistant_idx = _i
+                    break
         for i, m in enumerate(messages):
             msg = CopilotMessage(
                 role=m.role,
                 content=m.content,
+                tool_calls=getattr(m, 'tool_calls', None),
+                tool_call_id=getattr(m, 'tool_call_id', None),
+                name=getattr(m, 'name', None),
             )
-            # For assistant messages, check if this is the last assistant message
-            # and if we have a stored reasoning_opaque from the last response
-            if (
-                m.role == "assistant"
-                and i == len(messages) - 1
-                and self._copilot_reasoning_opaque
-            ):
+            if i == last_assistant_idx:
                 msg.reasoning_opaque = self._copilot_reasoning_opaque
             copilot_messages.append(msg)
 
@@ -856,6 +757,7 @@ class StreamingJSONClient:
                 on_content=on_content,
                 on_reasoning=on_reasoning,
                 check_interrupt=check_interrupt,
+                tools=tools,
             )
 
         # Store reasoning_opaque for multi-turn context
@@ -872,6 +774,7 @@ class StreamingJSONClient:
             finish_reason=response.finish_reason,
             interrupted=response.interrupted,
             is_truncated=response.finish_reason == "length",
+            tool_calls=response.tool_calls,
         )
 
     async def chat_stream_raw(
@@ -882,6 +785,7 @@ class StreamingJSONClient:
         check_interrupt: Optional[Callable[[], bool]] = None,
         enable_web_search: bool = False,
         status_line: Optional[Any] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> StreamingChatResponse:
         """Stream raw text response (no JSON parsing).
 
@@ -905,6 +809,7 @@ class StreamingJSONClient:
                 on_content=on_content,
                 on_reasoning=on_reasoning,
                 check_interrupt=check_interrupt,
+                tools=tools,
             )
         elif self._is_oauth and self._codex_client:
             # Use Codex OAuth client for ChatGPT Plus/Pro tokens
@@ -913,6 +818,7 @@ class StreamingJSONClient:
                 on_content=on_content,
                 on_reasoning=on_reasoning,
                 check_interrupt=check_interrupt,
+                tools=tools,
             )
         elif self._is_bedrock and self._bedrock_client:
             # Use custom Bedrock provider for bearer token auth
@@ -921,27 +827,19 @@ class StreamingJSONClient:
                 on_content=on_content,
                 on_reasoning=on_reasoning,
                 check_interrupt=check_interrupt,
+                tools=tools,
             )
         else:
-            # For OpenAI-compatible proxy APIs (NanoGPT, OpenRouter, etc.),
-            # use raw SSE streaming to preserve non-standard fields like
-            # `reasoning` that LiteLLM's stream processor drops.
-            # Falls back to LiteLLM on any transport error.
-            if self._is_openai_compat_proxy():
-                try:
-                    return await self._chat_stream_raw_sse(
-                        messages=messages,
-                        on_content=on_content,
-                        on_reasoning=on_reasoning,
-                        check_interrupt=check_interrupt,
-                    )
-                except _SSEFallback:
-                    pass  # Fall through to LiteLLM
+            # Use LiteLLM for all non-OAuth/non-Bedrock providers.
+            # LiteLLM normalizes tool calling, reasoning extraction, and
+            # streaming across 100+ providers so we don't need per-provider
+            # SSE parsing.
             return await self._chat_stream_raw_litellm(
                 messages=messages,
                 on_content=on_content,
                 on_reasoning=on_reasoning,
                 check_interrupt=check_interrupt,
+                tools=tools,
             )
 
     async def chat_stream(

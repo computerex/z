@@ -12,11 +12,14 @@ Based on opencode's implementation:
 
 import json
 import asyncio
+import logging
 from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass, field
 import aiohttp
 
 from .oauth import OAuthToken
+
+log = logging.getLogger("harness.copilot")
 
 # GitHub Copilot API endpoints
 COPILOT_API_BASE = "https://api.githubcopilot.com"
@@ -66,14 +69,44 @@ class CopilotMessage:
     reasoning_opaque: Optional[str] = None
     # Store reasoning text for display
     reasoning_text: Optional[str] = None
+    # Native tool calling fields
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to API format."""
-        msg: Dict[str, Any] = {"role": self.role, "content": self.content}
+        msg: Dict[str, Any] = {"role": self.role}
+
+        # For assistant messages with tool_calls, content can be null
+        if self.role == "assistant" and self.tool_calls:
+            msg["content"] = self.content if self.content else None
+            msg["tool_calls"] = self.tool_calls
+        elif self.role == "tool":
+            # Tool result messages: content must be a string
+            msg["content"] = str(self.content) if self.content else ""
+            # tool_call_id is REQUIRED on tool messages — without it the
+            # Copilot API returns 400 Bad Request.
+            if self.tool_call_id:
+                msg["tool_call_id"] = self.tool_call_id
+            else:
+                # Generate a fallback ID so the message is still valid
+                import hashlib
+                fallback_id = "call_" + hashlib.md5(
+                    (str(self.content)[:100] + (self.name or "")).encode()
+                ).hexdigest()[:24]
+                msg["tool_call_id"] = fallback_id
+                log.warning("Tool message missing tool_call_id, generated fallback: %s", fallback_id)
+        else:
+            msg["content"] = self.content
 
         # For assistant messages with reasoning, include provider metadata
         if self.role == "assistant" and self.reasoning_opaque:
             msg["reasoning_opaque"] = self.reasoning_opaque
+
+        # Tool name for tool result messages
+        if self.name and self.role == "tool":
+            msg["name"] = self.name
 
         return msg
 
@@ -89,6 +122,8 @@ class CopilotResponse:
     usage: Optional[Dict[str, int]] = None
     finish_reason: str = "stop"
     interrupted: bool = False
+    # Native tool calling
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class CopilotOAuthClient:
@@ -143,18 +178,32 @@ class CopilotOAuthClient:
             await self._session.close()
             self._session = None
 
-    def _build_headers(self) -> Dict[str, str]:
-        """Build headers for Copilot API request."""
+    def _build_headers(self, messages: Optional[List["CopilotMessage"]] = None) -> Dict[str, str]:
+        """Build headers for Copilot API request.
+
+        The x-initiator header is set dynamically based on the last message role,
+        matching opencode's behavior: 'agent' when last message is not from user.
+        """
+        # Determine if this is an agent-initiated request (tool loop, not direct user message)
+        is_agent = True
+        if messages:
+            last = messages[-1] if messages else None
+            if last and last.role == "user":
+                is_agent = False
         return {
             "Authorization": f"Bearer {self.oauth_token.access_token}",
             "Content-Type": "application/json",
             "User-Agent": "harness/1.0.0",
-            "x-initiator": "agent",
+            "x-initiator": "agent" if is_agent else "user",
             "Openai-Intent": "conversation-edits",
+            "Copilot-Integration-Id": "vscode-chat",
         }
 
     def _build_request_body(
-        self, messages: List[CopilotMessage], stream: bool = True
+        self,
+        messages: List[CopilotMessage],
+        stream: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Build request body for Copilot API with reasoning support."""
         body: Dict[str, Any] = {
@@ -173,6 +222,10 @@ class CopilotOAuthClient:
         if self.max_tokens:
             body["max_tokens"] = self.max_tokens
 
+        # Native tool calling
+        if tools:
+            body["tools"] = tools
+
         return body
 
     def _has_vision_content(self, messages: List[CopilotMessage]) -> bool:
@@ -190,12 +243,24 @@ class CopilotOAuthClient:
         on_content: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> CopilotResponse:
         """Stream chat response from Copilot API with reasoning support."""
-        headers = self._build_headers()
+        headers = self._build_headers(messages)
         if self._has_vision_content(messages):
             headers["Copilot-Vision-Request"] = "true"
-        body = self._build_request_body(messages, stream=True)
+        body = self._build_request_body(messages, stream=True, tools=tools)
+
+        # Copilot API enforces max 40-char tool_call IDs (opencode issue #12653).
+        # Truncate any oversized IDs in message history to prevent 400 errors.
+        for msg_dict in body.get("messages", []):
+            for tc in msg_dict.get("tool_calls", []) or []:
+                if isinstance(tc.get("id"), str) and len(tc["id"]) > 40:
+                    tc["id"] = tc["id"][:40]
+            # Also truncate tool_call_id in tool result messages
+            tcid = msg_dict.get("tool_call_id")
+            if isinstance(tcid, str) and len(tcid) > 40:
+                msg_dict["tool_call_id"] = tcid[:40]
 
         if not self._session:
             self._session = aiohttp.ClientSession()
@@ -206,9 +271,32 @@ class CopilotOAuthClient:
         usage = {}
         finish_reason = "stop"
         interrupted = False
+        _tool_call_accum: Dict[int, Dict[str, Any]] = {}
 
         try:
             url = f"{self.base_url}{COPILOT_CHAT_ENDPOINT}"
+
+            # Debug: log the request body structure for diagnosing 400 errors
+            if log.isEnabledFor(logging.DEBUG):
+                _msg_summary = []
+                for _m in body.get("messages", []):
+                    _role = _m.get("role", "?")
+                    _has_tc = "tool_calls" in _m
+                    _has_tcid = "tool_call_id" in _m
+                    _content_type = type(_m.get("content")).__name__
+                    _content_len = len(str(_m.get("content", "")))
+                    _msg_summary.append(
+                        f"{_role}(content={_content_type}:{_content_len}"
+                        f"{',tool_calls' if _has_tc else ''}"
+                        f"{',tool_call_id=' + _m['tool_call_id'] if _has_tcid else ''})"
+                    )
+                log.debug(
+                    "Copilot request: model=%s tools=%d messages=[%s]",
+                    body.get("model"),
+                    len(body.get("tools", [])),
+                    ", ".join(_msg_summary),
+                )
+
             async with self._session.post(
                 url,
                 headers=headers,
@@ -224,8 +312,36 @@ class CopilotOAuthClient:
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
+                    # Try to parse JSON error for more detail
+                    error_detail = error_text
+                    try:
+                        err_json = json.loads(error_text)
+                        if isinstance(err_json, dict):
+                            # OpenAI-style: {"error": {"message": "...", "type": "..."}}
+                            inner = err_json.get("error", {})
+                            if isinstance(inner, dict) and inner.get("message"):
+                                error_detail = f"{inner.get('type', 'error')}: {inner['message']}"
+                            elif err_json.get("message"):
+                                error_detail = err_json["message"]
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                    # Dump request body for debugging 400 errors
+                    if response.status == 400:
+                        import pathlib
+                        dbg_path = pathlib.Path.home() / ".harness_copilot_400_debug.json"
+                        try:
+                            debug_obj = {
+                                "error_status": response.status,
+                                "error_detail": error_detail,
+                                "error_raw": error_text,
+                                "request_body": body,
+                            }
+                            dbg_path.write_text(json.dumps(debug_obj, indent=2, default=str), encoding="utf-8")
+                            log.error("400 Bad Request — full debug dumped to %s", dbg_path)
+                        except Exception:
+                            pass
                     raise RuntimeError(
-                        f"Copilot API error {response.status}: {error_text}"
+                        f"Copilot API error {response.status}: {error_detail}"
                     )
 
                 # Process SSE stream
@@ -262,11 +378,33 @@ class CopilotOAuthClient:
                                 on_content(content)
 
                         # Reasoning content (for Claude models through Copilot)
-                        reasoning = delta.get("reasoning_text", "")
+                        reasoning = delta.get("reasoning_text", "") or delta.get("reasoning_content", "")
                         if reasoning:
                             full_reasoning += reasoning
                             if on_reasoning:
                                 on_reasoning(reasoning)
+
+                        # Tool calls (streaming — chunks arrive indexed)
+                        delta_tcs = delta.get("tool_calls")
+                        if delta_tcs:
+                            for tc_chunk in delta_tcs:
+                                idx = tc_chunk.get("index", 0)
+                                if idx not in _tool_call_accum:
+                                    _tool_call_accum[idx] = {
+                                        "id": "",
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    }
+                                acc = _tool_call_accum[idx]
+                                if tc_chunk.get("id"):
+                                    acc["id"] = tc_chunk["id"]
+                                if tc_chunk.get("type"):
+                                    acc["type"] = tc_chunk["type"]
+                                fn = tc_chunk.get("function") or {}
+                                if fn.get("name"):
+                                    acc["function"]["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    acc["function"]["arguments"] += fn["arguments"]
 
                         # Store reasoning_opaque for multi-turn context (CRITICAL)
                         # This must be passed back in subsequent requests
@@ -309,6 +447,10 @@ class CopilotOAuthClient:
         except Exception as e:
             raise RuntimeError(f"Copilot streaming error: {type(e).__name__}: {e}")
 
+        _final_tool_calls = None
+        if _tool_call_accum:
+            _final_tool_calls = [_tool_call_accum[i] for i in sorted(_tool_call_accum.keys())]
+
         return CopilotResponse(
             content=full_content,
             thinking=full_reasoning if full_reasoning else None,
@@ -316,6 +458,7 @@ class CopilotOAuthClient:
             usage=usage if usage else None,
             finish_reason=finish_reason,
             interrupted=interrupted,
+            tool_calls=_final_tool_calls,
         )
 
     async def chat(self, messages: List[CopilotMessage]) -> CopilotResponse:
