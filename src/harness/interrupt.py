@@ -1,10 +1,11 @@
 """Keyboard interrupt handling for streaming operations."""
 
 import sys
+import time
 import threading
 import signal
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .logger import get_logger
 
@@ -90,12 +91,18 @@ class KeyboardMonitor:
         self._stop_event = threading.Event()
         self._original_sigint = None
         self._generation = 0  # Prevent zombie threads from prior start/stop cycles
+        self._last_sigint_time: float = 0.0  # For double-tap detection
+        # Window (seconds) in which two Ctrl+C presses count as a double-tap.
+        # Phantom SIGINT from child process teardown is always a single pulse;
+        # a real user double-tapping will hit this easily.
+        self._double_tap_window: float = 1.5
     
     def start(self):
         """Start monitoring for keys."""
         # ALWAYS reset interrupt state, even if already running, to clear
         # stale ctrl-c / escape flags from a previous turn.
         reset_interrupt()
+        self._last_sigint_time = 0.0  # Reset double-tap timer for new turn
 
         if self._running and self._thread and self._thread.is_alive():
             _log.debug("KeyboardMonitor.start() — already running")
@@ -114,20 +121,62 @@ class KeyboardMonitor:
         self._thread.start()
     
     def _sigint_handler(self, signum, frame):
-        """Handle Ctrl+C by triggering interrupt.
-        
-        First Ctrl+C → soft interrupt (set flag, agent checks it).
-        Second Ctrl+C → hard exit (raise KeyboardInterrupt).
+        """Handle Ctrl+C with double-tap detection.
+
+        On Windows, child process teardown can leak a single CTRL_C_EVENT
+        into the parent console group, producing a phantom SIGINT.  These
+        phantom events are always isolated single pulses.
+
+        To filter them out:
+          1st Ctrl+C  → print hint, record timestamp, do NOT interrupt.
+          2nd Ctrl+C within 1.5s → soft interrupt (set flag).
+          3rd Ctrl+C while already interrupted → hard exit.
         """
-        was_already_interrupted = _interrupt_state.interrupted
-        _interrupt_state.trigger("ctrl-c")
-        if was_already_interrupted:
-            # Second Ctrl+C while already interrupted — hard exit
-            _log.warning("Second Ctrl+C — hard exit")
+        import traceback as _tb
+        now = time.monotonic()
+
+        # Log the call site for diagnosis
+        if frame is not None:
+            caller = f"{frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}"
+        else:
+            caller = "<no frame>"
+        _log.warning(
+            "SIGINT received: caller=%s thread=%s",
+            caller,
+            threading.current_thread().name,
+        )
+        if frame is not None:
+            _log.info(
+                "SIGINT stack:\n%s",
+                "".join(_tb.format_stack(frame, limit=4)),
+            )
+
+        # Already interrupted → hard exit on next Ctrl+C
+        if _interrupt_state.interrupted:
+            _log.warning("Ctrl+C while already interrupted — hard exit")
             if self._original_sigint and self._original_sigint != signal.SIG_DFL:
                 self._original_sigint(signum, frame)
             else:
                 raise KeyboardInterrupt()
+
+        elapsed = now - self._last_sigint_time
+        self._last_sigint_time = now
+
+        if elapsed <= self._double_tap_window:
+            # Double-tap confirmed → soft interrupt
+            _log.info("Double-tap Ctrl+C confirmed (%.2fs apart) — interrupting", elapsed)
+            _interrupt_state.trigger("ctrl-c")
+        else:
+            # First tap — just print a hint, don't interrupt
+            _log.info("Single Ctrl+C (%.2fs since last) — waiting for double-tap", elapsed)
+            # Print to stderr so it's visible even during streaming output.
+            # Use raw write to avoid Rich console lock issues inside a signal handler.
+            import sys as _sys
+            try:
+                _sys.stderr.write("\n  Press Ctrl+C again to interrupt\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
     
     def stop(self):
         """Stop monitoring."""

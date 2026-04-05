@@ -12,11 +12,14 @@ Based on opencode's implementation:
 
 import json
 import asyncio
+import logging
 from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass, field
 import aiohttp
 
 from .oauth import OAuthToken
+
+log = logging.getLogger(__name__)
 
 # GitHub Copilot API endpoints
 COPILOT_API_BASE = "https://api.githubcopilot.com"
@@ -254,6 +257,10 @@ class CopilotOAuthClient:
                         choice = event["choices"][0]
                         delta = choice.get("delta", {})
 
+                        # Log delta keys on first chunk for debugging reasoning issues
+                        if delta and not full_content and not full_reasoning:
+                            log.debug("copilot SSE first delta keys: %s", list(delta.keys()))
+
                         # Regular content
                         content = delta.get("content", "")
                         if content:
@@ -262,7 +269,13 @@ class CopilotOAuthClient:
                                 on_content(content)
 
                         # Reasoning content (for Claude models through Copilot)
-                        reasoning = delta.get("reasoning_text", "")
+                        # Check both field names: API may use reasoning_content or reasoning_text
+                        reasoning = (
+                            delta.get("reasoning_content")
+                            or delta.get("reasoning_text")
+                            or delta.get("reasoning")
+                            or ""
+                        )
                         if reasoning:
                             full_reasoning += reasoning
                             if on_reasoning:

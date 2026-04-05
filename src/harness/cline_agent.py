@@ -1974,6 +1974,7 @@ class ClineAgent:
                 # Web search disabled by default to avoid unnecessary searches
                 # Use /search command for explicit web searches
                 api_t0 = time.time()
+
                 log.info(
                     "API request: model=%s tokens_in=%d iter=%d",
                     self.config.model,

@@ -35,6 +35,13 @@ except Exception:
 
 log = get_logger("tools")
 
+# On Windows, child processes share the parent's console group by default.
+# If any child (or the shell wrapper) calls GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0),
+# the event hits ALL processes in the group — including the harness — causing a
+# spurious SIGINT.  CREATE_NEW_PROCESS_GROUP isolates children into their own group.
+import subprocess as _subprocess
+_PROC_FLAGS = _subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0
+
 
 def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
     """Kill a process and all its descendants, cross-platform.
@@ -1376,8 +1383,9 @@ class ToolHandlers:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=self.workspace_path,
+            creationflags=_PROC_FLAGS,
         )
-        log.info("Process launched: PID=%d log=%s", proc.pid, cmd_log_path)
+        log.info("Process launched: PID=%d log=%s flags=0x%X", proc.pid, cmd_log_path, _PROC_FLAGS)
         
         # ── Tail loop: read log file for live output ───────────────────
         output_lines: List[str] = []
@@ -1600,6 +1608,7 @@ class ToolHandlers:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=self.workspace_path,
+            creationflags=_PROC_FLAGS,
         )
         
         # Brief pause to capture initial output
