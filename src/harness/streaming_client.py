@@ -223,7 +223,7 @@ def _normalize_model_name(model: str, base_url: str = "") -> str:
         return f"deepseek/{model}"
     elif "api.groq.com" in url:
         return f"groq/{model}"
-    elif "localhost:11434" in url or "localhost:11434" in url:
+    elif "localhost:11434" in url:
         return f"ollama/{model}"
 
     # Default to openai format for OpenAI-compatible APIs
@@ -379,29 +379,6 @@ class StreamingJSONClient:
                 _litellm.drop_params = True  # Drop unsupported params
                 _litellm.success_callback = []  # Disable callbacks
                 _litellm.failure_callback = []
-
-    def _provider_kind(self) -> str:
-        """Get provider type from model name or URL."""
-        model_lower = self.litellm_model.lower()
-
-        if model_lower.startswith("bedrock/"):
-            return "litellm_bedrock"
-        elif model_lower.startswith("anthropic/"):
-            return "litellm_anthropic"
-        elif model_lower.startswith("openrouter/"):
-            return "litellm_openrouter"
-        elif model_lower.startswith("together_ai/"):
-            return "litellm_together"
-        elif model_lower.startswith("minimax/"):
-            return "litellm_minimax"
-        elif model_lower.startswith("deepseek/"):
-            return "litellm_deepseek"
-        elif model_lower.startswith("groq/"):
-            return "litellm_groq"
-        elif model_lower.startswith("ollama/"):
-            return "litellm_ollama"
-        else:
-            return "litellm_openai_compat"
 
     def _is_openai_compat_proxy(self) -> bool:
         """Check if this is an OpenAI-compatible proxy (not a native provider).

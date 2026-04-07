@@ -1347,22 +1347,6 @@ class SmartContextManager:
             base_scores.append(score)
             results.append((index, score, msg_type, source))
 
-        # Learned prior: train fast logistic model on weak labels from this
-        # candidate set and blend expected keep-probability into the final rank.
-        learned_keep = self._infer_policy_keep_scores(
-            candidates=candidates,
-            relevance_scores=relevance_scores,
-            total=total,
-            query_text=query_text,
-        )
-        if learned_keep:
-            blended: List[Tuple[int, float, str, str]] = []
-            for index, base, msg_type, source in results:
-                ml_keep = learned_keep.get(index, base)
-                score = max(0.0, min(1.0, base * 0.65 + ml_keep * 0.35))
-                blended.append((index, score, msg_type, source))
-            return blended
-
         return results
 
     def _compute_score(
@@ -1422,44 +1406,6 @@ class SmartContextManager:
         score = (recency * 0.30 + relevance * 0.35 + regen_cost * 0.35) - size_pressure
 
         return max(0.0, min(1.0, score))
-
-    @staticmethod
-    def _policy_weak_label(msg_type: str, tokens: int, role: str) -> int:
-        """Weak label mapping used by the runtime logistic prior.
-
-        0=KEEP_FULL, 1=SUMMARIZE, 2=ARCHIVE_WITH_BREADCRUMB, 3=EVICT
-        """
-        if msg_type == "guidance_nudge":
-            return 3
-        if msg_type in ("todo_result", "context_result"):
-            return 3
-        if msg_type == "introspect_result":
-            return 2 if tokens >= 120 else 1
-        if msg_type in ("command_output", "search_result", "other_tool_result"):
-            return 2 if tokens >= 120 else 1
-        if msg_type == "assistant_analysis":
-            return 1 if tokens >= 160 else 0
-        if role == "system":
-            return 0
-        return 0
-
-    def _infer_policy_keep_scores(
-        self,
-        candidates: List[Tuple[int, str, int, str, str, str]],
-        relevance_scores: List[float],
-        total: int,
-        query_text: str,
-    ) -> Dict[int, float]:
-        """Return learned keep-scores keyed by message index.
-
-        DISABLED: sklearn import causes Windows WMI hang.
-        Returns empty dict to use fallback keyword-based scoring.
-        """
-        self.last_policy_stats = {
-            "used": False,
-            "reason": "sklearn_disabled_due_to_wmi_hang",
-        }
-        return {}
 
     # ------------------------------------------------------------------
     # Classification

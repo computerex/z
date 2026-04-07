@@ -7,7 +7,6 @@ import json
 import os
 import platform
 import re
-import signal
 import time
 import difflib
 from pathlib import Path
