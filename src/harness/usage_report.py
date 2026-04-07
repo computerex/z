@@ -4,7 +4,7 @@ import html
 import os
 import tempfile
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 

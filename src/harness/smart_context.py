@@ -20,7 +20,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple, Any, Set, TYPE_CHECKING
+from typing import List, Optional, Dict, Tuple, Any, TYPE_CHECKING
 from collections import Counter
 
 import time as _time_mod_sc
@@ -704,7 +704,7 @@ class SmartContextManager:
 
         if current_tokens <= budget:
             if debug_scoring:
-                scored_preview = self._score_all_messages(messages, set(), set())
+                scored_preview = self._score_all_messages(messages)
                 scored_preview.sort(key=lambda x: x[1])
                 preview_rows = []
                 for index, score, msg_type, source in scored_preview[:8]:
@@ -778,7 +778,7 @@ class SmartContextManager:
             return messages, total_freed, "; ".join(report_parts)
 
         # Phase 2: score every non-protected message, compact lowest first
-        scored = self._score_all_messages(messages, set(), set())
+        scored = self._score_all_messages(messages)
         scored.sort(key=lambda x: x[1])  # lowest keep-priority first
 
         if debug_scoring and scored:
@@ -898,7 +898,7 @@ class SmartContextManager:
             # Bucket 1: already-compacted messages (cheap to drop, trace exists)
             compacted_indices: List[int] = []
             # Bucket 2: scored messages, lowest score first
-            scored_evict = self._score_all_messages(messages, set(), set())
+            scored_evict = self._score_all_messages(messages)
             scored_evict.sort(key=lambda x: x[1])  # lowest first
             scored_indices = {s[0] for s in scored_evict}
 
@@ -1279,8 +1279,6 @@ class SmartContextManager:
     def _score_all_messages(
         self,
         messages: List[Any],
-        ref_paths: Set[str],
-        ref_keywords: Set[str],
     ) -> List[Tuple[int, float, str, str]]:
         """Score every non-protected message.
 

@@ -13,7 +13,7 @@ Based on opencode's implementation:
 import json
 import time
 import asyncio
-from typing import Dict, List, Optional, Callable, Any, AsyncGenerator, Union
+from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass
 import aiohttp
 
