@@ -285,10 +285,7 @@ class BedrockClient:
 
         # Process stream
         stream = response.get("stream", [])
-        _event_count = 0
-        _reasoning_event_count = 0
         for event in stream:
-            _event_count += 1
             # Handle content block delta
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]

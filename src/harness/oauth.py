@@ -301,8 +301,6 @@ class OpenAIOAuthBrowser:
         if cls._server:
             try:
                 # Shutdown can block, so run it in a thread
-                import threading
-
                 server = cls._server
                 cls._server = None
                 cls._pending = None

@@ -113,24 +113,28 @@ class CodexOAuthClient:
             Valid access token
         """
         if self.oauth_token.is_expired():
-            # Refresh token
-            import requests
+            # Refresh token using aiohttp (non-blocking)
+            session = self._session or aiohttp.ClientSession()
+            close_after = self._session is None
+            try:
+                async with session.post(
+                    f"{ISSUER}/oauth/token",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": self.oauth_token.refresh_token,
+                        "client_id": CLIENT_ID,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status >= 400:
+                        raise RuntimeError(f"Token refresh failed: {response.status}")
 
-            response = requests.post(
-                f"{ISSUER}/oauth/token",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": self.oauth_token.refresh_token,
-                    "client_id": CLIENT_ID,
-                },
-                timeout=30,
-            )
+                    tokens = await response.json()
+            finally:
+                if close_after:
+                    await session.close()
 
-            if not response.ok:
-                raise RuntimeError(f"Token refresh failed: {response.status_code}")
-
-            tokens = response.json()
             self.oauth_token.access_token = tokens["access_token"]
             self.oauth_token.refresh_token = tokens.get(
                 "refresh_token", self.oauth_token.refresh_token

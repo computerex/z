@@ -2807,6 +2807,7 @@ class ClineAgent:
         _t0 = time.time()
         _success = True
         _error_msg = None
+        result = ""
 
         try:
             result = await self._dispatch_tool(tool)
@@ -2819,13 +2820,7 @@ class ClineAgent:
             return f"Error: {str(e)}"
         finally:
             _elapsed = (time.time() - _t0) * 1000
-            _result_size = 0
-            # result is local to the try block; capture it safely
-            try:
-                _result_size = len(result) if "result" in dir() else 0
-            except Exception:
-                pass
-            _metrics.record(tool.name, _elapsed, _success, _error_msg, _result_size)
+            _metrics.record(tool.name, _elapsed, _success, _error_msg, len(result))
 
     async def _dispatch_tool(self, tool: ParsedToolCall) -> str:
         """Dispatch a parsed tool call to its handler. Returns result string."""

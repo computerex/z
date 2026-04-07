@@ -1739,7 +1739,7 @@ class ToolHandlers:
                             results.append(f"{rel}:{i}: {line[:150]}")
                             if len(results) >= 100:
                                 break
-                except:
+                except Exception:
                     pass
             if len(results) >= 100:
                 break

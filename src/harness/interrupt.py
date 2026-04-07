@@ -350,7 +350,7 @@ class KeyboardMonitor:
                     # setcbreak() keeps ISIG, so Ctrl+C still generates SIGINT;
                     # the 0x03 byte never reaches stdin.read().
                     # _sigint_handler handles Ctrl+C reliably.
-        except:
+        except Exception:
             pass
         finally:
             if old_settings:
