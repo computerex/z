@@ -893,7 +893,6 @@ class ClineAgent:
 
     def save_session(self, path: str) -> None:
         """Save conversation history and context."""
-        import json
 
         def sanitize_string(s) -> str:
             """Remove unicode surrogates that can't be encoded."""
@@ -1000,7 +999,6 @@ class ClineAgent:
             path: Path to session file
             inject_resume: If True, adds a resume context message to help the model
         """
-        import json
 
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1483,8 +1481,6 @@ class ClineAgent:
                 # Check if we need to compact/truncate conversation
                 # Wrap in try/timeout to prevent hangs from corrupt context
                 try:
-                    import asyncio
-
                     self._last_token_count = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None, lambda: estimate_messages_tokens(self.messages)
@@ -1991,7 +1987,6 @@ class ClineAgent:
                 # Wrap API call in timeout to prevent indefinite hangs.
                 # Also run an interrupt-watcher so Ctrl+C / Escape cancel the
                 # blocked await immediately (not only after the first chunk).
-                import asyncio
 
                 async def _interrupt_watcher(task: asyncio.Task):
                     """Cancel *task* as soon as the interrupt flag is set."""
@@ -2879,10 +2874,9 @@ class ClineAgent:
                 # Backward compat: if model sends old <diff> format, parse it
                 if "diff" in tool.parameters and "old_text" not in tool.parameters:
                     diff_text = tool.parameters["diff"]
-                    import re as _re
-                    m = _re.search(
+                    m = re.search(
                         r'<{7}\s*SEARCH\s*\n(.*?)\n={7}\s*\n(.*?)\n>{7}\s*REPLACE',
-                        diff_text, _re.DOTALL
+                        diff_text, re.DOTALL
                     )
                     if m:
                         tool.parameters["old_text"] = m.group(1)
@@ -3094,11 +3088,6 @@ class ClineAgent:
             else:
                 self.console.print(f"    [dim]{rich_escape(text)}[/dim]")
             shown += 1
-
-    def _show_diff_blocks(self, blocks: List[Tuple[str, str]], path: str) -> None:
-        """Display SEARCH/REPLACE blocks as a unified diff (only real changes)."""
-        for search, replace in blocks:
-            self._render_udiff(search, replace)
 
     def _show_write_diff(self, old_content: str, new_content: str, path: str) -> None:
         """Display a unified diff for write_to_file overwrites."""

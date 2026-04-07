@@ -337,6 +337,38 @@ class ToolHandlers:
         except Exception:
             pass
 
+    async def _init_mcp_session(self, cm, timeout: int = 15):
+        """Initialize an MCP session from a transport context manager.
+
+        Handles cleanup of partially-opened resources on failure.
+        Returns (session, session_cm) on success; raises on failure
+        after cleaning up cm.
+        """
+        read_write = await cm.__aenter__()
+        # streamablehttp returns a 3-tuple; others return a 2-tuple
+        if isinstance(read_write, tuple) and len(read_write) == 3:
+            read_stream, write_stream, _ = read_write
+        else:
+            read_stream, write_stream = read_write
+        try:
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await session_cm.__aenter__()
+            try:
+                await asyncio.wait_for(session.initialize(), timeout=timeout)
+            except Exception:
+                try:
+                    await session_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            raise
+        return session, session_cm
+
     async def _get_or_create_mcp_session(self, name: str, cfg: dict):
         if not HAS_MCP_SDK:
             raise RuntimeError(
@@ -368,25 +400,11 @@ class ToolHandlers:
             )
 
             _errlog = open(os.devnull, "w", encoding="utf-8")
-            cm = stdio_client(server_params, errlog=_errlog)
-            read_stream, write_stream = await cm.__aenter__()
-            session_cm = ClientSession(read_stream, write_stream)
-            session = await session_cm.__aenter__()
             try:
-                await asyncio.wait_for(session.initialize(), timeout=15)
+                cm = stdio_client(server_params, errlog=_errlog)
+                session, session_cm = await self._init_mcp_session(cm, timeout=15)
             except Exception:
-                try:
-                    await session_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                try:
-                    await cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                try:
-                    _errlog.close()
-                except Exception:
-                    pass
+                _errlog.close()
                 raise
             self._mcp_sessions[name] = {
                 "cfg_key": cfg_key,
@@ -409,21 +427,7 @@ class ToolHandlers:
 
             if stype == "sse":
                 cm = sse_client(url, headers=headers, timeout=20, sse_read_timeout=300)
-                read_stream, write_stream = await cm.__aenter__()
-                session_cm = ClientSession(read_stream, write_stream)
-                session = await session_cm.__aenter__()
-                try:
-                    await asyncio.wait_for(session.initialize(), timeout=20)
-                except Exception:
-                    try:
-                        await session_cm.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                    try:
-                        await cm.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                    raise
+                session, session_cm = await self._init_mcp_session(cm, timeout=20)
                 self._mcp_sessions[name] = {
                     "cfg_key": cfg_key,
                     "stype": stype,
@@ -434,21 +438,7 @@ class ToolHandlers:
                 return session
 
             cm = streamablehttp_client(url, headers=headers, timeout=20, sse_read_timeout=300)
-            read_stream, write_stream, _get_session_id = await cm.__aenter__()
-            session_cm = ClientSession(read_stream, write_stream)
-            session = await session_cm.__aenter__()
-            try:
-                await asyncio.wait_for(session.initialize(), timeout=20)
-            except Exception:
-                try:
-                    await session_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                try:
-                    await cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                raise
+            session, session_cm = await self._init_mcp_session(cm, timeout=20)
             self._mcp_sessions[name] = {
                 "cfg_key": cfg_key,
                 "stype": stype,

@@ -21,7 +21,7 @@ def load_json_config(path: Path) -> dict:
     """Load config from JSON file if it exists."""
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, IOError):
             pass
     return {}

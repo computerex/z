@@ -678,14 +678,14 @@ class OAuthManager:
         for token_file in self.config_dir.glob("*_token.json"):
             provider = token_file.stem.replace("_token", "")
             try:
-                data = json.loads(token_file.read_text())
+                data = json.loads(token_file.read_text(encoding="utf-8"))
                 self._tokens[provider] = OAuthToken.from_dict(data)
             except Exception:
                 pass
 
     def _save_token(self, provider: str, token: OAuthToken):
         token_file = self._get_token_file(provider)
-        token_file.write_text(json.dumps(token.to_dict(), indent=2))
+        token_file.write_text(json.dumps(token.to_dict(), indent=2), encoding="utf-8")
 
     def get_token(self, provider: str) -> Optional[OAuthToken]:
         token = self._tokens.get(provider)

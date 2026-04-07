@@ -70,7 +70,7 @@ class CachedModelList:
             return None
 
         try:
-            data = json.loads(cache_file.read_text())
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
             models = [ModelInfo(**m) for m in data.get("models", [])]
             return ProviderModels(
                 provider=provider,
@@ -88,7 +88,7 @@ class CachedModelList:
             "models": [asdict(m) for m in provider_models.models],
             "last_updated": provider_models.last_updated,
         }
-        cache_file.write_text(json.dumps(data, indent=2))
+        cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def get_models(
         self, provider: str, force_refresh: bool = False

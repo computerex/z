@@ -352,7 +352,7 @@ class CheckpointManager:
                     )
                 except OSError:
                     pass
-            exclude_file.write_text("\n".join(exclude_parts) + "\n")
+            exclude_file.write_text("\n".join(exclude_parts) + "\n", encoding="utf-8")
 
             self._initialized = True
             return True

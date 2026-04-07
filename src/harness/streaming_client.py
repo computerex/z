@@ -84,7 +84,6 @@ class LiteLLMNotInstalled:
 
 
 @dataclass
-@dataclass
 class StreamingMessage:
     """Message format for chat."""
 
@@ -981,8 +980,8 @@ class StreamingJSONClient:
                 else:
                     raise RuntimeError(f"Failed after {retries + 1} attempts: {e}")
 
-        # Should not reach here
-        raise RuntimeError(f"Unexpected error: {last_error}")
+        # Unreachable: loop always returns or raises. Satisfy type checkers.
+        raise AssertionError("unreachable")
 
 
 # Model discovery functions

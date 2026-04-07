@@ -175,14 +175,14 @@ def load_instruction_hierarchy(workspace_path: str | Path) -> tuple[str, set[str
         # Check <dir>/CLAUDE.md
         text = _load_file_with_imports(ancestor / "CLAUDE.md", seen)
         if text:
-            rel = ancestor.relative_to(ws) if ancestor != ws and str(ancestor).startswith(str(ws)) else ancestor
+            rel = ancestor.relative_to(ws) if ancestor != ws and ancestor.is_relative_to(ws) else ancestor
             label = f"Instructions from {rel}/CLAUDE.md" if ancestor != ws else "Project CLAUDE.md"
             _add(label, text)
 
         # Check <dir>/.claude/CLAUDE.md (alternative location)
         text = _load_file_with_imports(ancestor / ".claude" / "CLAUDE.md", seen)
         if text:
-            rel = ancestor.relative_to(ws) if ancestor != ws and str(ancestor).startswith(str(ws)) else ancestor
+            rel = ancestor.relative_to(ws) if ancestor != ws and ancestor.is_relative_to(ws) else ancestor
             label = f"Instructions from {rel}/.claude/CLAUDE.md" if ancestor != ws else "Project .claude/CLAUDE.md"
             _add(label, text)
 
