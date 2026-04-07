@@ -745,7 +745,13 @@ class ClineAgent:
             _in_tag = False  # currently inside a < ... > sequence
             _suppress = False  # current tag should be suppressed
 
-
+            def _flush_tag_buf():
+                """Flush buffered tag to stdout (it wasn't a tool tag)."""
+                nonlocal _tag_buf
+                if _tag_buf:
+                    sys.stdout.write(_tag_buf)
+                    sys.stdout.flush()
+                    _tag_buf = ""
 
             def on_chunk(c: str):
                 nonlocal chunk_text, first_token, _tag_buf, _in_tag, _suppress
