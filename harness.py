@@ -6,6 +6,21 @@ import os
 import time as _time_mod
 import warnings
 
+# --- Windows: disable platform.uname() WMI queries -------------------------
+# On Python 3.12+, platform._win32_ver() issues a synchronous WMI query
+# (Win32_OperatingSystem) just to enrich the OS version string. When the
+# Winmgmt service is sluggish (typical after RAM/OOM events) that call can
+# hang for many minutes, blocking *any* importer that touches platform.uname
+# (aiohttp, requests, urllib3, etc.). platform.py catches OSError from
+# _wmi_query and falls back to getwindowsversion()+registry, so we stub it
+# out unconditionally. The harness never needs WMI.
+if sys.platform == "win32":
+    import platform as _platform_mod
+    if hasattr(_platform_mod, "_wmi_query"):
+        def _wmi_query_disabled(*_a, **_kw):  # noqa: D401
+            raise OSError("WMI disabled by harness (avoids Winmgmt hangs)")
+        _platform_mod._wmi_query = _wmi_query_disabled
+
 # Suppress Pydantic serialization warnings from LiteLLM
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.main")
 # Suppress requests/urllib3 version mismatch warning
@@ -908,6 +923,8 @@ def _record_model_history(model: str, profile: str) -> None:
 
 def _provider_family_for_url(api_url: str) -> str:
     u = (api_url or "").lower()
+    if "githubcopilot" in u or "copilot" in u:
+        return "github-copilot"
     if "bedrock" in u and "amazonaws.com" in u:
         return "bedrock"
     if "api.anthropic.com" in u:
@@ -1119,6 +1136,11 @@ def _apply_selected_provider_model(
     chosen_model: str,
 ) -> str:
     """Apply selected provider+model as active config and persist."""
+    provider_api_url = str(cfg.get("api_url", agent.config.api_url) or "")
+    provider_family = _provider_family_for_url(provider_api_url)
+    if chosen_model == "auto" and provider_family != "github-copilot":
+        return "Model 'auto' is only available for GitHub Copilot providers."
+
     agent.config.api_url = cfg.get("api_url", agent.config.api_url)
     agent.config.api_key = cfg.get("api_key", agent.config.api_key)
     agent.config.model = chosen_model
@@ -3848,7 +3870,6 @@ def main():
                         pct = total_tokens / max_allowed * 100 if max_allowed else 0
                         over = total_tokens > int(max_allowed * 0.85)
                         active_todos = agent.todo_manager.list_active()
-                        traces = agent.smart_context.compaction_traces
 
                         bar_width = 24
                         filled = int(bar_width * pct / 100)
@@ -3885,21 +3906,11 @@ def main():
                         console.print(
                             Panel(
                                 tbl,
-                                title="[bold]Smart Context[/bold]",
+                                title="[bold]Context Status[/bold]",
                                 border_style="dim",
                                 padding=(1, 2),
                             )
                         )
-                        if traces:
-                            console.print(
-                                f"  [dim]Compactions this session: {len(traces)}[/dim]"
-                            )
-                            for t in traces[-5:]:
-                                console.print(
-                                    f"    [dim]\u2192 {t.format_notice()}[/dim]"
-                                )
-                        else:
-                            console.print("  [dim]No compactions yet.[/dim]")
                         console.print()
                         continue
 

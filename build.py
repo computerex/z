@@ -54,7 +54,6 @@ HIDDEN_IMPORTS = [
     "harness.tools.shell_tools",
     "harness.tools.search_tools",
     "harness.todo_manager",
-    "harness.smart_context",
     "httpx",
     "httpx._transports",
     "httpx._transports.default",

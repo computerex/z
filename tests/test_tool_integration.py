@@ -29,7 +29,6 @@ from harness.cline_agent import (
 )
 from harness.config import Config
 from harness.todo_manager import TodoManager, TodoStatus
-from harness.smart_context import SmartContextManager
 from harness.streaming_client import StreamingChatResponse
 
 
@@ -822,44 +821,6 @@ class TestContextCompactionIntegration:
         )
         agent = ClineAgent(config=config, max_iterations=1)
         return agent
-
-    def test_smart_context_connected_to_todo_manager(self):
-        """SmartContextManager uses the agent's TodoManager."""
-        agent = self._make_agent()
-        assert agent.smart_context.todo_manager is agent.todo_manager
-
-        agent.todo_manager.add("Test task", context_refs=["important.py"])
-        refs = agent.smart_context.todo_manager.get_active_context_refs()
-        assert "important.py" in refs
-
-    def test_clear_resets_everything(self):
-        """clear_history resets todos and smart context."""
-        agent = self._make_agent()
-        agent.todo_manager.add("Task")
-        from harness.smart_context import CompactionTrace
-
-        agent.smart_context.compaction_traces.append(
-            CompactionTrace("file_read", "test.py", "test", tokens_freed=100)
-        )
-
-        agent.clear_history()
-        assert len(agent.todo_manager.list_all()) == 0
-        assert len(agent.smart_context.compaction_traces) == 0
-
-    def test_eviction_count_in_stats(self):
-        """Eviction count shows in context stats."""
-        agent = self._make_agent()
-        from harness.smart_context import CompactionTrace
-
-        agent.smart_context.compaction_traces.append(
-            CompactionTrace("file_read", "old.py", "Old file", tokens_freed=500)
-        )
-        agent.smart_context.compaction_traces.append(
-            CompactionTrace("command_output", "npm test", "Pass", tokens_freed=300)
-        )
-
-        stats = agent.get_context_stats()
-        assert stats["evictions"] == 2
 
 
 # ============================================================

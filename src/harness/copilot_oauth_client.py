@@ -27,10 +27,13 @@ COPILOT_CHAT_ENDPOINT = "/chat/completions"
 
 # Allowed Copilot models (from models.dev - https://models.dev/api.json)
 ALLOWED_COPILOT_MODELS = {
+    # Copilot router selector
+    "auto",
     # Claude models
     "claude-haiku-4.5",
     "claude-opus-4.5",
     "claude-opus-4.6",
+    "claude-opus-4.7",
     "claude-opus-41",
     "claude-sonnet-4",
     "claude-sonnet-4.5",
@@ -49,6 +52,7 @@ ALLOWED_COPILOT_MODELS = {
     "gpt-5.2-codex",
     "gpt-5.3-codex",
     "gpt-5.4",
+    "gpt-5.4-mini",
     # Gemini models
     "gemini-2.5-pro",
     "gemini-3-flash-preview",
@@ -56,7 +60,28 @@ ALLOWED_COPILOT_MODELS = {
     "gemini-3.1-pro-preview",
     # Grok
     "grok-code-fast-1",
+    # Raptor
+    "raptor-mini",
+    "raptor-mini-preview",
 }
+
+# Per-model maximum reasoning_effort. Some Copilot models reject "high".
+# When the user requests a higher level than supported, we clamp down.
+_REASONING_EFFORT_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
+MODEL_MAX_REASONING_EFFORT: Dict[str, str] = {
+    # claude-opus-4.7 only supports "medium" per the Copilot backend
+    "claude-opus-4.7": "medium",
+}
+
+
+def clamp_reasoning_effort(model: str, requested: str) -> str:
+    """Clamp the requested reasoning_effort to what the model accepts."""
+    cap = MODEL_MAX_REASONING_EFFORT.get(model)
+    if not cap:
+        return requested
+    req_rank = _REASONING_EFFORT_RANK.get(requested, 3)
+    cap_rank = _REASONING_EFFORT_RANK.get(cap, 3)
+    return cap if req_rank > cap_rank else requested
 
 
 @dataclass
@@ -157,26 +182,62 @@ class CopilotOAuthClient:
         }
 
     def _build_request_body(
-        self, messages: List[CopilotMessage], stream: bool = True
+        self,
+        messages: List[CopilotMessage],
+        stream: bool = True,
+        use_max_completion_tokens: bool = False,
+        include_temperature: bool = True,
     ) -> Dict[str, Any]:
         """Build request body for Copilot API with reasoning support."""
         body: Dict[str, Any] = {
-            "model": self.model,
             "messages": [m.to_dict() for m in messages],
             "stream": stream,
         }
 
+        request_model = self._resolve_request_model()
+        if request_model:
+            body["model"] = request_model
+
         # Enable reasoning (returns reasoning_text in SSE deltas)
         if self.reasoning_effort and self.reasoning_effort != "none":
-            body["reasoning_effort"] = self.reasoning_effort
+            body["reasoning_effort"] = clamp_reasoning_effort(
+                self.model, self.reasoning_effort
+            )
 
         # Add optional parameters
-        if self.temperature is not None:
+        if include_temperature and self.temperature is not None:
             body["temperature"] = self.temperature
         if self.max_tokens:
-            body["max_tokens"] = self.max_tokens
+            if use_max_completion_tokens:
+                body["max_completion_tokens"] = self.max_tokens
+            else:
+                body["max_tokens"] = self.max_tokens
 
         return body
+
+    def _resolve_request_model(self) -> Optional[str]:
+        """Translate UI model aliases into Copilot API-compatible model behavior.
+
+        - "auto" uses Copilot's router behavior by omitting the model field.
+        - "gpt-4o-copilot" is normalized to "gpt-4o" for API compatibility.
+        """
+        model = (self.model or "").strip()
+        lower = model.lower()
+        if lower == "auto":
+            return None
+        if lower == "gpt-4o-copilot":
+            return "gpt-4o"
+        return model
+
+    def _prefers_max_completion_tokens(self) -> bool:
+        """Some Copilot-routed models reject max_tokens and require max_completion_tokens."""
+        model = (self.model or "").lower()
+        return model.startswith("gpt-5")
+
+    def _supports_custom_temperature(self) -> bool:
+        """Some Copilot-routed models only support the default temperature value."""
+        model = (self.model or "").lower()
+        return not model.startswith("gpt-5.4")
 
     def _has_vision_content(self, messages: List[CopilotMessage]) -> bool:
         """Check if any message contains image/vision content."""
@@ -198,7 +259,14 @@ class CopilotOAuthClient:
         headers = self._build_headers()
         if self._has_vision_content(messages):
             headers["Copilot-Vision-Request"] = "true"
-        body = self._build_request_body(messages, stream=True)
+        use_max_completion_tokens = self._prefers_max_completion_tokens()
+        include_temperature = self._supports_custom_temperature()
+        body = self._build_request_body(
+            messages,
+            stream=True,
+            use_max_completion_tokens=use_max_completion_tokens,
+            include_temperature=include_temperature,
+        )
 
         if not self._session:
             self._session = aiohttp.ClientSession()
@@ -212,98 +280,127 @@ class CopilotOAuthClient:
 
         try:
             url = f"{self.base_url}{COPILOT_CHAT_ENDPOINT}"
-            async with self._session.post(
-                url,
-                headers=headers,
-                json=body,
-                # Use sock_read (idle timeout) instead of total timeout.
-                # total= kills long-but-active streams; sock_read= only
-                # fires when no data arrives for N seconds.
-                timeout=aiohttp.ClientTimeout(
-                    total=None,
-                    sock_connect=30,
-                    sock_read=self.timeout,
-                ),
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise RuntimeError(
-                        f"Copilot API error {response.status}: {error_text}"
-                    )
-
-                # Process SSE stream
-                async for line in response.content:
-                    if check_interrupt and check_interrupt():
-                        interrupted = True
-                        finish_reason = "interrupted"
-                        break
-
-                    line = line.decode("utf-8").strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-
-                    data = line[6:]  # Remove "data: " prefix
-
-                    if data == "[DONE]":
-                        break
-
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Handle chat completion format (most common)
-                    if "choices" in event and event["choices"]:
-                        choice = event["choices"][0]
-                        delta = choice.get("delta", {})
-
-                        # Log delta keys on first chunk for debugging reasoning issues
-                        if delta and not full_content and not full_reasoning:
-                            log.debug("copilot SSE first delta keys: %s", list(delta.keys()))
-
-                        # Regular content
-                        content = delta.get("content", "")
-                        if content:
-                            full_content += content
-                            if on_content:
-                                on_content(content)
-
-                        # Reasoning content (for Claude models through Copilot)
-                        # Check both field names: API may use reasoning_content or reasoning_text
-                        reasoning = (
-                            delta.get("reasoning_content")
-                            or delta.get("reasoning_text")
-                            or delta.get("reasoning")
-                            or ""
+            for attempt in range(3):
+                async with self._session.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    # Use sock_read (idle timeout) instead of total timeout.
+                    # total= kills long-but-active streams; sock_read= only
+                    # fires when no data arrives for N seconds.
+                    timeout=aiohttp.ClientTimeout(
+                        total=None,
+                        sock_connect=30,
+                        sock_read=self.timeout,
+                    ),
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        # Copilot sometimes requires max_completion_tokens for select models.
+                        if (
+                            attempt < 2
+                            and "Unsupported parameter: 'max_tokens'" in error_text
+                            and "max_completion_tokens" in error_text
+                        ):
+                            body = self._build_request_body(
+                                messages,
+                                stream=True,
+                                use_max_completion_tokens=True,
+                                include_temperature=include_temperature,
+                            )
+                            continue
+                        if (
+                            attempt < 2
+                            and "Unsupported value: 'temperature'" in error_text
+                            and "Only the default (1) value is supported" in error_text
+                        ):
+                            include_temperature = False
+                            body = self._build_request_body(
+                                messages,
+                                stream=True,
+                                use_max_completion_tokens=use_max_completion_tokens,
+                                include_temperature=False,
+                            )
+                            continue
+                        raise RuntimeError(
+                            f"Copilot API error {response.status}: {error_text}"
                         )
-                        if reasoning:
-                            full_reasoning += reasoning
-                            if on_reasoning:
-                                on_reasoning(reasoning)
 
-                        # Store reasoning_opaque for multi-turn context (CRITICAL)
-                        # This must be passed back in subsequent requests
-                        message = choice.get("message", {})
-                        if message.get("reasoning_opaque"):
-                            reasoning_opaque = message["reasoning_opaque"]
+                    # Process SSE stream
+                    async for line in response.content:
+                        if check_interrupt and check_interrupt():
+                            interrupted = True
+                            finish_reason = "interrupted"
+                            break
 
-                        # Also check delta for reasoning_opaque
-                        if delta.get("reasoning_opaque"):
-                            reasoning_opaque = delta["reasoning_opaque"]
+                        line = line.decode("utf-8").strip()
+                        if not line or not line.startswith("data: "):
+                            continue
 
-                        # Finish reason
-                        if choice.get("finish_reason"):
-                            finish_reason = choice["finish_reason"]
+                        data = line[6:]  # Remove "data: " prefix
 
-                    # Extract usage if present
-                    if "usage" in event:
-                        usage = {
-                            "prompt_tokens": event["usage"].get("prompt_tokens", 0),
-                            "completion_tokens": event["usage"].get(
-                                "completion_tokens", 0
-                            ),
-                            "total_tokens": event["usage"].get("total_tokens", 0),
-                        }
+                        if data == "[DONE]":
+                            break
+
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Handle chat completion format (most common)
+                        if "choices" in event and event["choices"]:
+                            choice = event["choices"][0]
+                            delta = choice.get("delta", {})
+
+                            # Log delta keys on first chunk for debugging reasoning issues
+                            if delta and not full_content and not full_reasoning:
+                                log.debug("copilot SSE first delta keys: %s", list(delta.keys()))
+
+                            # Regular content
+                            content = delta.get("content", "")
+                            if content:
+                                full_content += content
+                                if on_content:
+                                    on_content(content)
+
+                            # Reasoning content (for Claude models through Copilot)
+                            # Check both field names: API may use reasoning_content or reasoning_text
+                            reasoning = (
+                                delta.get("reasoning_content")
+                                or delta.get("reasoning_text")
+                                or delta.get("reasoning")
+                                or ""
+                            )
+                            if reasoning:
+                                full_reasoning += reasoning
+                                if on_reasoning:
+                                    on_reasoning(reasoning)
+
+                            # Store reasoning_opaque for multi-turn context (CRITICAL)
+                            # This must be passed back in subsequent requests
+                            message = choice.get("message", {})
+                            if message.get("reasoning_opaque"):
+                                reasoning_opaque = message["reasoning_opaque"]
+
+                            # Also check delta for reasoning_opaque
+                            if delta.get("reasoning_opaque"):
+                                reasoning_opaque = delta["reasoning_opaque"]
+
+                            # Finish reason
+                            if choice.get("finish_reason"):
+                                finish_reason = choice["finish_reason"]
+
+                        # Extract usage if present
+                        if "usage" in event:
+                            usage = {
+                                "prompt_tokens": event["usage"].get("prompt_tokens", 0),
+                                "completion_tokens": event["usage"].get(
+                                    "completion_tokens", 0
+                                ),
+                                "total_tokens": event["usage"].get("total_tokens", 0),
+                            }
+                    # Successful stream attempt; stop retry loop
+                    break
 
         except asyncio.CancelledError:
             interrupted = True

@@ -188,9 +188,8 @@ class TodoManager:
 
     def get_active_context_refs(self) -> List[str]:
         """Get all context references from active (non-completed) todos.
-        
-        Used by the smart context manager to determine which context
-        items are relevant to current work.
+
+        Returns a list of context references that are relevant to current work.
         """
         refs = []
         for item in self.list_active():

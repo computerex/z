@@ -445,7 +445,10 @@ class StreamingJSONClient:
             "stream_options": {"include_usage": True},
         }
         if self.reasoning_effort and self.reasoning_effort != "none":
-            body["reasoning_effort"] = self.reasoning_effort
+            from .copilot_oauth_client import clamp_reasoning_effort
+            body["reasoning_effort"] = clamp_reasoning_effort(
+                self.model, self.reasoning_effort
+            )
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -808,17 +811,24 @@ class StreamingJSONClient:
         from .copilot_oauth_client import CopilotMessage
 
         # Convert StreamingMessage to CopilotMessage with reasoning context
+        # Find the last assistant message index so we can attach reasoning_opaque
+        last_assistant_idx = -1
+        for i, m in enumerate(messages):
+            if m.role == "assistant":
+                last_assistant_idx = i
+
         copilot_messages = []
         for i, m in enumerate(messages):
             msg = CopilotMessage(
                 role=m.role,
                 content=m.content,
             )
-            # For assistant messages, check if this is the last assistant message
-            # and if we have a stored reasoning_opaque from the last response
+            # Attach reasoning_opaque to the last assistant message (not the last message overall)
+            # After tool calls, the last message is a user/tool-result, so checking
+            # i == len(messages) - 1 would never match on continuation turns.
             if (
                 m.role == "assistant"
-                and i == len(messages) - 1
+                and i == last_assistant_idx
                 and self._copilot_reasoning_opaque
             ):
                 msg.reasoning_opaque = self._copilot_reasoning_opaque

@@ -140,21 +140,43 @@ def truncate_output(
     max_lines: int = 200,
     keep_start: int = 50,
     keep_end: int = 50,
+    full_output_path: Optional[str] = None,
 ) -> str:
     """
     Truncate long output, keeping start and end.
     Like Cline's terminal output handling.
+
+    If full_output_path is provided, the notice will tell the model where the
+    complete output is stored so it can recover the dropped middle lines via
+    read_file.
     """
     lines = text.splitlines()
-    
+
     if len(lines) <= max_lines:
         return text
-    
+
     start = lines[:keep_start]
     end = lines[-keep_end:]
     removed = len(lines) - keep_start - keep_end
-    
-    return "\n".join(start) + f"\n\n... ({removed} lines truncated) ...\n\n" + "\n".join(end)
+
+    if full_output_path:
+        recovery = (
+            f"Full output saved to: {full_output_path} — use read_file with a line range "
+            f"to see the dropped middle."
+        )
+    else:
+        recovery = (
+            "To see the dropped lines, re-run the command writing to a file "
+            "(e.g. `cmd > out.txt`) and then read_file with line ranges, or use a "
+            "more selective command (head/tail/sed/grep)."
+        )
+
+    notice = (
+        f"\n\n[harness: tool output was {len(lines)} lines; kept first {keep_start} and last {keep_end}, "
+        f"dropped {removed} middle lines. {recovery} "
+        f"This is a harness output cap, not a user interruption.]\n\n"
+    )
+    return "\n".join(start) + notice + "\n".join(end)
 
 
 def truncate_file_content(
@@ -202,9 +224,6 @@ class DuplicateDetector:
         """
         Replace older reads of the same file with a notice.
         Returns count of replacements made.
-        
-        NOTE: This is largely superseded by SmartContextManager.consolidate_duplicates()
-        which provides more sophisticated duplicate handling.
         """
         count = 0
         for i, msg in enumerate(messages):

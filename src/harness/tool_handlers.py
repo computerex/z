@@ -10,7 +10,7 @@ import re
 import time
 import difflib
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from rich.console import Console
 import psutil
 
@@ -163,24 +163,21 @@ class ToolHandlers:
         workspace_path: str,
         context,
         duplicate_detector,
-        context_manager=None
     ):
         """Initialize tool handlers with required dependencies.
-        
+
         Args:
             config: Config object with API settings
             console: Rich console for output
             workspace_path: Path to workspace directory
             context: ContextContainer for managing loaded content
             duplicate_detector: DuplicateDetector for tracking file reads
-            context_manager: SmartContextManager for accessing stored tool results
         """
         self.config = config
         self.console = console
         self.workspace_path = workspace_path
         self.context = context
         self._duplicate_detector = duplicate_detector
-        self._context_manager = context_manager
         
         # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
         self._background_procs: Dict[int, dict] = {}
@@ -195,6 +192,29 @@ class ToolHandlers:
         # Keeps browser/tool state across turns (critical for Playwright MCP refs).
         self._mcp_sessions: Dict[str, Dict[str, Any]] = {}
         self._mcp_locks: Dict[str, asyncio.Lock] = {}
+
+        # Pending image attachments produced by the most recent tool call.
+        # Consumed by ClineAgent when constructing the next user (tool-result)
+        # message so the image is delivered to a multimodal model inline.
+        # Each entry: {"path": str, "mime_type": str, "data_uri": str}
+        self._pending_image_attachments: List[Dict[str, str]] = []
+
+    # Image extensions that read_file will attach as inline image_url blocks
+    # for multimodal models (instead of attempting to text-decode the bytes).
+    _IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
+
+    # Cap on inlined image size (10 MB raw bytes — base64 inflates ~33%).
+    _MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
+
+    def consume_pending_image_attachments(self) -> List[Dict[str, str]]:
+        """Return and clear any pending image attachments.
+
+        Called by the agent loop after a tool finishes so the image data
+        can be inlined into the next user (tool-result) message.
+        """
+        attachments = self._pending_image_attachments
+        self._pending_image_attachments = []
+        return attachments
     
     # -- Output spill helpers --------------------------------------------------
     
@@ -817,7 +837,45 @@ class ToolHandlers:
             return f"Error: File not found: {path}"
         
         rel_path = str(path.relative_to(self.workspace_path)) if str(path).startswith(self.workspace_path) else str(path)
-        
+
+        # Image short-circuit: if the file is an image, attach it inline as
+        # an image_url block (consumed by the agent loop) instead of trying
+        # to text-decode binary bytes. Multimodal models can then "see" it.
+        ext = path.suffix.lower()
+        if ext in self._IMAGE_EXTS:
+            import base64 as _b64
+            try:
+                img_bytes = path.read_bytes()
+            except Exception as e:
+                return f"Error reading image {rel_path}: {e}"
+            if len(img_bytes) > self._MAX_INLINE_IMAGE_BYTES:
+                return (
+                    f"Error: Image {rel_path} is too large to inline "
+                    f"({len(img_bytes):,} bytes > {self._MAX_INLINE_IMAGE_BYTES:,} cap). "
+                    f"Use analyze_image for a vision-model summary instead."
+                )
+            mime_map = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+            }
+            mime_type = mime_map.get(ext, "application/octet-stream")
+            data_uri = f"data:{mime_type};base64,{_b64.b64encode(img_bytes).decode('ascii')}"
+            self._pending_image_attachments.append({
+                "path": rel_path,
+                "mime_type": mime_type,
+                "data_uri": data_uri,
+            })
+            ctx_id = self.context.add(
+                "image", rel_path,
+                f"[image attached inline] {rel_path} ({mime_type}, {len(img_bytes):,} bytes)",
+            )
+            return (
+                f"[Context ID: {ctx_id}]\n"
+                f"[Image attached inline: {rel_path} ({mime_type}, {len(img_bytes):,} bytes)]\n"
+                f"The image is delivered to the model with this message. "
+                f"If the model is not multimodal, use analyze_image instead."
+            )
+
         # Parse optional line range parameters (1-based, inclusive)
         # Accept aliases: offset→start_line, limit→end_line (some models prefer these)
         start_line = params.get("start_line") or params.get("offset")
@@ -836,7 +894,6 @@ class ToolHandlers:
                 return f"Error: end_line must be an integer, got '{end_line}'"
 
         # Track file reads for duplicate reporting
-        # (Actual dedup is handled by SmartContextManager.consolidate_duplicates)
         # Only flag as duplicate if reading the SAME range (or full file twice).
         # Different line ranges of the same file are NOT duplicates.
         range_key = f"{rel_path}:{start_line or ''}-{end_line or ''}"
@@ -1461,7 +1518,31 @@ class ToolHandlers:
             
             # Build raw output and spill to file if huge
             raw_output = self._read_log_file(cmd_log_path) or "(no output)"
-            output = truncate_output(raw_output, max_lines=300, keep_start=80, keep_end=80)
+
+            # If the output is long enough that truncate_output would drop middle
+            # lines, save the full output to a file FIRST so the model can read
+            # those dropped lines via read_file.
+            full_output_path: Optional[str] = None
+            if len(raw_output.splitlines()) > 300:
+                try:
+                    import hashlib as _hashlib
+                    safe_label = re.sub(r'[^\w\-.]', '_', (command.split()[0] if command else "cmd"))[:60]
+                    ts = int(time.time())
+                    fname = f"cmd_{safe_label}_{ts}.txt"
+                    os.makedirs(self._output_dir, exist_ok=True)
+                    fp = os.path.join(self._output_dir, fname)
+                    Path(fp).write_text(raw_output, encoding="utf-8")
+                    full_output_path = fp
+                except Exception as _e:
+                    log.warning("failed to write full-output recovery file: %s", _e)
+
+            output = truncate_output(
+                raw_output,
+                max_lines=300,
+                keep_start=80,
+                keep_end=80,
+                full_output_path=full_output_path,
+            )
             output = self.spill_output_to_file(output, f"cmd_{command.split()[0] if command else 'cmd'}")
             
             # Add to context if significant output
@@ -2074,48 +2155,3 @@ class ToolHandlers:
             tb = traceback.format_exc()
             return f"Error searching web: {type(e).__name__}: {e}\n{tb}"
     
-    async def retrieve_tool_result(self, params: Dict[str, str]) -> str:
-        """Retrieve the full content of a previously compacted tool result.
-        
-        When tool results are compacted to save context space, they're stored
-        with a unique ID. Use this tool to retrieve the full result when needed.
-        
-        Args:
-            result_id: The ID of the stored result (e.g., res_abc123_456)
-            
-        Returns:
-            The full tool result content, or an error message if not found
-        """
-        result_id = params.get("result_id", "").strip()
-        if not result_id:
-            return "Error: result_id is required. Example: res_abc123_456"
-        
-        # Check if context_manager is available
-        if not self._context_manager:
-            return "Error: Context manager not available for result retrieval"
-        
-        # Retrieve the stored result
-        stored = self._context_manager.result_storage.get_result(result_id)
-        if not stored:
-            return (
-                f"Error: Result {result_id} not found. "
-                f"It may have been evicted due to age or memory limits."
-            )
-        
-        # Format the result with metadata
-        age_seconds = time.time() - stored.timestamp
-        age_str = f"{age_seconds:.0f}s" if age_seconds < 60 else f"{age_seconds/60:.0f}m"
-        
-        result = (
-            f"[Retrieved tool result: {stored.tool_name}]\n"
-            f"Result ID: {result_id}\n"
-            f"Age: {age_str} ago\n"
-            f"Size: {stored.tokens:,} tokens (~{len(stored.original_content):,} chars)\n"
-            f"{'='*60}\n"
-            f"{stored.original_content}"
-        )
-        
-        log.info("retrieve_tool_result: result_id=%s tool=%s tokens=%d age=%s",
-                 result_id, stored.tool_name, stored.tokens, age_str)
-        
-        return result

@@ -123,11 +123,15 @@ class KeyboardMonitor:
     def _sigint_handler(self, signum, frame):
         """Handle Ctrl+C with double-tap detection.
 
-        On Windows, child process teardown can leak a single CTRL_C_EVENT
-        into the parent console group, producing a phantom SIGINT.  These
-        phantom events are always isolated single pulses.
+        On Windows, child process teardown can leak CTRL_C_EVENTs into the
+        parent console group, producing phantom SIGINTs.  Multiple phantoms
+        within the double-tap window can fool the filter.
 
-        To filter them out:
+        Primary defence (Windows): check GetAsyncKeyState(VK_CONTROL).
+        If the Ctrl key is not physically held, the SIGINT is phantom —
+        discard it immediately.
+
+        Secondary defence (all platforms): double-tap filter.
           1st Ctrl+C  → print hint, record timestamp, do NOT interrupt.
           2nd Ctrl+C within 1.5s → soft interrupt (set flag).
           3rd Ctrl+C while already interrupted → hard exit.
@@ -150,6 +154,24 @@ class KeyboardMonitor:
                 "SIGINT stack:\n%s",
                 "".join(_tb.format_stack(frame, limit=4)),
             )
+
+        # ── Windows phantom-SIGINT guard ──────────────────────────────
+        # On Windows, validate that the user is physically holding the
+        # Ctrl key right now.  Phantom SIGINTs from child-process
+        # teardown (GenerateConsoleCtrlEvent) arrive without any real
+        # keypress, so GetAsyncKeyState(VK_CONTROL) returns 0.
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                _VK_CONTROL = 0x11
+                ctrl_held = ctypes.windll.user32.GetAsyncKeyState(_VK_CONTROL) & 0x8000
+                if not ctrl_held:
+                    _log.info(
+                        "Phantom SIGINT filtered (VK_CONTROL not held) — ignoring"
+                    )
+                    return
+            except Exception:
+                pass  # If the check fails, fall through to double-tap filter
 
         # Already interrupted → hard exit on next Ctrl+C
         if _interrupt_state.interrupted:

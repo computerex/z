@@ -13,9 +13,29 @@ Based on opencode's implementation:
 import json
 import time
 import asyncio
-from typing import Dict, List, Optional, Callable, Any, Union
+from typing import Dict, List, Optional, Callable, Any, Union, TYPE_CHECKING
 from dataclasses import dataclass
-import aiohttp
+
+if TYPE_CHECKING:
+    import aiohttp  # noqa: F401  # type-only; runtime import is lazy
+
+# NOTE: aiohttp is imported lazily (see _aiohttp() below).
+# Importing aiohttp at module load triggers platform.uname() on Windows,
+# which can hang for minutes when WMI is sluggish (e.g., after memory
+# pressure / OOM events). Lazy import avoids paying that cost just to
+# load the harness, since most users never use Codex OAuth.
+
+_aiohttp_mod = None
+
+
+def _aiohttp():
+    """Lazily import and return the aiohttp module."""
+    global _aiohttp_mod
+    if _aiohttp_mod is None:
+        import aiohttp as _m
+        _aiohttp_mod = _m
+    return _aiohttp_mod
+
 
 from .oauth import OAuthToken, get_oauth_manager
 
@@ -93,11 +113,11 @@ class CodexOAuthClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: Optional["aiohttp.ClientSession"] = None
 
     async def __aenter__(self):
         """Async context manager entry."""
-        self._session = aiohttp.ClientSession()
+        self._session = _aiohttp().ClientSession()
         return self
 
     async def __aexit__(self, *args):
@@ -114,7 +134,8 @@ class CodexOAuthClient:
         """
         if self.oauth_token.is_expired():
             # Refresh token using aiohttp (non-blocking)
-            session = self._session or aiohttp.ClientSession()
+            _ah = _aiohttp()
+            session = self._session or _ah.ClientSession()
             close_after = self._session is None
             try:
                 async with session.post(
@@ -125,7 +146,7 @@ class CodexOAuthClient:
                         "refresh_token": self.oauth_token.refresh_token,
                         "client_id": CLIENT_ID,
                     },
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    timeout=_ah.ClientTimeout(total=30),
                 ) as response:
                     if response.status >= 400:
                         raise RuntimeError(f"Token refresh failed: {response.status}")
@@ -244,7 +265,7 @@ class CodexOAuthClient:
         )
 
         if not self._session:
-            self._session = aiohttp.ClientSession()
+            self._session = _aiohttp().ClientSession()
 
         full_content = ""
         full_reasoning = ""
@@ -257,7 +278,7 @@ class CodexOAuthClient:
                 CODEX_API_ENDPOINT,
                 headers=headers,
                 json=body,
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                timeout=_aiohttp().ClientTimeout(total=self.timeout),
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()

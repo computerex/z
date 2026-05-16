@@ -126,14 +126,6 @@ TOOL_DEFS: List[ToolDef] = [
                     ToolParam("tool", required=True),
                     ToolParam("arguments", required=True)]),
 
-    # --- Context management ---
-    ToolDef("retrieve_tool_result", category="context",
-            description="Retrieve a stored tool result by its ID. Use this to access "
-                       "the output of previous tool executions that have been stored in the context. "
-                       "Provide the result_id to get the complete tool output and metadata.",
-            params=[ToolParam("result_id", required=True,
-                    description="The ID of the stored tool result (e.g., res_abc123_456)")]),
-
     # --- Agent meta ---
     ToolDef("manage_todos",     category="agent",
             description="Track goals and progress with a structured task list. "
