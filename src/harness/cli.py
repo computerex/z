@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""Entry point for the harness CLI."""
+"""Console-script entry point for the harness CLI.
 
-import os
-import importlib.util
+Registered in pyproject.toml as: z = "harness.cli:run"
+"""
 
-# Directly load the root harness.py module by file path
-# This bypasses the package vs module naming conflict
-current_dir = os.path.dirname(os.path.abspath(__file__))
-harness_file = os.path.abspath(os.path.join(current_dir, "..", "..", "harness.py"))
-
-spec = importlib.util.spec_from_file_location("root_harness", harness_file)
-harness_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(harness_module)
-
-main = harness_module.main
+from harness._app import main
 
 
 def run():
