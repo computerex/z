@@ -259,6 +259,28 @@ def strip_thinking_blocks(content: str) -> str:
     return preamble + rest
 
 
+def _erase_thinking_blocks(content: str) -> str:
+    """Completely erase <thinking>/<think> blocks for tool-call parsing.
+
+    Unlike strip_thinking_blocks (which keeps inner text for display),
+    this removes the entire block so that tool tags inside thinking are NOT
+    mistakenly parsed as real tool calls.  GLM-style models sometimes place
+    an opening tool tag inside their <think> block and output the parameters
+    after </think>, causing the parser to match a truncated, parameter-free
+    block and silently execute the wrong action (e.g. "list" instead of "add").
+
+    Closed blocks are removed first; then any unclosed block reaching end-of-
+    string is trimmed so truncated reasoning never leaks into parsed output.
+    """
+    # Closed blocks (greedy inner match so nested tags are consumed)
+    content = re.sub(r"(?s)<thinking>.*?</thinking>", "", content)
+    content = re.sub(r"(?s)<think>.*?</think>", "", content)
+    # Unclosed blocks (model truncated mid-reasoning)
+    content = re.sub(r"(?s)<thinking>.*$", "", content)
+    content = re.sub(r"(?s)<think>.*$", "", content)
+    return content
+
+
 def _normalize_tool_xml(content: str) -> str:
     """Fix common model hallucinations in tool call XML.
 
@@ -281,7 +303,7 @@ def parse_xml_tool(content: str) -> Optional[ParsedToolCall]:
     For tools with complex content (write_to_file, replace_in_file), uses
     greedy matching to get the full content including any nested examples.
     """
-    content = strip_thinking_blocks(content)
+    content = _erase_thinking_blocks(content)
     content = _normalize_tool_xml(content)
 
     tool_names = get_tool_names()
@@ -449,7 +471,7 @@ def parse_all_xml_tools(content: str) -> List[ParsedToolCall]:
     can execute them sequentially. This is essential for batched
     operations like adding multiple todo items in one response.
     """
-    stripped = strip_thinking_blocks(content)
+    stripped = _erase_thinking_blocks(content)
     stripped = _normalize_tool_xml(stripped)
 
     tool_names = get_tool_names()
@@ -2534,6 +2556,55 @@ class ClineAgent:
                     )
 
                 if not tool_call:
+                    # Detect the GLM/QWen pattern where tool XML is inside a
+                    # <think> block (partially or entirely).  Two sub-cases:
+                    #
+                    #   A) Only the opening tag is inside thinking, params are
+                    #      outside → after erasing, closing tag appears without
+                    #      a matching opening tag.
+                    #
+                    #   B) The entire tool call (opening + params + closing) is
+                    #      inside thinking → after erasing, the opening tag is
+                    #      gone from `erased` but still present in `full_content`.
+                    #
+                    # Both cases mean the tool was NOT executed.  Inject a
+                    # correction so the model re-emits the XML outside thinking.
+                    erased = _erase_thinking_blocks(full_content)
+                    tool_names_set = set(get_tool_names())
+                    think_trapped_tools = [
+                        tn
+                        for tn in tool_names_set
+                        if (
+                            # Case A: opening inside thinking, closing outside
+                            (f"</{tn}>" in erased and f"<{tn}>" not in erased)
+                            # Case B: entire call inside thinking
+                            or (f"<{tn}>" in full_content and f"<{tn}>" not in erased)
+                        )
+                    ]
+                    if think_trapped_tools:
+                        bad_tool = think_trapped_tools[0]
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(
+                                    response, "provider_content_blocks", None
+                                ),
+                            )
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="user",
+                                content=(
+                                    f"[SYSTEM: Your <{bad_tool}> tool call was "
+                                    "inside your <think> block and was NOT executed. "
+                                    f"Re-emit the complete <{bad_tool}>...</{bad_tool}> "
+                                    "XML AFTER the closing </think> tag, outside any thinking block.]"
+                                ),
+                            )
+                        )
+                        continue
+
                     # Detect invalid direct MCP tool-tag usage (e.g. <browser_navigate>).
                     # MCP tools must be invoked via mcp_call_tool, not direct tags.
                     tool_names_set = set(get_tool_names())
