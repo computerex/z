@@ -132,6 +132,7 @@ class TodoManager:
         description: Optional[str] = None,
         notes: Optional[str] = None,
         context_refs: Optional[List[str]] = None,
+        parent_id: Optional[int] = None,
     ) -> Optional[TodoItem]:
         """Update a todo item. Returns updated item or None if not found."""
         item = self._items.get(item_id)
@@ -150,6 +151,8 @@ class TodoManager:
             item.notes = notes
         if context_refs is not None:
             item.context_refs = context_refs
+        if parent_id is not None:
+            item.parent_id = parent_id
 
         item.updated_at = time.time()
         return item

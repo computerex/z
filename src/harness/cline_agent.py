@@ -1761,6 +1761,21 @@ class ClineAgent:
                 # Used below to detect hidden-only responses (reasoning but no text/tool calls).
                 _response_visible_text = full_content
 
+                # Strip XML tool tags that the model sometimes emits despite being
+                # told to use native tool calling (it pattern-matches from
+                # conversation history).  This mirrors what introspect does.
+                if _response_visible_text.strip():
+                    _tool_names_pattern = "|".join(
+                        re.escape(n) for n in get_tool_names()
+                    )
+                    _response_visible_text = re.sub(
+                        rf"</?(?:{_tool_names_pattern})\b[^>]*>",
+                        "",
+                        _response_visible_text,
+                    ).strip()
+                    # Also strip from full_content so history stays clean
+                    full_content = _response_visible_text
+
                 # Wrap reasoning into full_content so the pipeline can see it
                 if full_reasoning.strip():
                     full_content = (

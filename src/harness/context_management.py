@@ -187,6 +187,37 @@ class TruncationResult:
     notice: Optional[str] = None
 
 
+def _msg_role(msg) -> str:
+    """Get the role of a message, handling both objects and dicts."""
+    if hasattr(msg, 'role'):
+        return msg.role
+    return msg.get('role', '')
+
+
+def _msg_tool_calls(msg):
+    """Get tool_calls from a message, handling both objects and dicts."""
+    if hasattr(msg, 'tool_calls'):
+        return msg.tool_calls or []
+    return msg.get('tool_calls', []) or []
+
+
+def _is_tool(msg) -> bool:
+    """Check if a message is a tool result message."""
+    return _msg_role(msg) == "tool"
+
+
+def _has_tool_calls(msg) -> bool:
+    """Check if an assistant message has tool_calls entries."""
+    if _msg_role(msg) != "assistant":
+        return False
+    return bool(_msg_tool_calls(msg))
+
+
+def _tc_count(msg) -> int:
+    """Count the number of tool_calls in an assistant message."""
+    return len(_msg_tool_calls(msg))
+
+
 def truncate_conversation(
     messages: List,
     strategy: str = "half",  # "none", "lastTwo", "half", "quarter"
@@ -204,6 +235,20 @@ def truncate_conversation(
     - "lastTwo": Keep first pair + last user-assistant pair
     - "half": Keep first pair + 50% of remaining
     - "quarter": Keep first pair + 25% of remaining
+    
+    Integrity guarantee:
+    ``assistant`` messages with ``tool_calls`` and their corresponding
+    ``role="tool"`` results are kept as atomic groups.  The truncation
+    boundary is adjusted so that:
+    
+    * No ``role="tool"`` message survives without its preceding
+      ``assistant(tool_calls)``.
+    * No ``assistant(tool_calls)`` message survives without all of its
+      matching ``role="tool"`` results.
+    
+    If the required ``role="tool"`` messages were removed, they are
+    pulled back from the removed region if possible; otherwise the
+    orphaned ``assistant(tool_calls)`` is also dropped.
     """
     if len(messages) <= 4:
         return TruncationResult(messages=messages, removed_count=0)
@@ -232,7 +277,78 @@ def truncate_conversation(
         return TruncationResult(messages=messages, removed_count=0)
     
     kept_messages = remaining[-keep_count:] if keep_count > 0 else []
-    removed_count = len(remaining) - keep_count
+    
+    # ──────────────────────────────────────────────────────────────────
+    # Fix: Preserve tool_calls/tool message group integrity
+    #
+    # The naive "even pair" assumption breaks when tool_calls are in
+    # play because the message sequence can be:
+    #
+    #   assistant(tool_calls=[a,b]) → tool(a) → tool(b) → assistant(...)
+    #
+    # A truncation boundary through the middle of such a group produces
+    # orphaned tool or assistant(tool_calls) messages, which cause
+    # providers like DeepSeek to reject the request with 400.
+    #
+    # The fix combines two steps:
+    #   1. Find the first non-tool message in kept_messages.
+    #   2. If it has tool_calls, verify all its tool results are present.
+    #      Tools at the start of kept_messages may belong to this
+    #      assistant — they are NOT blindly dropped.
+    # ──────────────────────────────────────────────────────────────────
+    
+    # Locate the first non-tool message in the kept tail
+    first_non_tool = 0
+    while first_non_tool < len(kept_messages) and _is_tool(kept_messages[first_non_tool]):
+        first_non_tool += 1
+    
+    if first_non_tool < len(kept_messages) and _has_tool_calls(kept_messages[first_non_tool]):
+        # This assistant has tool_calls.  Count how many tool results
+        # are available (both before and after it in kept_messages).
+        need = _tc_count(kept_messages[first_non_tool])
+        tools_before = first_non_tool  # tools at the start of kept
+        tools_after = 0
+        for m in kept_messages[first_non_tool + 1:]:
+            if _is_tool(m):
+                tools_after += 1
+            else:
+                break
+        total_have = tools_before + tools_after
+        missing = need - total_have
+        
+        if missing > 0:
+            # Pull missing tool messages from the removed region
+            # (messages immediately before the truncation boundary).
+            removed_idx = len(remaining) - len(kept_messages)
+            predecessor_slice = remaining[:removed_idx]
+            pulled = []
+            for m in reversed(predecessor_slice):
+                if _is_tool(m) and len(pulled) < missing:
+                    pulled.insert(0, m)
+                else:
+                    break
+            
+            if len(pulled) == missing:
+                # Success — prepend pulled tools to kept_messages
+                kept_messages = pulled + kept_messages
+            else:
+                # Can't satisfy — drop the entire orphaned group
+                # (assistant + all its tool results) to prevent API 400.
+                drop_end = first_non_tool + 1 + tools_after
+                kept_messages = kept_messages[drop_end:]
+        elif missing < 0:
+            # More tools than needed — drop excess from the front
+            excess = -missing
+            kept_messages = kept_messages[excess:]
+        # else missing == 0: perfect match, keep as-is
+    elif first_non_tool > 0:
+        # Tools at the start, but the first non-tool message does NOT
+        # have tool_calls — these tools are truly orphaned. Drop them.
+        kept_messages = kept_messages[first_non_tool:]
+    
+    # ──────────────────────────────────────────────────────────────────
+    
+    removed_count = len(remaining) - len(kept_messages)
     
     # Add truncation notice
     notice = (
