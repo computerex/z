@@ -12,6 +12,7 @@ import difflib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from rich.console import Console
+from rich.markup import escape as rich_escape
 import psutil
 
 from .context_management import truncate_file_content, truncate_output
@@ -768,6 +769,23 @@ class ToolHandlers:
             except Exception:
                 pass
 
+        # Await all cancelled background tasks so they are fully done before
+        # loop.close().  Un-awaited pending Tasks get GC'd during interpreter
+        # shutdown which, in Python 3.12, calls loop.call_exception_handler()
+        # → asyncio logger → RotatingFileHandler.  If that handler has already
+        # started closing, the recursive logging chain can raise RecursionError
+        # which escapes logging.shutdown() because raiseExceptions is True.
+        tasks_to_await = []
+        for info in self._background_procs.values():
+            task = info.get("task")
+            if task and not task.done():
+                tasks_to_await.append(task)
+        if tasks_to_await:
+            try:
+                await asyncio.gather(*tasks_to_await, return_exceptions=True)
+            except Exception:
+                pass
+
         # Close persistent MCP sessions on shutdown.
         for sname in list(self._mcp_sessions.keys()):
             try:
@@ -1403,7 +1421,7 @@ class ToolHandlers:
         
         mode_indicator = "[bg] " if background else ""
         cmd_short = command.split('\n')[0][:120]  # First line, truncated
-        self.console.print(f"  [dim]•[/dim] [bold]Running[/bold] [dim]{mode_indicator}{cmd_short}[/dim]")
+        self.console.print(f"  [dim]•[/dim] [bold]Running[/bold] [dim]{rich_escape(mode_indicator + cmd_short)}[/dim]")
         
         if background:
             return await self._run_background_command(command)
@@ -1460,7 +1478,7 @@ class ToolHandlers:
                 
                 # Show hint after 5 seconds
                 if elapsed > 5 and not hint_shown:
-                    self.console.print(f"    [dim]Ctrl+B background · Esc stop[/dim]")
+                    self.console.print(f"    [dim]Ctrl+B background · Esc Esc stop[/dim]")
                     hint_shown = True
                 
                 # Auto-background after timeout.  Use a shorter timeout for
@@ -1593,31 +1611,51 @@ class ToolHandlers:
         the final summary is printed by execute_command on completion.
         Returns the updated file position.
         """
+        # Separate file I/O from display: a display failure must never reset
+        # the file position, which would cause the same content to be re-read
+        # and re-processed in an infinite loop.
+        new_pos = file_pos
+        new_data = ""
         try:
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(file_pos)
                 new_data = f.read()
                 new_pos = f.tell()
-            if new_data:
-                # Decode any CLIXML blocks before splitting into lines so
-                # multi-line XML fragments are cleaned up as a unit.
-                new_data = _decode_clixml_in_text(new_data)
-                for line in new_data.splitlines():
-                    decoded_line = _decode_powershell_clixml(line)
-                    if not decoded_line.strip():
-                        continue
-                    output_lines.append(decoded_line)
-                    n = len(output_lines)
-                    if n <= self._MAX_LIVE_DISPLAY:
-                        safe_line = sanitize_terminal_output(decoded_line)
-                        self.console.print(f"    [dim]{safe_line}[/dim]")
-                    elif n == self._MAX_LIVE_DISPLAY + 1:
-                        self.console.print(f"    [dim]… +more lines (running)[/dim]")
-            return new_pos
         except FileNotFoundError:
             return file_pos
         except Exception:
             return file_pos
+
+        if not new_data:
+            return new_pos
+
+        # Decode any CLIXML blocks before splitting into lines so
+        # multi-line XML fragments are cleaned up as a unit.
+        try:
+            new_data = _decode_clixml_in_text(new_data)
+        except Exception:
+            pass
+        for line in new_data.splitlines():
+            try:
+                decoded_line = _decode_powershell_clixml(line)
+            except Exception:
+                decoded_line = line
+            if not decoded_line.strip():
+                continue
+            output_lines.append(decoded_line)
+            n = len(output_lines)
+            if n <= self._MAX_LIVE_DISPLAY:
+                safe_line = sanitize_terminal_output(decoded_line)
+                try:
+                    self.console.print(f"    [dim]{rich_escape(safe_line)}[/dim]")
+                except Exception:
+                    pass
+            elif n == self._MAX_LIVE_DISPLAY + 1:
+                try:
+                    self.console.print(f"    [dim]… +more lines (running)[/dim]")
+                except Exception:
+                    pass
+        return new_pos
     
     def _read_log_file(self, log_path: str) -> str:
         """Read the entire contents of a log file."""
@@ -1690,7 +1728,7 @@ class ToolHandlers:
             initial_output = data.splitlines()[-10:]
             for line in initial_output:
                 safe_line = sanitize_terminal_output(line)
-                self.console.print(f"[dim]  {safe_line}[/dim]")
+                self.console.print(f"[dim]  {rich_escape(safe_line)}[/dim]")
         except Exception:
             pass
         

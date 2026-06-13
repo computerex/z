@@ -3008,6 +3008,42 @@ def _parse_token_limit_input(raw: str) -> Optional[int]:
     return val if val > 0 else None
 
 
+def _cancel_pending_and_close(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel all pending asyncio tasks and close the event loop cleanly.
+
+    Leaving Tasks pending when loop.close() is called causes them to be GC'd
+    in Python 3.12 with __del__ that calls loop.call_exception_handler().  If
+    the logging system is already partially shut down at that point, the
+    resulting call chain can raise RecursionError that escapes
+    logging.shutdown() (because logging.raiseExceptions is True by default).
+
+    This helper cancels every pending task, waits for the cancellations to
+    propagate, then sets logging.raiseExceptions = False before closing so
+    that any residual errors during logging.shutdown() are silently swallowed.
+    """
+    import logging as _logging
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        if pending:
+            for t in pending:
+                t.cancel()
+            try:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Suppress logging errors during interpreter shutdown so they can't
+    # escape logging.shutdown() as RecursionError.
+    _logging.raiseExceptions = False
+    try:
+        loop.close()
+    except Exception:
+        pass
+
+
 async def run_single(
     agent: ClineAgent,
     user_input: Union[str, List[Dict[str, Any]]],
@@ -3401,7 +3437,7 @@ def main():
             loop.run_until_complete(run_single(agent, user_input, console))
         finally:
             cleanup_and_save()
-            loop.close()
+            _cancel_pending_and_close(loop)
     else:
         # Interactive mode â€” clean startup banner
         stats = agent.get_context_stats()
@@ -4746,10 +4782,7 @@ def main():
                 break
 
         # Clean up the event loop
-        try:
-            loop.close()
-        except:
-            pass
+        _cancel_pending_and_close(loop)
 
 
 if __name__ == "__main__":
