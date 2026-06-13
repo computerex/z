@@ -3387,7 +3387,7 @@ def main():
             _banner_model += f"  [dim]{_banner_prov}[/dim]"
         banner_table.add_row("model", _banner_model)
         banner_table.add_row(
-            "context", f"[bold]{stats['max_allowed']:,}[/bold] [dim]tokens[/dim]"
+            "context", f"[bold]{stats['context_window']:,}[/bold] [dim]tokens[/dim]"
         )
         banner_table.add_row("workspace", f"[cyan]{ws_short}[/cyan]")
         banner_table.add_row("session", current_session)
@@ -3843,7 +3843,7 @@ def main():
                             estimate_messages_tokens as _emt,
                         )
 
-                        _, max_allowed = _gml(agent.config.model, api_url=agent.config.api_url)
+                        context_window, max_allowed = _gml(agent.config.model, api_url=agent.config.api_url)
                         total_tokens = _emt(agent.messages)
                         pct = total_tokens / max_allowed * 100 if max_allowed else 0
                         over = total_tokens > int(max_allowed * 0.85)
@@ -3867,7 +3867,7 @@ def main():
                         ctx_val = Text()
                         ctx_val.append_text(bar)
                         ctx_val.append(
-                            f"  {total_tokens:,} / {max_allowed:,} ({pct:.0f}%)"
+                            f"  {total_tokens:,} / {context_window:,} ({pct:.0f}%)"
                         )
                         tbl.add_row("Context", ctx_val)
                         threshold_style = "red bold" if over else "green"

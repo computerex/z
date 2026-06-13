@@ -941,13 +941,14 @@ class ClineAgent:
 
     def get_context_stats(self) -> dict:
         """Get context statistics for display."""
-        _, max_allowed = get_model_limits(self.config.model, api_url=self.config.api_url)
+        context_window, max_allowed = get_model_limits(self.config.model, api_url=self.config.api_url)
         tokens = self.get_token_count()
         todos = self.todo_manager.list_all()
         active_todos = self.todo_manager.list_active()
         return {
             "tokens": tokens,
             "max_allowed": max_allowed,
+            "context_window": context_window,
             "percent": (tokens / max_allowed * 100) if max_allowed > 0 else 0,
             "messages": len(self.messages),
             "context_items": len(self.context.list_items()),
