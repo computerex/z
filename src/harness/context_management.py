@@ -41,25 +41,88 @@ def estimate_messages_tokens(messages: List[dict]) -> int:
 # Model context windows and safe limits (leave room for response)
 # Format: (context_window, max_allowed_input)
 # max_allowed_input leaves headroom for the model's output tokens.
-MODEL_LIMITS = {
-    "glm-4.7": (200_000, 128_000),     # 200K context, 128K max output
+# These are fetched from https://models.dev/api.json at first use.
+# This minimal hardcoded set is used as fallback if the remote fetch fails.
+_FALLBACK_LIMITS = {
+    "glm-4.7": (200_000, 128_000),
     "glm-4-plus": (128_000, 98_000),
-    "deepseek-chat": (64_000, 37_000), # older DeepSeek (pre-V4) with 64K context
-    "deepseek": (1_000_000, 800_000),  # 1M context (DeepSeek V4+), leave 200K for output
     "gpt-4": (128_000, 98_000),
-    "claude-3": (200_000, 160_000),
     "claude": (200_000, 160_000),
-    "MiniMax-M2": (1_000_000, 200_000), # 1M context
+    "MiniMax-M2": (1_000_000, 200_000),
 }
 
 DEFAULT_LIMIT = (128_000, 98_000)
 
+_remote_limits: dict | None = None
+_remote_load_attempted = False
+
+
+def _load_remote_limits() -> dict:
+    """Fetch model limits from models.dev API. Cached after first call."""
+    global _remote_limits, _remote_load_attempted
+    if _remote_load_attempted:
+        return _remote_limits or {}
+
+    _remote_load_attempted = True
+    import logging as _logging
+    _log = _logging.getLogger("harness.context_management")
+    try:
+        import httpx
+        resp = httpx.get(
+            "https://models.dev/api.json",
+            timeout=10,
+            headers={"User-Agent": "Harness/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        _log.warning("Failed to fetch model limits from models.dev: %s", exc)
+        _remote_limits = {}
+        return _remote_limits
+
+    # Flatten provider/model entries into a single lookup dict.
+    # Key is the model ID (e.g. "deepseek/deepseek-v4-flash" or "deepseek-v4-flash").
+    # We also add plain model name (without provider prefix) as a key.
+    limits: dict = {}
+    for provider, provider_data in data.items():
+        models = provider_data.get("models", {})
+        for model_id, model in models.items():
+            ctx = model.get("limit", {}).get("context")
+            out = model.get("limit", {}).get("output")
+            if ctx and out:
+                max_input = max(2000, ctx - out)
+                limits[model_id] = (ctx, max_input)
+                if "/" in model_id:
+                    short = model_id.rsplit("/", 1)[1]
+                    if short not in limits:
+                        limits[short] = (ctx, max_input)
+
+    _remote_limits = limits
+    _log.info("Loaded %d model limits from models.dev", len(limits))
+    return limits
+
 
 def get_model_limits(model: str) -> Tuple[int, int]:
-    """Get (context_window, max_allowed) for a model."""
-    for key, limits in MODEL_LIMITS.items():
-        if key in model.lower():
+    """Get (context_window, max_allowed) for a model.
+
+    Uses remote models.dev API on first call, cached thereafter.
+    Falls back to hardcoded limits, then DEFAULT_LIMIT.
+    """
+    model_lower = model.lower()
+
+    # Try remote limits first — sort by key length descending so
+    # more specific matches (e.g. "gemini-2.5-pro") win over
+    # short accidental substrings (e.g. "pro" or "2.5").
+    remote = _load_remote_limits()
+    for key in sorted(remote, key=len, reverse=True):
+        if key in model_lower:
+            return remote[key]
+
+    # Fall back to hardcoded limits
+    for key, limits in _FALLBACK_LIMITS.items():
+        if key in model_lower:
             return limits
+
     return DEFAULT_LIMIT
 
 
