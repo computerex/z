@@ -1761,9 +1761,10 @@ class ClineAgent:
                 # Used below to detect hidden-only responses (reasoning but no text/tool calls).
                 _response_visible_text = full_content
 
-                # Strip XML tool tags that the model sometimes emits despite being
-                # told to use native tool calling (it pattern-matches from
-                # conversation history).  This mirrors what introspect does.
+                # Strip XML tool tags that the model sometimes emits despite using
+                # native tool calling.  The old plugin docs taught XML format via
+                # <tagname>...</tagname> usage examples in the system prompt; this
+                # is defense-in-depth until that history fully flushes out.
                 if _response_visible_text.strip():
                     _tool_names_pattern = "|".join(
                         re.escape(n) for n in get_tool_names()

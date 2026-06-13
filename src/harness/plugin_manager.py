@@ -324,7 +324,12 @@ class PluginManager:
     # ── Prompt documentation ─────────────────────────────────────
 
     def get_tool_prompt_docs(self) -> str:
-        """Generate XML-formatted tool documentation for plugin tools (for system prompt)."""
+        """Generate natural-language tool documentation for plugin tools (for system prompt).
+
+        NOTE: Must NOT use XML tag examples — doing so causes the model to pattern-match
+        and emit XML-style tool calls (e.g. <read_file>...</read_file>) for native tools
+        even though they use OpenAI function calling via the API ``tool_calls`` parameter.
+        """
         if not self.tools:
             return ""
 
@@ -338,11 +343,11 @@ class PluginManager:
                     req = "(required)" if pinfo.get("required") else "(optional)"
                     desc = pinfo.get("description", "")
                     lines.append(f"- {pname}: {req} {desc}")
-            lines.append("Usage:")
-            lines.append(f"<{tool.name}>")
-            for pname in tool.params:
-                lines.append(f"<{pname}>value</{pname}>")
-            lines.append(f"</{tool.name}>")
+            lines.append("Usage: Call this tool via native function calling (API-level tool_calls).")
+            param_keys = list(tool.params.keys())
+            if param_keys:
+                keys_str = ", ".join(param_keys)
+                lines.append(f"         Pass parameters as a JSON object with keys: {keys_str}.")
             sections.append("\n".join(lines))
 
         return "\n\n".join(sections)
