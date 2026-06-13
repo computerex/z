@@ -17,7 +17,6 @@ from .logger import get_logger
 log = get_logger("registry")
 
 
-# â”€â”€ Tool Definition â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @dataclass
 class ToolParam:
@@ -40,7 +39,6 @@ class ToolDef:
     description: str = ""
 
 
-# â”€â”€ The Registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 TOOL_DEFS: List[ToolDef] = [
     # --- File operations ---
@@ -59,7 +57,7 @@ TOOL_DEFS: List[ToolDef] = [
             description="Write content to a file at the specified path. If the file exists it will "
                         "be overwritten. Creates directories as needed. Use for NEW files. "
                         "Prefer replace_in_file for modifying existing files. "
-                        "ALWAYS provide the COMPLETE intended content â€” no truncation. "
+                        "ALWAYS provide the COMPLETE intended content no truncation. "
                         "MUST read existing files before overwriting.",
             params=[ToolParam("path", required=True,
                               description="The path of the file to write to"),
@@ -67,10 +65,10 @@ TOOL_DEFS: List[ToolDef] = [
                               description="The full content to write to the file")]),
     ToolDef("replace_in_file", category="file", 
             description="Perform exact string replacement in a file. You MUST read the file first. "
-                        "old_text must match the file content EXACTLY â€” character-for-character "
+                        "old_text must match the file content EXACTLY character-for-character "
                         "including whitespace, indentation, and line endings. "
                         "Only the FIRST occurrence is replaced. Use multiple calls for multiple changes. "
-                        "Keep replacements concise â€” include just the changing lines and a few surrounding for uniqueness.",
+                        "Keep replacements concise include just the changing lines and a few surrounding for uniqueness.",
             params=[ToolParam("path", required=True,
                               description="The path of the file to modify"),
                     ToolParam("old_text", required=True,
@@ -93,7 +91,7 @@ TOOL_DEFS: List[ToolDef] = [
     # --- Shell / process ---
     ToolDef("execute_command",          category="shell",
             description="Execute a CLI command on the system. "
-                        "Avoid using for find/grep/cat/sed â€” use dedicated tools instead. "
+                        "Avoid using for find/grep/cat/sed use dedicated tools instead. "
                         "Use background=true for servers and long-running processes.",
             params=[ToolParam("command", required=True,
                               description="The CLI command to execute"),
@@ -103,7 +101,7 @@ TOOL_DEFS: List[ToolDef] = [
             description="List all background processes (ID, PID, status, elapsed, command)."),
     ToolDef("check_background_process", category="shell",
             description="Check status and recent logs of a background process. "
-                        "Don't poll in a loop â€” check once, do other work, check later.",
+                        "Don't poll in a loop check once, do other work, check later.",
             params=[ToolParam("id", required=True,
                               description="The ID of the background process to check"),
                     ToolParam("lines",
@@ -180,7 +178,7 @@ TOOL_DEFS: List[ToolDef] = [
     # --- Agent meta ---
     ToolDef("manage_todos",     category="agent",
             description="Track goals and progress with a structured task list. "
-                        "Persists across context compaction â€” your permanent memory. "
+                        "Persists across context compaction your permanent memory. "
                         "For complex tasks: break into todos FIRST.",
             params=[ToolParam("action", required=True,
                               description="One of: add, update, remove, list"),
@@ -202,7 +200,7 @@ TOOL_DEFS: List[ToolDef] = [
                         "Use ONLY after confirming all previous tool uses succeeded. "
                         "Do NOT end the result with questions or offers for further assistance.",
             params=[ToolParam("result", required=True,
-                              description="The final result of the task â€” must be complete and not require further input"),
+                              description="The final result of the task must be complete and not require further input"),
                     ToolParam("command",
                               description="A CLI command to demonstrate the result (e.g., open a browser, run a script)")]),
 ]
@@ -261,13 +259,6 @@ def tool_defs_to_openai_tools(tool_defs: Optional[List[ToolDef]] = None) -> List
         tools.append({"type": "function", "function": func})
     return tools
 
-
-def get_tool_def(name: str) -> Optional[ToolDef]:
-    """Return tool definition by name, or None if unknown."""
-    return TOOL_BY_NAME.get(name)
-
-
-# â”€â”€ Observability: ToolMetrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @dataclass
 class ToolCallRecord:
@@ -365,9 +356,6 @@ class ToolMetrics:
                 for r in self._calls[-n:]
             ]
 
-    def to_json(self) -> str:
-        """Serialize full metrics to JSON."""
-        return json.dumps({"summary": self.summary(), "recent": self.recent()}, indent=2)
 
 
 # Global metrics instance

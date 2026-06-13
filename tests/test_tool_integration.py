@@ -9,7 +9,6 @@ reflected in agent state. This is the critical gap that unit tests miss.
 """
 
 import asyncio
-import contextlib
 import io
 import sys
 import os

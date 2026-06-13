@@ -726,12 +726,6 @@ class OAuthManager:
 
         return token
 
-    def clear_token(self, provider: str):
-        if provider in self._tokens:
-            del self._tokens[provider]
-        token_file = self._get_token_file(provider)
-        if token_file.exists():
-            token_file.unlink()
 
 
 _oauth_manager: Optional[OAuthManager] = None

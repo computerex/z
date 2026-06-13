@@ -314,31 +314,3 @@ class DuplicateDetector:
     # Protected message indices that must never be modified
     PROTECTED_INDICES = {0, 1, 2}  # system prompt, first user-assistant pair
 
-    @classmethod
-    def replace_old_reads(cls, messages: List, path: str, new_index: int) -> int:
-        """
-        Replace older reads of the same file with a notice.
-        Returns count of replacements made.
-        
-        NOTE: This is largely superseded by SmartContextManager.consolidate_duplicates()
-        which provides more sophisticated duplicate handling.
-        """
-        count = 0
-        for i, msg in enumerate(messages):
-            if i >= new_index:
-                break
-            # CRITICAL: Never modify protected messages (system prompt, first pair)
-            if i in cls.PROTECTED_INDICES:
-                continue
-            content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
-            
-            # Check if this is a tool result with this file path
-            if f"[read_file result]" in content and path in content:
-                # Replace with notice
-                if hasattr(msg, 'content'):
-                    msg.content = f"[read_file result]\n{path}\n{cls.DUPLICATE_NOTICE}"
-                else:
-                    msg['content'] = f"[read_file result]\n{path}\n{cls.DUPLICATE_NOTICE}"
-                count += 1
-        
-        return count

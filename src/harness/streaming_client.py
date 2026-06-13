@@ -10,7 +10,6 @@ Special handling for OAuth tokens (ChatGPT Plus/Pro subscriptions):
 """
 
 import os
-import re
 import asyncio
 import time
 from typing import Dict, List, Optional, Callable, Any, Union
@@ -28,12 +27,6 @@ from .oauth import get_oauth_manager
 
 # Think-token sanitization (for tool_handlers compatibility)
 _THINK_ZWS = "\u200b"
-_THINK_TAG_RE = re.compile(r"<(/?)think>")
-
-
-def _sanitize_think_tokens(text: str) -> str:
-    """Escape <think> and </think> with zero-width space."""
-    return _THINK_TAG_RE.sub(lambda m: f"<{_THINK_ZWS}{m.group(1)}think>", text)
 
 
 def desanitize_think_tokens(text: str) -> str:
@@ -71,11 +64,6 @@ def _import_litellm():
 # For backwards compatibility - will be set after first import
 litellm = None
 acompletion = None
-
-
-class LiteLLMNotInstalled:
-    def __init__(self, *args, **kwargs):
-        raise ImportError("LiteLLM required. Install: pip install litellm")
 
 
 @dataclass
@@ -393,29 +381,6 @@ class StreamingJSONClient:
                 _litellm.drop_params = True  # Drop unsupported params
                 _litellm.success_callback = []  # Disable callbacks
                 _litellm.failure_callback = []
-
-    def _provider_kind(self) -> str:
-        """Get provider type from model name or URL."""
-        model_lower = self.litellm_model.lower()
-
-        if model_lower.startswith("bedrock/"):
-            return "litellm_bedrock"
-        elif model_lower.startswith("anthropic/"):
-            return "litellm_anthropic"
-        elif model_lower.startswith("openrouter/"):
-            return "litellm_openrouter"
-        elif model_lower.startswith("together_ai/"):
-            return "litellm_together"
-        elif model_lower.startswith("minimax/"):
-            return "litellm_minimax"
-        elif model_lower.startswith("deepseek/"):
-            return "litellm_deepseek"
-        elif model_lower.startswith("groq/"):
-            return "litellm_groq"
-        elif model_lower.startswith("ollama/"):
-            return "litellm_ollama"
-        else:
-            return "litellm_openai_compat"
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -927,40 +892,3 @@ def search_litellm_models(query: str) -> List[str]:
     )
 
     return matches
-
-
-# Convenience function for harness.py
-def fetch_models_litellm() -> List[str]:
-    """Fetch model list for harness /model command.
-
-    Returns:
-        List of model names
-    """
-    return get_litellm_model_list()
-
-
-def fetch_models_for_provider(
-    api_key: str, api_url: str = "", oauth_provider: Optional[str] = None
-) -> List[str]:
-    """Fetch models for a provider, handling OAuth specially.
-
-    Args:
-        api_key: API key (may be OAuth token)
-        api_url: API base URL
-        oauth_provider: OAuth provider ID ("openai" or "github-copilot")
-
-    Returns:
-        List of model names
-    """
-    if is_oauth_token(api_key):
-        # OAuth tokens - determine which models to show based on provider
-        if oauth_provider == "github-copilot":
-            from .copilot_oauth_client import get_copilot_models
-
-            return get_copilot_models()
-        else:
-            # Default to Codex models (OpenAI)
-            return get_codex_models()
-    else:
-        # Use LiteLLM for regular API keys
-        return get_litellm_model_list()

@@ -625,29 +625,4 @@ class CheckpointManager:
 
         return None
 
-    # ── Display helpers ──────────────────────────────────────────
 
-    def get_history_display(self, current_model: str = "") -> List[dict]:
-        """Return checkpoint history for display."""
-        items = []
-        for i, cp in enumerate(self.checkpoints):
-            items.append({
-                "index": i,
-                "user_input": cp.user_input[:80],
-                "model": cp.model,
-                "timestamp": cp.timestamp,
-                "is_current": (
-                    i == self._undo_pos if self._undo_pos >= 0
-                    else i == len(self.checkpoints) - 1
-                ),
-            })
-        return items
-
-    def gc(self) -> None:
-        """Garbage collect old git objects."""
-        if not self._initialized:
-            return
-        try:
-            self._git("gc", "--prune=7.days.ago", "--quiet", check=False)
-        except Exception:
-            pass

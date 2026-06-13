@@ -18,8 +18,8 @@ Linux binaries via Docker from any platform.
     - Linux: produces harness
     - macOS: produces harness
 """
-
 import argparse
+import importlib.util
 import platform
 import shutil
 import subprocess
@@ -242,11 +242,7 @@ def build_executable(root: Path, onefile: bool = True, debug: bool = False):
 
 def check_pyinstaller():
     """Check if PyInstaller is installed."""
-    try:
-        import PyInstaller
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("PyInstaller") is not None
 
 
 def build_linux_via_docker(root: Path) -> bool:

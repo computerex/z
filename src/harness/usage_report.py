@@ -4,7 +4,7 @@ import html
 import os
 import tempfile
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 
@@ -35,22 +35,6 @@ def _fmt_duration(ms: float) -> str:
     m = int(s) // 60
     sec = int(s) % 60
     return f"{m}m {sec}s"
-
-
-def _time_ago(dt: datetime) -> str:
-    """Format a datetime as relative time."""
-    delta = datetime.now() - dt
-    secs = int(delta.total_seconds())
-    if secs < 60:
-        return "just now"
-    if secs < 3600:
-        m = secs // 60
-        return f"{m}m ago"
-    if secs < 86400:
-        h = secs // 3600
-        return f"{h}h ago"
-    d = secs // 86400
-    return f"{d}d ago"
 
 
 def generate_usage_html(

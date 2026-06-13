@@ -1799,11 +1799,11 @@ def run_in_app_config_wizard(
                     model = _interactive_model_picker(model_current, model_ids)
                 else:
                     console.print(
-                        "  [dim]No models returned â€” using manual entry[/dim]"
+                        "  [dim]No models returned using manual entry[/dim]"
                     )
             except Exception as e:
                 console.print(
-                    f"  [yellow]âš Model fetch failed: {rich_escape(str(e))}[/yellow]"
+                    f"  [yellow]Model fetch failed: {rich_escape(str(e))}[/yellow]"
                 )
             except Exception as e:
                 console.print(
@@ -2438,84 +2438,6 @@ def _ui_choose_from_list(
         ).run()
     except Exception:
         return None
-
-
-def run_provider_picker_ui(
-    workspace: str,
-    console: Console,
-    agent: ClineAgent,
-    providers: Dict[str, dict],
-) -> str:
-    """Interactive provider picker UI (no command memorization needed)."""
-    if not providers:
-        return (
-            "No provider profiles yet. Use /provider setup <name> once, then use F2/F3."
-        )
-    active = _infer_active_provider_profile(agent, providers)
-    values: List[tuple[str, str]] = []
-    for name in sorted(providers.keys()):
-        p = providers[name]
-        detected = _detect_provider_label(p.get("api_url", ""))
-        model = p.get("model", "")
-        label = f"{name}  |  {detected}"
-        if model:
-            label += f"  |  {model}"
-        values.append((name, label))
-    picked = _ui_choose_from_list(
-        title="Select Provider",
-        text="Choose a saved provider profile to use now.",
-        values=values,
-    )
-    if not picked:
-        return "Provider selection cancelled."
-    return run_provider_manager(workspace, console, agent, providers, f"use {picked}")
-
-
-def run_model_picker_ui(
-    workspace: str,
-    console: Console,
-    agent: ClineAgent,
-    providers: Dict[str, dict],
-    refresh: bool = False,
-) -> str:
-    """Interactive model picker UI for the current provider."""
-    api_url = agent.config.api_url
-    api_key = agent.config.api_key
-    current_model = agent.config.model
-    if not api_url or not api_key:
-        return "No active provider configured. Use /provider setup <name> then /provider use <name>."
-    try:
-        model_ids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=refresh)
-    except Exception as e:
-        return f"Model fetch failed: {e}"
-    if not model_ids:
-        return "Provider returned no models."
-
-    display_ids = model_ids
-    if len(model_ids) > 200 and HAS_PROMPT_TOOLKIT and HAS_PT_DIALOGS:
-        flt = input_dialog(
-            title="Filter Models",
-            text=f"{len(model_ids)} models found. Enter a search substring (optional):",
-        ).run()
-        if flt:
-            filtered = [m for m in model_ids if flt.lower() in m.lower()]
-            if filtered:
-                display_ids = filtered
-            else:
-                return f"No models matched filter '{flt}'."
-    # Keep dialog usable
-    shown = display_ids[:200]
-    if len(shown) == 0:
-        return "No models available."
-    values = [(mid, mid) for mid in shown]
-    picked = _ui_choose_from_list(
-        title="Select Model",
-        text=f"Current: {current_model}\nShowing {len(shown)} of {len(display_ids)} model(s)",
-        values=values,
-    )
-    if not picked:
-        return "Model selection cancelled."
-    return run_model_switch_wizard(workspace, console, agent, providers, picked)
 
 
 def list_sessions(workspace: str) -> list[tuple[str, datetime, int]]:
@@ -3375,7 +3297,7 @@ def main():
             cleanup_and_save()
             loop.close()
     else:
-        # Interactive mode â€” clean startup banner
+        # Interactive mode clean startup banner
         stats = agent.get_context_stats()
         ws_short = os.path.basename(workspace) or workspace
         banner_table = Table(show_header=False, box=None, padding=(0, 1), expand=False)
@@ -3664,7 +3586,7 @@ def main():
                         from harness.usage_report import open_usage_report
                         from harness.cost_tracker import get_global_tracker
                         prov_name = _infer_active_provider_profile(agent, providers) or ""
-                        rpath = open_usage_report(
+                        open_usage_report(
                             get_global_tracker(),
                             provider_name=prov_name,
                             session_name=current_session,

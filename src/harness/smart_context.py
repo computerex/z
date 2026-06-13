@@ -222,20 +222,6 @@ class ToolResultStorage:
         results.sort(key=lambda r: result_order.get(r.result_id, float("inf")))
         return results
 
-    def clear_old_results(self, max_age_seconds: float = 3600) -> int:
-        """Clear results older than max_age_seconds."""
-        now = time.time()
-        to_remove = [
-            rid
-            for rid, result in self._results.items()
-            if now - result.timestamp > max_age_seconds
-        ]
-        for rid in to_remove:
-            self._results.pop(rid, None)
-            if rid in self._access_order:
-                self._access_order.remove(rid)
-        return len(to_remove)
-
 
 # ---------------------------------------------------------------------------
 # SmartContextManager — simplified, no semantic scoring

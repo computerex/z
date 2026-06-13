@@ -13,13 +13,12 @@ from dataclasses import dataclass
 # Import LiteLLM
 try:
     import litellm
-    from litellm import completion, acompletion
+    from litellm import acompletion
 
     LITELLM_AVAILABLE = True
 except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None
-    completion = None
     acompletion = None
 
 
@@ -110,31 +109,6 @@ class StreamingJSONClient:
 
         # Normalize model name for LiteLLM
         self.litellm_model = _normalize_model_name(model, base_url)
-
-    def _provider_kind(self) -> str:
-        """Infer provider from model name or URL."""
-        # Check model name first
-        if self.litellm_model.startswith("bedrock/"):
-            return "litellm_bedrock"
-        elif self.litellm_model.startswith("anthropic/"):
-            return "litellm_anthropic"
-        elif self.litellm_model.startswith("openrouter/"):
-            return "litellm_openrouter"
-        elif self.litellm_model.startswith("together_ai/"):
-            return "litellm_together"
-
-        # Fall back to URL detection
-        url = (self.base_url or "").lower()
-        if "bedrock" in url and "amazonaws.com" in url:
-            return "litellm_bedrock"
-        elif "anthropic.com" in url:
-            return "litellm_anthropic"
-        elif "openrouter.ai" in url:
-            return "litellm_openrouter"
-        elif "together.xyz" in url:
-            return "litellm_together"
-
-        return "litellm_openai_compat"
 
     async def __aenter__(self):
         """Async context manager entry."""

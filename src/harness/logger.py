@@ -57,11 +57,6 @@ def enable_debug() -> None:
     _debug_enabled = True
 
 
-def is_debug_enabled() -> bool:
-    """Check if debug mode is enabled."""
-    return _debug_enabled
-
-
 def debug_print(msg: str) -> None:
     """Print debug message to stdout if debug mode is enabled."""
     if _debug_enabled:

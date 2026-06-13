@@ -11,12 +11,6 @@ def get_global_config_path() -> Path:
     return Path.home() / ".z.json"
 
 
-def get_workspace_config_path(workspace: Optional[Path] = None) -> Path:
-    """Legacy helper kept for compatibility (workspace config is ignored)."""
-    ws = workspace or Path.cwd()
-    return ws / ".z" / ".z.json"
-
-
 def load_json_config(path: Path) -> dict:
     """Load config from JSON file if it exists."""
     if path.exists():
@@ -97,18 +91,6 @@ class Config:
             plugins=list(config_data.get("plugins", [])),
             plugin_config=dict(config_data.get("plugin_config", {})),
         )
-
-    @classmethod
-    def from_env(
-        cls,
-        env_path: Optional[Path] = None,
-        workspace: Optional[Path] = None,
-    ) -> "Config":
-        """Load configuration from global JSON config file.
-
-        The env_path parameter is accepted but ignored (legacy compat).
-        """
-        return cls.from_json(workspace)
 
     def validate(self) -> bool:
         """Validate the configuration."""

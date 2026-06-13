@@ -461,10 +461,6 @@ class CopilotOAuthClient:
             tool_calls=_final_tool_calls,
         )
 
-    async def chat(self, messages: List[CopilotMessage]) -> CopilotResponse:
-        """Non-streaming chat (for simple requests)."""
-        return await self.chat_stream(messages)
-
 
 def is_oauth_token(api_key: str) -> bool:
     """Check if API key is an OAuth token."""
@@ -481,8 +477,3 @@ def extract_oauth_token(api_key: str) -> Optional[str]:
 def get_copilot_models() -> List[str]:
     """Get list of allowed Copilot models."""
     return sorted(ALLOWED_COPILOT_MODELS)
-
-
-def is_copilot_model(model: str) -> bool:
-    """Check if model is a Copilot model."""
-    return model in ALLOWED_COPILOT_MODELS

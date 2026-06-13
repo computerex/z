@@ -282,7 +282,6 @@ class WorkspaceIndex:
         self._dir_count = 0
         self._skipped_files = 0
         self._is_shallow = False
-        subprojects_indexed = 0
 
         # --- Phase 1: Collect root-level files ---
         try:

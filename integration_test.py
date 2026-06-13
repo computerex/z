@@ -258,7 +258,7 @@ A simple blog application built with Flask.
         if self.test_dir and self.test_dir.exists():
             try:
                 if os.name == 'nt':
-                    for root, dirs, files in os.walk(self.test_dir):
+                    for root, _, files in os.walk(self.test_dir):
                         for file in files:
                             try:
                                 os.chmod(os.path.join(root, file), 0o777)
@@ -267,18 +267,6 @@ A simple blog application built with Flask.
                 shutil.rmtree(self.test_dir)
             except Exception as e:
                 print(f"Warning: Could not clean up: {e}")
-    
-    def simulate_user_interaction(self, user_message):
-        """Simulate a user interaction and return agent's tool calls."""
-        print(f"\n>>> USER: {user_message}")
-        
-        # Add user message
-        self.agent.messages.append(StreamingMessage(role="user", content=user_message))
-        
-        # Simulate agent response with tool calls
-        # In a real scenario, this would be the model's response
-        # For testing, we'll manually construct expected responses
-        return []
     
     def test_multi_step_file_editing(self):
         """Test complex multi-step file editing scenario."""

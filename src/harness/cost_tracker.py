@@ -90,15 +90,6 @@ class CostSummary:
             "avg_cost_per_call": round(self.total_cost / max(1, self.total_calls), 6),
         }
     
-    def format_human(self) -> str:
-        """Format for human display."""
-        return (
-            f"API Calls: {self.total_calls}\n"
-            f"Tokens: {self.total_input_tokens:,} in / {self.total_output_tokens:,} out ({self.total_tokens:,} total)\n"
-            f"Cost: ${self.total_input_cost:.4f} in / ${self.total_output_cost:.4f} out (${self.total_cost:.4f} total)\n"
-            f"Tool Calls: {self.total_tool_calls}\n"
-            f"Duration: {self.total_duration_ms / 1000:.2f}s"
-        )
 
 
 class CostTracker:
@@ -223,10 +214,6 @@ class CostTracker:
             row["output_cost"] += call.output_cost
             row["total_cost"] += call.total_cost
         return out
-    
-    def get_last_call(self) -> Optional[APICall]:
-        """Get the most recent API call."""
-        return self.calls[-1] if self.calls else None
     
     def reset(self) -> None:
         """Reset all tracking."""

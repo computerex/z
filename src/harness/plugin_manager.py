@@ -284,44 +284,6 @@ class PluginManager:
 
     # ── Hook execution ───────────────────────────────────────────
 
-    async def run_hook(self, hook_name: str, *args, **kwargs) -> Any:
-        """Run all registered handlers for a hook.
-
-        For hooks that return values (system_prompt, post_tool), results
-        are collected. For post_tool, the last non-None return wins.
-        """
-        handlers = self.hooks.get(hook_name, [])
-        if not handlers:
-            return None
-
-        last_result = None
-        for fn, plugin_name in handlers:
-            try:
-                if inspect.iscoroutinefunction(fn):
-                    result = await fn(*args, **kwargs)
-                else:
-                    result = fn(*args, **kwargs)
-                if result is not None:
-                    last_result = result
-            except Exception as e:
-                log.error("Hook %s from plugin '%s' failed: %s", hook_name, plugin_name, e)
-        return last_result
-
-    async def run_system_prompt_hooks(self) -> str:
-        """Collect all system_prompt hook contributions."""
-        parts = []
-        for fn, plugin_name in self.hooks.get(HOOK_SYSTEM_PROMPT, []):
-            try:
-                if inspect.iscoroutinefunction(fn):
-                    result = await fn()
-                else:
-                    result = fn()
-                if result:
-                    parts.append(str(result))
-            except Exception as e:
-                log.error("system_prompt hook from '%s' failed: %s", plugin_name, e)
-        return "\n\n".join(parts)
-
     # ── Tool dispatch ────────────────────────────────────────────
 
     async def dispatch_tool(self, tool_name: str, params: Dict[str, Any]) -> Optional[str]:

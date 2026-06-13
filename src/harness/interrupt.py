@@ -76,11 +76,6 @@ def reset_background():
         _interrupt_state.background = False
 
 
-def trigger_interrupt(reason: str = "user"):
-    """Trigger an interrupt externally."""
-    _interrupt_state.trigger(reason)
-
-
 class KeyboardMonitor:
     """Monitor for escape key and Ctrl+B during streaming."""
     

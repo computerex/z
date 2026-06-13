@@ -68,7 +68,7 @@ def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
         pass
     
     # Wait for all to die
-    gone, alive = psutil.wait_procs(children + [parent], timeout=timeout)
+    _, alive = psutil.wait_procs(children + [parent], timeout=timeout)
     for p in alive:
         try:
             p.kill()

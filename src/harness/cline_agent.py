@@ -185,13 +185,6 @@ class ContextContainer:
             return True
         return False
 
-    def remove_by_source(self, source: str) -> int:
-        """Remove all items with matching source. Returns count removed."""
-        to_remove = [id for id, item in self._items.items() if source in item.source]
-        for id in to_remove:
-            del self._items[id]
-        return len(to_remove)
-
     def get(self, item_id: int) -> Optional[ContextItem]:
         return self._items.get(item_id)
 
@@ -1616,13 +1609,6 @@ class ClineAgent:
                         # Read timeouts and connection errors are transient —
                         # the server may have dropped the connection or been
                         # temporarily unavailable.  Retry with a short backoff.
-                        is_transient = (not is_throttle) and any(kw in err_str for kw in (
-                            "timeout", "timed out", "read timeout",
-                            "connect timeout", "connection reset",
-                            "connection refused", "connection closed",
-                            "server disconnected", "remotedisconnected",
-                            "unexpected eof", "incomplete chunked read",
-                        ))
 
                         # For Bedrock token quotas, toggle between us./global. profiles
                         # Each profile has its own independent token bucket that refills gradually.
@@ -2582,11 +2568,6 @@ class ClineAgent:
                 self.console.print(f"    [dim]{rich_escape(text)}[/dim]")
             shown += 1
 
-    def _show_diff_blocks(self, blocks: List[Tuple[str, str]], path: str) -> None:
-        """Display SEARCH/REPLACE blocks as a unified diff (only real changes)."""
-        for search, replace in blocks:
-            self._render_udiff(search, replace)
-
     def _show_write_diff(self, old_content: str, new_content: str, path: str) -> None:
         """Display a unified diff for write_to_file overwrites."""
         self._render_udiff(old_content, new_content)
@@ -2648,12 +2629,11 @@ class ClineAgent:
                     r.strip() for r in params["context_refs"].split(",") if r.strip()
                 ]
 
-            parent_id_str = params.get("parent_id")
-
             item = self.todo_manager.update(
                 item_id=item_id,
                 title=params.get("title"),
                 status=params.get("status"),
+                parent_id=params.get("parent_id"),
                 description=params.get("description"),
                 notes=params.get("notes"),
                 context_refs=context_refs,

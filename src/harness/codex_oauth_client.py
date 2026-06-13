@@ -13,7 +13,7 @@ Based on opencode's implementation:
 import json
 import time
 import asyncio
-from typing import Dict, List, Optional, Callable, Any, AsyncGenerator, Union
+from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass
 import aiohttp
 
@@ -361,20 +361,6 @@ class CodexOAuthClient:
             finish_reason=finish_reason,
             interrupted=interrupted,
         )
-
-    async def chat(
-        self,
-        messages: List[CodexMessage],
-    ) -> CodexResponse:
-        """Non-streaming chat (for simple requests).
-
-        Args:
-            messages: List of messages
-
-        Returns:
-            CodexResponse
-        """
-        return await self.chat_stream(messages)
 
 
 def is_oauth_token(api_key: str) -> bool:
