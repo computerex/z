@@ -949,7 +949,7 @@ class ClineAgent:
             "tokens": tokens,
             "max_allowed": max_allowed,
             "context_window": context_window,
-            "percent": (tokens / max_allowed * 100) if max_allowed > 0 else 0,
+            "percent": (tokens / context_window * 100) if context_window > 0 else 0,
             "messages": len(self.messages),
             "context_items": len(self.context.list_items()),
             "context_chars": self.context.total_size(),

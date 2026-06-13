@@ -3731,7 +3731,7 @@ def main():
                         ctx_line = Text("  ")
                         ctx_line.append_text(bar)
                         ctx_line.append(
-                            f"  {stats['tokens']:,} / {stats['max_allowed']:,} tokens ({pct:.0f}%)",
+                            f"  {stats['tokens']:,} / {stats['context_window']:,} tokens ({pct:.0f}%)",
                             style="dim",
                         )
                         console.print(ctx_line)
