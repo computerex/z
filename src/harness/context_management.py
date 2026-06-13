@@ -54,12 +54,29 @@ _FALLBACK_LIMITS = {
 DEFAULT_LIMIT = (128_000, 98_000)
 
 _remote_limits: dict | None = None
+_remote_providers: dict | None = None  # raw provider data keyed by domain
 _remote_load_attempted = False
+
+
+def _extract_domain(url: str) -> str:
+    """Extract the hostname from a URL for provider matching."""
+    if not url:
+        return ""
+    url = url.strip()
+    # Strip protocol
+    if "://" in url:
+        url = url.split("://", 1)[1]
+    # Strip path/port
+    url = url.split("/")[0]
+    # Strip port
+    if ":" in url:
+        url = url.split(":")[0]
+    return url.lower()
 
 
 def _load_remote_limits() -> dict:
     """Fetch model limits from models.dev API. Cached after first call."""
-    global _remote_limits, _remote_load_attempted
+    global _remote_limits, _remote_load_attempted, _remote_providers
     if _remote_load_attempted:
         return _remote_limits or {}
 
@@ -80,12 +97,19 @@ def _load_remote_limits() -> dict:
         _remote_limits = {}
         return _remote_limits
 
-    # Flatten provider/model entries into a single lookup dict.
-    # Key is the model ID (e.g. "deepseek/deepseek-v4-flash" or "deepseek-v4-flash").
-    # We also add plain model name (without provider prefix) as a key.
+    # Build two lookups:
+    #   1) flat limits dict: model_id -> (context, max_input)
+    #   2) provider index: domain -> { model_id -> (context, max_input) }
     limits: dict = {}
-    for provider, provider_data in data.items():
+    provider_by_domain: dict = {}
+
+    for provider_id, provider_data in data.items():
         models = provider_data.get("models", {})
+        provider_api = provider_data.get("api", "")
+        domain = _extract_domain(provider_api)
+
+        # Build per-domain provider model lookup
+        provider_models: dict = {}
         for model_id, model in models.items():
             ctx = model.get("limit", {}).get("context")
             out = model.get("limit", {}).get("output")
@@ -96,24 +120,49 @@ def _load_remote_limits() -> dict:
                     short = model_id.rsplit("/", 1)[1]
                     if short not in limits:
                         limits[short] = (ctx, max_input)
+                provider_models[model_id] = (ctx, max_input)
+                if "/" in model_id:
+                    short = model_id.rsplit("/", 1)[1]
+                    if short not in provider_models:
+                        provider_models[short] = (ctx, max_input)
+
+        if domain:
+            provider_by_domain[domain] = provider_models
 
     _remote_limits = limits
+    _remote_providers = provider_by_domain
     _log.info("Loaded %d model limits from models.dev", len(limits))
     return limits
 
 
-def get_model_limits(model: str) -> Tuple[int, int]:
+def get_model_limits(
+    model: str,
+    api_url: str = "",
+) -> Tuple[int, int]:
     """Get (context_window, max_allowed) for a model.
 
     Uses remote models.dev API on first call, cached thereafter.
+    If ``api_url`` is provided, prefers the provider whose API URL
+    domain matches (e.g. ``api.deepseek.com`` → deepseek models).
     Falls back to hardcoded limits, then DEFAULT_LIMIT.
     """
     model_lower = model.lower()
 
-    # Try remote limits first — sort by key length descending so
-    # more specific matches (e.g. "gemini-2.5-pro") win over
-    # short accidental substrings (e.g. "pro" or "2.5").
     remote = _load_remote_limits()
+
+    # Provider-specific match: if we know the API URL, check that
+    # provider's models first for a more accurate limit.
+    if api_url:
+        domain = _extract_domain(api_url)
+        if domain and _remote_providers:
+            provider_models = _remote_providers.get(domain)
+            if provider_models:
+                for key in sorted(provider_models, key=len, reverse=True):
+                    if key in model_lower:
+                        return provider_models[key]
+
+    # Generic match across all models — sort by key length descending
+    # so more specific matches win over accidental substrings.
     for key in sorted(remote, key=len, reverse=True):
         if key in model_lower:
             return remote[key]

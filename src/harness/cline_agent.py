@@ -941,7 +941,7 @@ class ClineAgent:
 
     def get_context_stats(self) -> dict:
         """Get context statistics for display."""
-        _, max_allowed = get_model_limits(self.config.model)
+        _, max_allowed = get_model_limits(self.config.model, api_url=self.config.api_url)
         tokens = self.get_token_count()
         todos = self.todo_manager.list_all()
         active_todos = self.todo_manager.list_active()
@@ -1024,7 +1024,7 @@ class ClineAgent:
             )
 
         total_tokens = estimate_messages_tokens(self.messages)
-        _, max_allowed = get_model_limits(self.config.model)
+        _, max_allowed = get_model_limits(self.config.model, api_url=self.config.api_url)
 
         # System prompt analysis
         sys_msg = (
@@ -1234,7 +1234,7 @@ class ClineAgent:
                 if client:
                     client.reasoning_effort = getattr(self.config, "reasoning_effort", "high")
 
-                _, max_allowed = get_model_limits(self.config.model)
+                _, max_allowed = get_model_limits(self.config.model, api_url=self.config.api_url)
 
                 log.debug(
                     "_run_loop iteration=%d/%d tokens=%d msgs=%d",

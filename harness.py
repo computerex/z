@@ -3843,7 +3843,7 @@ def main():
                             estimate_messages_tokens as _emt,
                         )
 
-                        _, max_allowed = _gml(agent.config.model)
+                        _, max_allowed = _gml(agent.config.model, api_url=agent.config.api_url)
                         total_tokens = _emt(agent.messages)
                         pct = total_tokens / max_allowed * 100 if max_allowed else 0
                         over = total_tokens > int(max_allowed * 0.85)
