@@ -114,7 +114,11 @@ def _load_remote_limits() -> dict:
             ctx = model.get("limit", {}).get("context")
             out = model.get("limit", {}).get("output")
             if ctx and out:
-                max_input = max(2000, ctx - out)
+                # Reserve headroom for output: 20% of context, capped at 128K.
+                # This is more consistent than subtracting the full output limit,
+                # which can be unrealistically large (e.g. 384K for DeepSeek V4).
+                headroom = min(max(ctx // 5, 8_000), 128_000)
+                max_input = max(2_000, ctx - headroom)
                 limits[model_id] = (ctx, max_input)
                 if "/" in model_id:
                     short = model_id.rsplit("/", 1)[1]
