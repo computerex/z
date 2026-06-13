@@ -45,7 +45,7 @@ PROVIDER_TESTS = [
 ]
 
 
-async def test_provider(label, profile, model_override, expect_reasoning, cfg):
+async def check_provider(label, profile, model_override, expect_reasoning, cfg):
     """Test a single provider/model combo for reasoning extraction."""
     providers = cfg.get("providers", {})
     if profile not in providers:
@@ -148,7 +148,7 @@ async def main():
     results = []
     for label, profile, model_override, expect_reasoning in PROVIDER_TESTS:
         print(f"  Testing {label} ...", end="", flush=True)
-        result = await test_provider(label, profile, model_override, expect_reasoning, cfg)
+        result = await check_provider(label, profile, model_override, expect_reasoning, cfg)
         results.append(result)
 
         status = result["status"]

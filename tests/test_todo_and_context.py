@@ -356,14 +356,6 @@ class TestSmartContextManager:
         )
         assert msg_type == "search_result"
 
-    def test_classify_assistant_tool_call(self):
-        msg_type, source = SmartContextManager._classify(
-            "I'll read that file now.\n<read_file>\n<path>src/main.py</path>\n</read_file>",
-            "assistant",
-        )
-        assert msg_type == "assistant_tool_call"
-        assert source == "tool_call"
-
     def test_classify_assistant_analysis(self):
         msg_type, source = SmartContextManager._classify(
             "After reviewing the code, I think the issue is in the auth flow.",

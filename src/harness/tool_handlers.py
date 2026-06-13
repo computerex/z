@@ -1430,20 +1430,23 @@ class ToolHandlers:
             await asyncio.sleep(0.1)  # Brief pause for OS to flush file buffers
             file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
 
-            # Detached GUI app detection: if the shell exited very quickly with
-            # little or no output, the actual app may have detached (e.g. Windows
-            # GUI subsystem) and is still writing to the log file via inherited
-            # handles.  Wait briefly, then check if the log is growing — if so,
-            # promote to background so the standard log tailer keeps monitoring.
+            # Detached GUI app detection: a detached child (e.g. a Windows GUI
+            # subsystem app launched via cmd.exe) makes the shell exit fast while
+            # producing NO console output, then may write to the log via inherited
+            # handles.  We only enter this check when the fast exit produced *zero*
+            # output so far; if new lines then appear during a brief wait, a
+            # detached child is alive and we promote to background.  A normal CLI
+            # script that printed its result and exited (e.g. `python calc.py` →
+            # "5") already has output and must NOT be misclassified.
             elapsed_so_far = time.time() - start_time
-            if elapsed_so_far < 2.0 and len(output_lines) < 3:
-                log.info("Fast exit with little output (%.1fs, %d lines) — "
-                         "checking for detached GUI app", elapsed_so_far, len(output_lines))
+            if elapsed_so_far < 2.0 and len(output_lines) == 0:
+                log.info("Fast exit with no output (%.1fs) — checking for detached GUI app",
+                         elapsed_so_far)
                 await asyncio.sleep(1.0)
                 file_pos = self._tail_log_file(cmd_log_path, file_pos, output_lines)
                 if output_lines:
-                    # Log file is growing — a detached app is still running.
-                    # Promote to background so the log tailer keeps reading.
+                    # New output appeared after the shell exited — a detached app
+                    # is still running.  Promote so the log tailer keeps reading.
                     self.console.print(f"    [cyan]→ background[/cyan] [dim](detached process)[/dim]")
                     return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
 

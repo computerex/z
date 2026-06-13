@@ -1,11 +1,11 @@
-"""Integration tests for tool-use pipeline.
+"""Integration tests for the native tool-use pipeline.
 
 These tests validate the ACTUAL pipeline the agent uses:
-  Model output (XML) → parse_xml_tool() → _execute_tool() → result
+  Native tool_calls -> ParsedToolCall -> _execute_tool() -> result
 
 Unlike unit tests which test Python classes in isolation, these prove
-that if the LLM generates the right XML, the harness correctly parses
-and executes it. This is the critical gap that unit tests miss.
+that a structured tool call is correctly dispatched, executed, and
+reflected in agent state. This is the critical gap that unit tests miss.
 """
 
 import asyncio
@@ -22,8 +22,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from harness.cline_agent import (
-    parse_xml_tool,
-    parse_all_xml_tools,
     ParsedToolCall,
     ClineAgent,
 )
@@ -31,398 +29,6 @@ from harness.config import Config
 from harness.todo_manager import TodoManager, TodoStatus
 from harness.smart_context import SmartContextManager
 from harness.streaming_client import StreamingChatResponse
-
-
-# ============================================================
-# XML Parsing Tests — Does parse_xml_tool handle every tool?
-# ============================================================
-
-
-class TestParseXmlTool:
-    """Test that parse_xml_tool correctly extracts tool calls from
-    realistic model output (including surrounding prose)."""
-
-    def test_parse_read_file(self):
-        content = """I need to examine the auth module to understand the flow.
-
-<read_file>
-<path>src/auth.py</path>
-</read_file>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "read_file"
-        assert result.parameters["path"] == "src/auth.py"
-
-    def test_parse_write_to_file(self):
-        content = """I'll create the config file now.
-
-<write_to_file>
-<path>config.json</path>
-<content>
-{
-    "key": "value",
-    "nested": {
-        "a": 1
-    }
-}
-</content>
-</write_to_file>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "write_to_file"
-        assert result.parameters["path"] == "config.json"
-        assert '"key": "value"' in result.parameters["content"]
-
-    def test_parse_replace_in_file(self):
-        content = """I see the bug. Let me fix line 42.
-
-<replace_in_file>
-<path>src/auth.py</path>
-<old_text>
-    if token.validate():
-</old_text>
-<new_text>
-    if token is not None and token.validate():
-</new_text>
-</replace_in_file>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "replace_in_file"
-        assert result.parameters["path"] == "src/auth.py"
-        assert "token.validate()" in result.parameters["old_text"]
-        assert "token is not None" in result.parameters["new_text"]
-
-    def test_parse_execute_command(self):
-        content = """Let me run the tests to verify.
-
-<execute_command>
-<command>python -m pytest tests/ -v</command>
-</execute_command>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "execute_command"
-        assert result.parameters["command"] == "python -m pytest tests/ -v"
-
-    def test_parse_execute_command_background(self):
-        content = """Starting the dev server.
-
-<execute_command>
-<command>npm run dev</command>
-<background>true</background>
-</execute_command>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "execute_command"
-        assert result.parameters["command"] == "npm run dev"
-        assert result.parameters["background"] == "true"
-
-    def test_parse_list_files(self):
-        content = """<list_files>
-<path>src/</path>
-<recursive>true</recursive>
-</list_files>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "list_files"
-        assert result.parameters["path"] == "src/"
-        assert result.parameters["recursive"] == "true"
-
-    def test_parse_tool_call_shorthand_list_files(self):
-        content = """I'll inspect the repo layout first.
-
-<tool_call>list_files path="." recursive="true" />"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "list_files"
-        assert result.parameters["path"] == "."
-        assert result.parameters["recursive"] == "true"
-
-    def test_parse_search_files(self):
-        content = """<search_files>
-<path>src/</path>
-<regex>\\bdef authenticate\\b</regex>
-<file_pattern>*.py</file_pattern>
-</search_files>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "search_files"
-        assert result.parameters["path"] == "src/"
-        assert "authenticate" in result.parameters["regex"]
-        assert result.parameters["file_pattern"] == "*.py"
-
-    def test_parse_web_search(self):
-        content = """<web_search>
-<query>Python 3.12 asyncio changes</query>
-<count>5</count>
-</web_search>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "web_search"
-        assert result.parameters["query"] == "Python 3.12 asyncio changes"
-        assert result.parameters["count"] == "5"
-
-    def test_parse_mcp_list_tools(self):
-        content = """<mcp_list_tools>
-<server>MiniMax</server>
-</mcp_list_tools>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "mcp_list_tools"
-        assert result.parameters["server"] == "MiniMax"
-
-    def test_parse_mcp_search_tools(self):
-        content = """<mcp_search_tools>
-<server>MiniMax</server>
-<query>Montgomery Alabama events March 2026</query>
-<limit>5</limit>
-</mcp_search_tools>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "mcp_search_tools"
-        assert result.parameters["server"] == "MiniMax"
-        assert result.parameters["query"] == "Montgomery Alabama events March 2026"
-        assert result.parameters["limit"] == "5"
-
-    def test_parse_mcp_call_tool(self):
-        content = """<mcp_call_tool>
-<server>MiniMax</server>
-<tool>web_search</tool>
-<arguments>
-{"query":"Montgomery AL events March 2026","count":5}
-</arguments>
-</mcp_call_tool>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "mcp_call_tool"
-        assert result.parameters["server"] == "MiniMax"
-        assert result.parameters["tool"] == "web_search"
-        assert "Montgomery AL events March 2026" in result.parameters["arguments"]
-
-    def test_no_tool_call(self):
-        """Plain text with no XML should return None."""
-        content = "I cannot run commands directly. I am an AI running in a text-only environment."
-        result = parse_xml_tool(content)
-        assert result is None
-
-    def test_no_tool_call_with_xml_like_text(self):
-        """Text that mentions XML tags but isn't a tool call."""
-        content = "You can use <read_file> to read files. Just put the path inside <path> tags."
-        # This might parse as a tool call — the key question is does it matter?
-        # Actually, in Cline format, if the model generates these tags, they DO get parsed.
-        # The issue is when the model doesn't generate ANY tags.
-        pass
-
-    def test_last_tool_wins(self):
-        """When model generates multiple tool calls, the LAST one wins."""
-        content = """I'll first read the file.
-
-<read_file>
-<path>old_file.py</path>
-</read_file>
-
-Actually, let me read a different file instead.
-
-<read_file>
-<path>correct_file.py</path>
-</read_file>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "read_file"
-        assert result.parameters["path"] == "correct_file.py"
-
-
-# ============================================================
-# Multi-Tool-Call Parsing Tests
-# ============================================================
-
-
-class TestParseAllXmlTools:
-    """Test that parse_all_xml_tools finds every tool call in order."""
-
-    def test_single_tool(self):
-        content = """<read_file>
-<path>foo.py</path>
-</read_file>"""
-        results = parse_all_xml_tools(content)
-        assert len(results) == 1
-        assert results[0].name == "read_file"
-        assert results[0].parameters["path"] == "foo.py"
-
-    def test_multiple_manage_todos(self):
-        """The exact scenario that was broken: 3 manage_todos in one response."""
-        content = """I'll create a todo list.
-
-<manage_todos>
-<action>add</action>
-<title>Delete evoke.exe</title>
-</manage_todos>
-
-<manage_todos>
-<action>add</action>
-<title>Rebuild evoke.exe</title>
-</manage_todos>
-
-<manage_todos>
-<action>add</action>
-<title>Launch evoke.exe</title>
-</manage_todos>"""
-        results = parse_all_xml_tools(content)
-        assert len(results) == 3
-        assert results[0].parameters["title"] == "Delete evoke.exe"
-        assert results[1].parameters["title"] == "Rebuild evoke.exe"
-        assert results[2].parameters["title"] == "Launch evoke.exe"
-
-    def test_mixed_tool_types(self):
-        content = """<manage_todos>
-<action>update</action>
-<id>1</id>
-<status>in-progress</status>
-</manage_todos>
-
-<read_file>
-<path>src/main.py</path>
-</read_file>"""
-        results = parse_all_xml_tools(content)
-        assert len(results) == 2
-        assert results[0].name == "manage_todos"
-        assert results[1].name == "read_file"
-
-    def test_no_tools(self):
-        content = "Just some plain text with no XML tool calls."
-        results = parse_all_xml_tools(content)
-        assert len(results) == 0
-
-    def test_with_thinking_blocks(self):
-        content = """<thinking>Let me plan this out.</thinking>
-
-<manage_todos>
-<action>add</action>
-<title>First task</title>
-</manage_todos>
-
-<manage_todos>
-<action>add</action>
-<title>Second task</title>
-</manage_todos>"""
-        results = parse_all_xml_tools(content)
-        assert len(results) == 2
-        assert results[0].parameters["title"] == "First task"
-        assert results[1].parameters["title"] == "Second task"
-
-    def test_parse_all_preserves_order(self):
-        content = """<manage_todos>
-<action>add</action>
-<title>A</title>
-</manage_todos>
-<manage_todos>
-<action>add</action>
-<title>B</title>
-</manage_todos>
-<manage_todos>
-<action>add</action>
-<title>C</title>
-</manage_todos>"""
-        results = parse_all_xml_tools(content)
-        titles = [r.parameters["title"] for r in results]
-        assert titles == ["A", "B", "C"]
-
-
-# ============================================================
-# manage_todos XML Parsing Tests
-# ============================================================
-
-
-class TestParseTodoXml:
-    """Test that manage_todos XML is correctly parsed — the critical
-    integration point between our new code and the existing parser."""
-
-    def test_parse_add_simple(self):
-        content = """I'll break this task down into steps.
-
-<manage_todos>
-<action>add</action>
-<title>Implement user authentication</title>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "manage_todos"
-        assert result.parameters["action"] == "add"
-        assert result.parameters["title"] == "Implement user authentication"
-
-    def test_parse_add_with_description(self):
-        content = """<manage_todos>
-<action>add</action>
-<title>Add JWT support</title>
-<context_refs>src/auth.py,src/config.py</context_refs>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.name == "manage_todos"
-        assert result.parameters["action"] == "add"
-        assert result.parameters["title"] == "Add JWT support"
-        assert "src/auth.py" in result.parameters["context_refs"]
-        assert "src/config.py" in result.parameters["context_refs"]
-
-    def test_parse_add_subtask(self):
-        content = """<manage_todos>
-<action>add</action>
-<title>Create login endpoint</title>
-<parent_id>1</parent_id>
-<context_refs>src/routes.py</context_refs>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.parameters["action"] == "add"
-        assert result.parameters["parent_id"] == "1"
-        assert result.parameters["title"] == "Create login endpoint"
-
-    def test_parse_update_status(self):
-        content = """<manage_todos>
-<action>update</action>
-<id>1</id>
-<status>in-progress</status>
-<notes>Found existing auth module, extending it</notes>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.parameters["action"] == "update"
-        assert result.parameters["id"] == "1"
-        assert result.parameters["status"] == "in-progress"
-        assert "extending it" in result.parameters["notes"]
-
-    def test_parse_update_completed(self):
-        content = """Task is done.
-
-<manage_todos>
-<action>update</action>
-<id>3</id>
-<status>completed</status>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.parameters["action"] == "update"
-        assert result.parameters["id"] == "3"
-        assert result.parameters["status"] == "completed"
-
-    def test_parse_remove(self):
-        content = """<manage_todos>
-<action>remove</action>
-<id>5</id>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.parameters["action"] == "remove"
-        assert result.parameters["id"] == "5"
-
-    def test_parse_list(self):
-        content = """Let me review my progress.
-
-<manage_todos>
-<action>list</action>
-</manage_todos>"""
-        result = parse_xml_tool(content)
-        assert result is not None
-        assert result.parameters["action"] == "list"
 
 
 # ============================================================
@@ -603,12 +209,12 @@ class TestToolDispatch:
 
 
 class TestEndToEndMock:
-    """Simulate realistic model output and verify the complete pipeline.
+    """Simulate realistic native tool calls and verify the complete pipeline.
 
-    These test what happens in _run_loop when the model generates XML:
-    1. Model text → parse_xml_tool() → ParsedToolCall
+    These test what happens in _run_loop when the model emits a tool call:
+    1. Native tool_call → ParsedToolCall
     2. ParsedToolCall → _execute_tool() → result string
-    3. Result gets appended as user message for next iteration
+    3. Result gets appended as a tool message for next iteration
     """
 
     def _make_agent(self):
@@ -631,33 +237,26 @@ class TestEndToEndMock:
         return agent
 
     def test_e2e_model_adds_todo_then_reads_file(self):
-        """Simulate: model → add todo XML → parse → execute → verify state."""
+        """Simulate: model → add todo tool call → execute → verify state."""
         agent = self._make_agent()
 
-        # Simulate realistic model output with prose + XML
-        model_output = """I'll start by breaking this task into steps.
-
-First, let me create a todo list to track my progress:
-
-<manage_todos>
-<action>add</action>
-<title>Read and understand auth module</title>
-<context_refs>src/auth.py</context_refs>
-</manage_todos>"""
-
-        # Step 1: Parse the XML
-        tool_call = parse_xml_tool(model_output)
-        assert tool_call is not None, (
-            "parse_xml_tool should find manage_todos in model output"
+        # Native tool call as emitted by the model
+        tool_call = ParsedToolCall(
+            name="manage_todos",
+            parameters={
+                "action": "add",
+                "title": "Read and understand auth module",
+                "context_refs": "src/auth.py",
+            },
         )
         assert tool_call.name == "manage_todos"
 
-        # Step 2: Execute the tool
+        # Execute the tool
         result = asyncio.get_event_loop().run_until_complete(
             agent._execute_tool(tool_call)
         )
 
-        # Step 3: Verify state changes
+        # Verify state changes
         assert "Added todo [1]" in result
         assert len(agent.todo_manager.list_all()) == 1
         item = agent.todo_manager.get(1)
@@ -669,40 +268,41 @@ First, let me create a todo list to track my progress:
         agent = self._make_agent()
 
         # Step 1: Add first todo
-        output1 = """<manage_todos>
-<action>add</action>
-<title>Fix authentication bug</title>
-</manage_todos>"""
-        tool1 = parse_xml_tool(output1)
+        tool1 = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "add", "title": "Fix authentication bug"},
+        )
         asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool1))
 
         # Step 2: Add sub-task
-        output2 = """<manage_todos>
-<action>add</action>
-<title>Add null check for token</title>
-<parent_id>1</parent_id>
-<context_refs>src/auth.py</context_refs>
-</manage_todos>"""
-        tool2 = parse_xml_tool(output2)
+        tool2 = ParsedToolCall(
+            name="manage_todos",
+            parameters={
+                "action": "add",
+                "title": "Add null check for token",
+                "parent_id": "1",
+                "context_refs": "src/auth.py",
+            },
+        )
         asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool2))
 
         # Step 3: Mark parent in-progress
-        output3 = """<manage_todos>
-<action>update</action>
-<id>1</id>
-<status>in-progress</status>
-</manage_todos>"""
-        tool3 = parse_xml_tool(output3)
+        tool3 = ParsedToolCall(
+            name="manage_todos",
+            parameters={"action": "update", "id": "1", "status": "in-progress"},
+        )
         asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool3))
 
         # Step 4: Complete sub-task
-        output4 = """<manage_todos>
-<action>update</action>
-<id>2</id>
-<status>completed</status>
-<notes>Added null check on line 42</notes>
-</manage_todos>"""
-        tool4 = parse_xml_tool(output4)
+        tool4 = ParsedToolCall(
+            name="manage_todos",
+            parameters={
+                "action": "update",
+                "id": "2",
+                "status": "completed",
+                "notes": "Added null check on line 42",
+            },
+        )
         asyncio.get_event_loop().run_until_complete(agent._execute_tool(tool4))
 
         # Verify final state
@@ -713,41 +313,6 @@ First, let me create a todo list to track my progress:
         assert child.status == TodoStatus.COMPLETED
         assert child.parent_id == 1
         assert child.notes == "Added null check on line 42"
-
-    def test_e2e_model_output_with_thinking(self):
-        """Model output with <thinking> blocks should still parse tools."""
-        model_output = """<thinking>
-I need to track my progress on this complex task.
-Let me create a todo list first before doing anything.
-</thinking>
-
-I'll organize my approach with a todo list.
-
-<manage_todos>
-<action>add</action>
-<title>Analyze codebase structure</title>
-</manage_todos>"""
-
-        tool_call = parse_xml_tool(model_output)
-        assert tool_call is not None
-        assert tool_call.name == "manage_todos"
-        assert tool_call.parameters["title"] == "Analyze codebase structure"
-
-    def test_e2e_no_tool_plain_response(self):
-        """When model says 'I can't do that' — no tool gets parsed."""
-        model_output = """No, I cannot run commands directly.
-
-I am an AI running in a text-only environment. I do not have access 
-to a terminal, a command line, or your computer's file system. This 
-means I cannot execute 'git clone', 'pip install', or download files 
-from GitHub for you.
-
-I can only:
-1. **Write the code** for you to copy and paste.
-2. **Explain** how to run the commands on your own machine."""
-
-        tool_call = parse_xml_tool(model_output)
-        assert tool_call is None, "Should NOT parse any tool from this refusal response"
 
     def test_e2e_todo_persists_through_save_load(self):
         """Todos survive session save/load."""
@@ -944,7 +509,10 @@ class TestContextDump:
             # Each message has metadata
             assert "tokens_est" in data["messages"][0]
             assert "chars" in data["messages"][0]
-            assert data["messages"][0]["tokens_est"] > 1500
+            # System prompt is substantial. Native tool calling moves the tool
+            # schemas out of the prompt (into the `tools` param), so this is
+            # leaner than the old XML-embedded prompt but still sizeable.
+            assert data["messages"][0]["tokens_est"] > 800
         finally:
             os.unlink(dump_path)
 

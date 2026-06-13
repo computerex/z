@@ -1822,6 +1822,10 @@ class ClineAgent:
                 full_content = response.content or full_content
                 full_reasoning = response.thinking or full_reasoning
 
+                # Save the actual visible text from model BEFORE thinking wrapping.
+                # Used below to detect hidden-only responses (reasoning but no text/tool calls).
+                _response_visible_text = full_content
+
                 # Wrap reasoning into full_content so the pipeline can see it
                 if full_reasoning.strip():
                     full_content = (
@@ -2094,7 +2098,11 @@ class ClineAgent:
                     )
 
                 if not tool_call:
-                    display_text = full_content.strip()
+                    # Display the VISIBLE model text only — never the <thinking>
+                    # wrapper that was spliced into full_content for the internal
+                    # pipeline/history. Rich's Markdown treats <thinking> as an
+                    # HTML block and silently swallows it, producing an empty box.
+                    display_text = _response_visible_text.strip()
 
                     if _defer_markdown_render:
                         display_text = _normalize_display_text(display_text)
@@ -2102,10 +2110,12 @@ class ClineAgent:
                             self.console.print()
                             self.console.print(Panel(Markdown(display_text), border_style="dim", padding=(0, 1)))
 
-                    # Check for truly empty response and auto-retry with guidance.
-                    # Only nudge when display_text is completely empty — short but
-                    # non-empty responses (e.g. "yes", "42", "repeat this") are valid.
-                    if not display_text:
+                    # Check for hidden-only or empty response and auto-retry with guidance.
+                    # Use _response_visible_text (pre-thinking-wrap) to detect the case
+                    # where the model produced reasoning but no actual visible output or
+                    # tool calls — full_content may be non-empty due to <thinking> wrapping
+                    # but the Panel would render as blank.
+                    if not _response_visible_text.strip():
                         thinking_len = (
                             len(response.thinking) if response.thinking else 0
                         )
