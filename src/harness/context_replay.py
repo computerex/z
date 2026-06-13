@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .context_management import estimate_tokens
-from .smart_context import SmartContextManager, SemanticScorer
+from .smart_context import SmartContextManager
 from .todo_manager import TodoManager
 
 try:
@@ -32,26 +32,10 @@ try:
 except Exception:
     HAS_SKLEARN = False
 
-try:
-    from sentence_transformers import SentenceTransformer
-    HAS_SENTENCE_TRANSFORMERS = True
-except Exception:
-    HAS_SENTENCE_TRANSFORMERS = False
-
-try:
-    import torch
-    from transformers import AutoModel, AutoTokenizer
-    HAS_TRANSFORMERS = True
-except Exception:
-    HAS_TRANSFORMERS = False
-
 ACTIONS = ["KEEP_FULL", "SUMMARIZE", "ARCHIVE_WITH_BREADCRUMB", "EVICT"]
 ACTION_TO_ID = {a: i for i, a in enumerate(ACTIONS)}
 
-# Useful defaults for embedding experimentation.
-DEFAULT_SENTENCE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DEFAULT_CODE_MODEL = "microsoft/codebert-base"
-AUTO_BACKEND = "auto"
+AUTO_BACKEND = "hash_char_wb"
 
 
 @dataclass
@@ -192,84 +176,13 @@ def _hash_embedding_features(nodes: Sequence[ReplayNode], n_features: int = 256)
     return mat.toarray().astype(np.float32)
 
 
-def _st_embedding_features(nodes: Sequence[ReplayNode], model_name: str) -> np.ndarray:
-    if not HAS_SENTENCE_TRANSFORMERS:
-        return np.zeros((len(nodes), 0), dtype=np.float32)
-    model = SentenceTransformer(model_name)
-    texts = [n.content[:2000] for n in nodes]
-    embs = model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False)
-    return np.asarray(embs, dtype=np.float32)
-
-
-def _hf_transformers_embedding_features(nodes: Sequence[ReplayNode], model_name: str) -> np.ndarray:
-    if not HAS_TRANSFORMERS:
-        return np.zeros((len(nodes), 0), dtype=np.float32)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    model.eval()
-    texts = [n.content[:2000] for n in nodes]
-    batch = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=512,
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        out = model(**batch)
-        last_hidden = out.last_hidden_state
-        mask = batch["attention_mask"].unsqueeze(-1).to(last_hidden.dtype)
-        pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-    arr = pooled.detach().cpu().numpy().astype(np.float32)
-    # L2 normalize for cosine-friendly geometry.
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    norms[norms == 0.0] = 1.0
-    return arr / norms
-
-
 def _embedding_features(
     nodes: Sequence[ReplayNode],
     backend: str = AUTO_BACKEND,
 ) -> Tuple[np.ndarray, str]:
+    """Compute hash-based embedding features (semantic backends removed)."""
     if not nodes:
         return np.zeros((0, 8), dtype=np.float32), "none"
-
-    selected = (backend or AUTO_BACKEND).strip().lower()
-    scorer = SemanticScorer.get()
-
-    if selected in (AUTO_BACKEND, "semantic", "semantic_scorer"):
-        if scorer.available:
-            contents = [n.content[:2000] for n in nodes]
-            embs = scorer._embed_batch(contents)
-            return np.asarray(embs, dtype=np.float32), "semantic_scorer"
-        # Fallback to hash if semantic scorer is unavailable.
-        return _hash_embedding_features(nodes), "hash_char_wb"
-
-    if selected in ("hash", "hashing", "charhash"):
-        return _hash_embedding_features(nodes), "hash_char_wb"
-
-    if selected.startswith("hf:"):
-        model_name = backend.split(":", 1)[1].strip()
-        if not model_name:
-            model_name = DEFAULT_SENTENCE_MODEL
-        # Try sentence-transformers first for faster encode convenience.
-        try:
-            embs = _st_embedding_features(nodes, model_name=model_name)
-            if embs.shape[1] > 0:
-                return embs, f"hf_st:{model_name}"
-        except Exception:
-            pass
-        # Fallback to transformers mean pooling.
-        try:
-            embs = _hf_transformers_embedding_features(nodes, model_name=model_name)
-            if embs.shape[1] > 0:
-                return embs, f"hf_tx:{model_name}"
-        except Exception:
-            pass
-        # Last-resort lexical hash.
-        return _hash_embedding_features(nodes), f"hash_fallback_for:{model_name}"
-
-    # Unknown backend value -> deterministic fallback.
     return _hash_embedding_features(nodes), "hash_char_wb"
 
 
@@ -465,8 +378,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--embed-backend",
         default=AUTO_BACKEND,
         help=(
-            "Embedding backend: auto | semantic_scorer | hash | hf:<model-id>. "
-            f"Examples: hf:{DEFAULT_SENTENCE_MODEL}, hf:{DEFAULT_CODE_MODEL}"
+            "Embedding backend: hash (default). "
+            "Semantic/sentence-transformer backends have been removed."
         ),
     )
     p.add_argument("--out", default="", help="Optional JSON output path.")

@@ -90,7 +90,7 @@ When sklearn is available and ≥8 candidates exist, fits a logistic regression 
 3. **Eviction** — if still over budget, evict already-compacted messages first, then lowest-scored
 
 ### When it runs
-- **Every turn**: `semantic_maintenance_tick()` — prunes stale guidance, soft compaction if over 62% budget
+- **Every turn**: `semantic_maintenance_tick()` — prunes stale/expired guidance nudges only (no general compaction)
 - **At 85% capacity**: `compact_context()` — full compaction to 75% budget target
 - **Model load**: Lazy — `SentenceTransformer("all-MiniLM-L6-v2")` loaded on first compaction, not at startup
 

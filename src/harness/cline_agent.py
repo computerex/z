@@ -1279,77 +1279,25 @@ class ClineAgent:
 
                 # Check interrupt before expensive operations
                 if is_interrupted():
-                    log.info("Interrupted before semantic maintenance")
+                    log.info("Interrupted before token check")
                     self.status.clear()
                     return "[Interrupted]"
 
-                # Continuous semantic maintenance (lightweight) every turn.
-                # Keeps stale guidance/noise trimmed even before hard thresholds.
-                try:
-                    self.messages, _maint_freed, _maint_report = (
-                        self.smart_context.semantic_maintenance_tick(
-                            self.messages,
-                            max_allowed,
-                            current_tokens=self._last_token_count,
-                        )
-                    )
-                except Exception as e:
-                    log.error("Semantic maintenance failed: %s", e)
-                    _maint_freed = 0
-                    _maint_report = "error"
-                if _maint_freed > 0:
-                    self._last_token_count = estimate_messages_tokens(self.messages)
-                    log.info(
-                        "Semantic maintenance freed %d tokens. Report: %s",
-                        _maint_freed,
-                        _maint_report,
-                    )
-                    self.console.print(
-                        f"[dim][~] Semantic maintenance: freed {_maint_freed:,} tokens ({_maint_report})[/dim]"
-                    )
-
+                # Warn if context is getting large — user should use /compact
                 compact_threshold = int(max_allowed * self.config.compaction_threshold)
                 if self._last_token_count > compact_threshold:
-                    log.info(
-                        "Context compaction triggered: %d tokens > %d threshold",
+                    pct = (self._last_token_count / max_allowed) * 100
+                    log.warning(
+                        "Context at %d/%d tokens (%.0f%%) — use /compact to truncate",
                         self._last_token_count,
-                        compact_threshold,
-                    )
-                    self.status.update("Compacting context...", StatusLine.COMPACTING)
-                    # Smart compaction: dedup → compact low-priority → evict lowest-scored
-                    self.messages, freed, report = self.smart_context.compact_context(
-                        self.messages,
                         max_allowed,
-                        current_tokens=self._last_token_count,
+                        pct,
                     )
-                    if freed > 0:
-                        self._last_token_count = estimate_messages_tokens(self.messages)
-                        log.info(
-                            "Compaction freed %d tokens, now %d tokens. Report: %s",
-                            freed,
-                            self._last_token_count,
-                            report,
-                        )
-                        self.console.print(
-                            f"[dim][!] Smart compaction: freed {freed:,} tokens ({report})[/dim]"
-                        )
-
-                        # Inject reorientation so the agent knows context changed
-                        todo_state = self.todo_manager.format_list(
-                            include_completed=False
-                        )
-                        recovery = self.smart_context.build_context_recovery_notice()
-
-                        reorientation = "[CONTEXT COMPACTED - Re-orienting]\n"
-                        if todo_state and "empty" not in todo_state.lower():
-                            reorientation += f"\n{todo_state}\n"
-                        if recovery:
-                            reorientation += f"\n{recovery}\n"
-                        reorientation += "\nCheck your todos and continue working on the current in-progress item."
-
-                        self.messages.append(
-                            StreamingMessage(role="user", content=reorientation)
-                        )
+                    self.console.print(
+                        f"[dim][~] Context at {pct:.0f}% capacity "
+                        f"({self._last_token_count:,}/{max_allowed:,} tok). "
+                        f"Use [bold]/compact[/bold] to truncate.[/dim]"
+                    )
 
                 # Auto-dump context before API call if debug enabled
                 if os.environ.get("HARNESS_DEBUG_CONTEXT"):
