@@ -44,7 +44,8 @@ def estimate_messages_tokens(messages: List[dict]) -> int:
 MODEL_LIMITS = {
     "glm-4.7": (200_000, 128_000),     # 200K context, 128K max output
     "glm-4-plus": (128_000, 98_000),
-    "deepseek-chat": (64_000, 37_000),
+    "deepseek-chat": (64_000, 37_000), # older DeepSeek (pre-V4) with 64K context
+    "deepseek": (1_000_000, 800_000),  # 1M context (DeepSeek V4+), leave 200K for output
     "gpt-4": (128_000, 98_000),
     "claude-3": (200_000, 160_000),
     "claude": (200_000, 160_000),
