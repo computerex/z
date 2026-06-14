@@ -25,37 +25,48 @@ log = logging.getLogger("harness.copilot")
 COPILOT_API_BASE = "https://api.githubcopilot.com"
 COPILOT_CHAT_ENDPOINT = "/chat/completions"
 
-# Allowed Copilot models (from models.dev - https://models.dev/api.json)
+# Allowed Copilot models — sourced from the Copilot API's available model list.
+# This is a hardcoded cache; update when the API adds or removes models.
 ALLOWED_COPILOT_MODELS = {
     # Claude models
     "claude-haiku-4.5",
     "claude-opus-4.5",
-    "claude-opus-4.6",
-    "claude-opus-41",
-    "claude-sonnet-4",
+    "claude-opus-4.7",
+    "claude-opus-4.8",
     "claude-sonnet-4.5",
     "claude-sonnet-4.6",
     # GPT models
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-0613",
+    "gpt-4",
+    "gpt-4-0613",
     "gpt-4.1",
+    "gpt-4.1-2025-04-14",
     "gpt-4o",
+    "gpt-4o-2024-05-13",
+    "gpt-4o-2024-08-06",
+    "gpt-4o-2024-11-20",
     "gpt-4o-copilot",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
+    "gpt-4-o-preview",
+    "gpt-4o-japanwest",
+    "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18",
     "gpt-5.2",
-    "gpt-5.2-codex",
     "gpt-5.3-codex",
     "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gpt-5-mini",
+    "copilot-preview-4o-mini-a1cfd608",
+    "copilot-preview-gpt4-centralus",
+    "copilot-preview-gpt4o-centralus",
     # Gemini models
     "gemini-2.5-pro",
     "gemini-3-flash-preview",
-    "gemini-3-pro-preview",
     "gemini-3.1-pro-preview",
-    # Grok
-    "grok-code-fast-1",
+    "gemini-3.5-flash",
+    # Other
+    "goldeneye-secondary",
 }
 
 
