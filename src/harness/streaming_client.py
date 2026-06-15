@@ -18,6 +18,11 @@ import time
 from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass
 
+# Import logger
+from .logger import get_logger
+
+log = get_logger("streaming_client")
+
 # Enable LiteLLM debug mode if requested
 if os.environ.get("HARNESS_LITELLM_DEBUG") == "1":
     try:
