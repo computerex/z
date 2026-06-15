@@ -423,7 +423,10 @@ class StreamingJSONClient:
         # subsequent turns benefit from cached prefix computation.
         # LiteLLM's `drop_params=True` ensures non-Anthropic providers
         # silently ignore these markers.
-        _is_anthropic = self.litellm_model.lower().startswith("anthropic/")
+        _litellm_model_lower = self.litellm_model.lower()
+        _is_anthropic = _litellm_model_lower.startswith(
+            "anthropic/"
+        ) or "/anthropic/" in _litellm_model_lower
         if _is_anthropic and litellm_messages:
             # --- system message (index 0) ---
             sys_msg = litellm_messages[0]
