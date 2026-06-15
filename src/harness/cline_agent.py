@@ -123,6 +123,34 @@ def _normalize_display_text(text: str) -> str:
     return out
 
 
+# Regex patterns for stripping text-based reasoning tags from model output.
+# Built at module load using string construction to avoid XML parser confusion.
+_REASON_TAG_OPEN = "<" + "think" + "ing>"
+_REASON_TAG_CLOSE = "<" + "/" + "thinking>"
+_REASON_OPEN_SHORT = "<" + "think" + ">"
+_REASON_CLOSE_SHORT = "<" + "/" + "think" + ">"
+_REASON_OPEN_RE = re.compile(
+    r"<think(?:ing)?>" + r".*?" + r"</think(?:ing)?>",
+    re.DOTALL,
+)
+_REASON_ORPHAN_RE = re.compile(r"</?think(?:ing)?>")
+
+
+def _strip_text_reasoning_tags(text: str) -> str:
+    """Strip text-based reasoning tags from model output.
+
+    Models like MIMO/Qwen emit ``<thinking>...</thinking>`` as plain text
+    content (not via the ``reasoning_content`` API field).  When the harness
+    uses native reasoning extraction, these text tags are redundant and cause
+    double-printing.  This function removes them.
+
+    Degenerate patterns (multiple orphaned closing tags) are also cleaned up.
+    """
+    text = _REASON_OPEN_RE.sub("", text)
+    text = _REASON_ORPHAN_RE.sub("", text)
+    return text.strip()
+
+
 @dataclass
 class ContextItem:
     """An item in the agent's context container."""
@@ -1868,6 +1896,26 @@ class ClineAgent:
                 # Used below to detect hidden-only responses (reasoning but no text/tool calls).
                 _response_visible_text = full_content
 
+                # ── Strip reasoning tags ONLY when native reasoning is active ──
+                #
+                # Two modes:
+                # 1. Native reasoning (_sf_native_reasoning_active=True):
+                #    Model sends thinking via reasoning_content API field.
+                #    Stream filter extracts it into full_reasoning via on_reasoning().
+                #    full_content may still contain text-based thinking tags that
+                #    are redundant (double-printing). Strip them.
+                #
+                # 2. Text-based thinking (_sf_native_reasoning_active=False):
+                #    Model outputs thinking tags as regular text content (MIMO, Qwen).
+                #    Stream filter extracts them into full_reasoning, but full_content
+                #    still has the raw tags. Do NOT strip -- these tags ARE the model's
+                #    visible output. Stripping them leaves empty content, triggering
+                #    false "hidden-only" nudges and premature termination.
+                if _response_visible_text.strip() and _sf_native_reasoning_active:
+                    _response_visible_text = _strip_text_reasoning_tags(
+                        _response_visible_text
+                    )
+
                 # Strip XML tool tags that the model sometimes emits despite using
                 # native tool calling.  The old plugin docs taught XML format via
                 # <tagname>...</tagname> usage examples in the system prompt; this
@@ -1884,8 +1932,10 @@ class ClineAgent:
                     # Also strip from full_content so history stays clean
                     full_content = _response_visible_text
 
-                # Wrap reasoning into full_content so the pipeline can see it
-                if full_reasoning.strip():
+                # Wrap reasoning into full_content so the pipeline can see it.
+                # Only when native reasoning was used — for text-based models
+                # (MIMO, Qwen) the reasoning tags are already in full_content.
+                if full_reasoning.strip() and _sf_native_reasoning_active:
                     full_content = (
                         f"<thinking>\n{full_reasoning}\n</thinking>\n{full_content}"
                     )
