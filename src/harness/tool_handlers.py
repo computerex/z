@@ -807,19 +807,29 @@ class ToolHandlers:
 
     async def read_file(self, params: Dict[str, str]) -> str:
         """Read a file and return its contents, with optional line range.
-        
+
         If the file exceeds MAX_FULL_READ_LINES and no start_line/end_line
         are provided, returns an error instructing the model to use line
         range parameters instead.
+
+        For image files, adds the image to context and returns a reference.
         """
+        from .image_utils import is_image_file, encode_image_to_data_uri
+
         path = self._resolve_path(params.get("path", ""))
         log.debug("read_file: path=%s start_line=%s end_line=%s",
                   path, params.get("start_line"), params.get("end_line"))
-        
+
         if not path.exists():
             log.warning("read_file: file not found: %s", path)
             return f"Error: File not found: {path}"
-        
+
+        if is_image_file(path):
+            # Add image to context for persistence across model switches
+            data_uri = encode_image_to_data_uri(path)
+            ctx_id = self.context.add("image", str(path), data_uri)
+            return f"[Image: {path.name} added to context (ID: {ctx_id})]"
+
         rel_path = str(path.relative_to(self.workspace_path)) if str(path).startswith(self.workspace_path) else str(path)
         
         # Parse optional line range parameters (1-based, inclusive)
@@ -1861,85 +1871,61 @@ class ToolHandlers:
         return result
     
     async def analyze_image(self, params: Dict[str, str]) -> str:
-        """Analyze an image using GLM-4.6V vision model via coding endpoint."""
-        import base64
+        """Analyze an image using the Z.AI GLM-4.6V vision model.
+
+        This tool is only available when using the glm-4.7 model on Z.AI.
+        """
         import httpx
         from urllib.parse import urlparse
-        
+        from .image_utils import encode_image_to_data_uri, is_image_file
+
         path_str = params.get("path", "")
-        question = params.get("question", "Describe this image in detail. Note any text, UI elements, errors, or important visual details.")
-        
+        question = params.get(
+            "question",
+            "Describe this image in detail. Note any text, UI elements, errors, or important visual details.",
+        )
+
         path = self._resolve_path(path_str)
         if not path.exists():
             return f"Error: Image not found: {path}"
-        
-        # Check file extension
-        ext = path.suffix.lower()
-        if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
-            return f"Error: Unsupported image format: {ext}. Use jpg, png, gif, or webp."
-        
-        # Read and encode image as base64
+        if not is_image_file(path):
+            return f"Error: Unsupported image format: {path.suffix}. Use jpg, jpeg, png, gif, or webp."
+
         try:
-            img_data = path.read_bytes()
-            img_base64 = base64.b64encode(img_data).decode('utf-8')
-        except Exception as e:
-            return f"Error reading image: {e}"
-        
-        # Determine mime type
-        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', 
-                    '.gif': 'image/gif', '.webp': 'image/webp'}
-        mime_type = mime_map.get(ext, 'image/png')
-        
-        # Use the Coding endpoint which properly supports vision with base64
-        # https://api.z.ai/api/coding/paas/v4/chat/completions
-        parsed = urlparse(self.config.api_url)
-        vision_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
-        
-        # OpenAI format with data URI base64
-        vision_messages = [
-            {
-                "role": "user",
-                "content": [
+            data_uri = encode_image_to_data_uri(path)
+            parsed = urlparse(self.config.api_url)
+            vision_url = f"{parsed.scheme}://{parsed.netloc}/api/coding/paas/v4/chat/completions"
+
+            payload = {
+                "model": "glm-4.6v",
+                "messages": [
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{img_base64}"
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": question
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                            {"type": "text", "text": question},
+                        ],
                     }
-                ]
+                ],
+                "max_tokens": 2048,
             }
-        ]
-        
-        payload = {
-            "model": "glm-4.6v",  # Vision model
-            "messages": vision_messages,
-            "max_tokens": 2048,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.config.api_key}",
-        }
-        
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as http_client:
-                response = await http_client.post(vision_url, headers=headers, json=payload)
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.config.api_key}",
+            }
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(vision_url, headers=headers, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                
-                # Extract OpenAI response format
+
                 if "choices" in data and len(data["choices"]) > 0:
                     content = data["choices"][0].get("message", {}).get("content", "")
                     if content:
-                        # Add to context
                         ctx_id = self.context.add("image_analysis", str(path), content)
                         return f"[Context ID: {ctx_id}]\n\nImage: {path_str}\n\n{content}"
                     return "Vision model returned empty response."
                 return f"Unexpected response format: {data}"
-                
         except httpx.HTTPStatusError as e:
             return f"Error calling vision API: {e.response.status_code} - {e.response.text[:200]}"
         except Exception as e:

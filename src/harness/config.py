@@ -88,6 +88,7 @@ class Config:
             workspace_path=workspace or Path.cwd(),
             max_context_tokens=int(config_data.get("max_context_tokens", 32000)),
             compaction_threshold=float(config_data.get("compaction_threshold", 0.85)),
+            reasoning_effort=str(config_data.get("reasoning_effort", "high")),
             plugins=list(config_data.get("plugins", [])),
             plugin_config=dict(config_data.get("plugin_config", {})),
         )

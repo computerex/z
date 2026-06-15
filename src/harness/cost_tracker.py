@@ -138,11 +138,30 @@ class CostTracker:
         finish_reason: str = "",
         extra_usage: Optional[Dict[str, Any]] = None,
     ) -> APICall:
-        """Record an API call."""
+        """Record an API call.
+
+        When Anthropic prompt-caching fields are present in *extra_usage*
+        the input cost is calculated with the correct discounted rates
+        (cache reads ≈ 10 % of base input price, cache writes ≈ 125 %).
+        """
         pricing = self.get_pricing(model)
-        
+
         # Cost per million tokens
-        input_cost = (input_tokens / 1_000_000) * pricing["input"]
+        cache_read = int((extra_usage or {}).get("cache_read_input_tokens", 0))
+        cache_write = int((extra_usage or {}).get("cache_creation_input_tokens", 0))
+
+        if cache_read or cache_write:
+            # Remaining tokens are billed at the standard input rate
+            remaining = max(0, input_tokens - cache_read - cache_write)
+            base = pricing["input"]
+            input_cost = (
+                (remaining / 1_000_000) * base
+                + (cache_read / 1_000_000) * base * 0.10       # cache reads 10 %
+                + (cache_write / 1_000_000) * base * 1.25       # cache writes 125 %
+            )
+        else:
+            input_cost = (input_tokens / 1_000_000) * pricing["input"]
+
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
         
         call = APICall(

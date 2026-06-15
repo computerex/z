@@ -55,8 +55,41 @@ DEFAULT_LIMIT = (128_000, 98_000)
 
 _remote_limits: dict | None = None
 _remote_providers: dict | None = None  # raw provider data keyed by domain
+_remote_models_raw: dict | None = None  # raw model metadata keyed by model_id
 _remote_load_attempted = False
 
+
+def get_remote_model_data(model: str, api_url: str = "") -> Optional[dict]:
+    """Return raw model metadata from models.dev/api.json if available.
+
+    Prefers a provider-specific match when ``api_url`` is provided, then
+    falls back to a generic model-id match.
+    """
+    global _remote_models_raw
+    _load_remote_limits()
+    if not _remote_models_raw:
+        return None
+
+    model_lower = model.lower()
+
+    # Provider-specific match: use the domain to narrow the provider first.
+    if api_url:
+        domain = _extract_domain(api_url)
+        if domain and _remote_providers:
+            provider_models = _remote_providers.get(domain)
+            if provider_models:
+                for key in sorted(provider_models, key=len, reverse=True):
+                    if key in model_lower:
+                        return _remote_models_raw.get(key)
+
+    # Generic match across all models
+    if isinstance(_remote_models_raw, dict):
+        for key in sorted(_remote_models_raw.keys(), key=len, reverse=True):
+            if key in model_lower:
+                data = _remote_models_raw[key]
+                return data if isinstance(data, dict) else None
+
+    return None
 
 def _extract_domain(url: str) -> str:
     """Extract the hostname from a URL for provider matching."""
@@ -76,7 +109,7 @@ def _extract_domain(url: str) -> str:
 
 def _load_remote_limits() -> dict:
     """Fetch model limits from models.dev API. Cached after first call."""
-    global _remote_limits, _remote_load_attempted, _remote_providers
+    global _remote_limits, _remote_load_attempted, _remote_providers, _remote_models_raw
     if _remote_load_attempted:
         return _remote_limits or {}
 
@@ -95,6 +128,7 @@ def _load_remote_limits() -> dict:
     except Exception as exc:
         _log.warning("Failed to fetch model limits from models.dev: %s", exc)
         _remote_limits = {}
+        _remote_models_raw = {}
         return _remote_limits
 
     # Build two lookups:
@@ -135,6 +169,17 @@ def _load_remote_limits() -> dict:
 
     _remote_limits = limits
     _remote_providers = provider_by_domain
+    # Also keep a flat registry of raw model metadata for capability lookups.
+    _remote_models_raw = {}
+    for provider_data in data.values():
+        if not isinstance(provider_data, dict):
+            continue
+        for model_id, model in provider_data.get("models", {}).items():
+            if isinstance(model, dict):
+                _remote_models_raw[model_id.lower()] = model
+                if "/" in model_id:
+                    _remote_models_raw[model_id.rsplit("/", 1)[1].lower()] = model
+
     _log.info("Loaded %d model limits from models.dev", len(limits))
     return limits
 

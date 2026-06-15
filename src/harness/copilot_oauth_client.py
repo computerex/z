@@ -440,6 +440,15 @@ class CopilotOAuthClient:
                             ),
                             "total_tokens": event["usage"].get("total_tokens", 0),
                         }
+                        # Propagate any extra usage fields (cache tokens etc.)
+                        for _extra in (
+                            "cache_read_input_tokens",
+                            "cache_creation_input_tokens",
+                            "prompt_cached_tokens",
+                        ):
+                            _val = event["usage"].get(_extra)
+                            if _val is not None:
+                                usage[_extra] = _val
 
         except asyncio.CancelledError:
             interrupted = True

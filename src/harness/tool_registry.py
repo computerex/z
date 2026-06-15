@@ -132,7 +132,8 @@ TOOL_DEFS: List[ToolDef] = [
 
     # --- External / vision / web ---
     ToolDef("analyze_image", category="external",
-            description="Analyze an image file (jpg, png, gif, webp) using a vision model.",
+            description="Analyze an image file (jpg, png, gif, webp) using the Z.AI GLM-4.6V vision model. "
+                        "Only available when the active model is glm-4.7 on Z.AI.",
             params=[ToolParam("path", required=True,
                               description="The path of the image file to analyze"),
                     ToolParam("question",
@@ -225,18 +226,44 @@ def register_plugin_tools(tool_defs: List[ToolDef]) -> None:
     rebuild_lookups()
 
 
-def get_tool_names() -> List[str]:
-    """Return canonical list of tool names."""
-    return TOOL_NAMES
+def _is_analyze_image_available(model: str = "") -> bool:
+    """analyze_image only works with the Z.AI glm-4.7 model."""
+    return "glm-4.7" in model.lower()
 
 
-def tool_defs_to_openai_tools(tool_defs: Optional[List[ToolDef]] = None) -> List[Dict[str, Any]]:
+def get_tool_names(model: str = "") -> List[str]:
+    """Return canonical list of tool names.
+
+    If ``model`` is provided, filters out tools that are not available
+    for that model (e.g. analyze_image is only available for glm-4.7).
+    """
+    if _is_analyze_image_available(model):
+        return TOOL_NAMES
+    return [n for n in TOOL_NAMES if n != "analyze_image"]
+
+
+def tool_defs_to_openai_tools(
+    tool_defs: Optional[List[ToolDef]] = None,
+    model: str = "",
+    api_url: str = "",
+) -> List[Dict[str, Any]]:
     """Convert ToolDef list to OpenAI function-calling tool schema.
 
     Returns a list of dicts suitable for the ``tools`` parameter of
     litellm.acompletion / openai.chat.completions.create.
+
+    If ``model`` is provided, filters out tools that are not available
+    for that model, and conditionally updates tool descriptions.
     """
+    from .model_capabilities import supports_vision
+
     defs = tool_defs if tool_defs is not None else TOOL_DEFS
+    if not _is_analyze_image_available(model):
+        defs = [d for d in defs if d.name != "analyze_image"]
+
+    # Check if model supports vision for conditional read_file description
+    model_supports_vision = supports_vision(model, api_url=api_url) if model else False
+
     tools: List[Dict[str, Any]] = []
     for td in defs:
         properties: Dict[str, Any] = {}
@@ -249,8 +276,12 @@ def tool_defs_to_openai_tools(tool_defs: Optional[List[ToolDef]] = None) -> List
                 required.append(p.name)
 
         func: Dict[str, Any] = {"name": td.name}
-        if td.description:
-            func["description"] = td.description
+        # Conditionally append image note to read_file description for vision models
+        description = td.description
+        if td.name == "read_file" and model_supports_vision:
+            description += " For image files (PNG, JPG, etc.), use read_file to attach images to context."
+        if description:
+            func["description"] = description
         params_schema: Dict[str, Any] = {"type": "object", "properties": properties}
         if required:
             params_schema["required"] = required

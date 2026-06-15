@@ -474,13 +474,20 @@ class ClineAgent:
             StreamingMessage(role="user", content=self._build_introspect_prompt(focus))
         )
 
+        # Filter images for non-vision models even in introspect mode
+        from .image_utils import filter_messages_for_non_vision_model
+        from .model_capabilities import supports_vision
+
+        if not supports_vision(self.config.model, api_url=self.config.api_url):
+            thinking_messages = filter_messages_for_non_vision_model(thinking_messages)
+
         full_thinking = ""
         api_t0 = time.time()
         client = self._active_client
 
         # Build a set of tag patterns to suppress from the live stream.
         # The thinking model sometimes emits XML tool tags despite being told not to.
-        _suppress_tags = set(get_tool_names())
+        _suppress_tags = set(get_tool_names(model=self.config.model))
 
         for attempt in range(1 + self._INTROSPECT_MAX_CONTINUATIONS):
             first_token = True
@@ -604,7 +611,7 @@ class ClineAgent:
 
         # Strip XML tool tags that the thinking model sometimes emits
         # despite being told not to (it pattern-matches from conversation history).
-        _tool_names_pattern = "|".join(re.escape(n) for n in get_tool_names())
+        _tool_names_pattern = "|".join(re.escape(n) for n in get_tool_names(model=self.config.model))
         full_thinking = re.sub(
             rf"</?(?:{_tool_names_pattern})\b[^>]*>", "", full_thinking
         ).strip()
@@ -1132,6 +1139,34 @@ class ClineAgent:
             # Keep MCP/provider config changes reflected without requiring restart.
             self.refresh_system_prompt()
 
+        # Seamless multimodal handling:
+        # - Track attached images in the context container.
+        # - For vision models, pass image blocks through to the API.
+        # - For non-vision models, strip image blocks and replace them with
+        #   placeholders so the API never receives raw images.
+        if not isinstance(user_content, str) and user_content:
+            from .image_utils import (
+                content_has_image_blocks,
+                adapt_content_for_non_vision_model,
+                extract_image_paths_from_content,
+            )
+            from .model_capabilities import supports_vision
+
+            image_paths = extract_image_paths_from_content(user_content)
+            for p in image_paths:
+                self.context.add("image", str(p), f"[Attached image: {p.name}]")
+
+            if content_has_image_blocks(user_content):
+                if supports_vision(self.config.model, api_url=self.config.api_url):
+                    log.debug("Model supports vision; passing image blocks through.")
+                else:
+                    log.info(
+                        "Model %s does not support vision; stripping image blocks.",
+                        self.config.model,
+                    )
+                    user_content = adapt_content_for_non_vision_model(user_content)
+                    log_input = user_label or "[image blocks omitted]"
+
         # Add user message
         self.messages.append(StreamingMessage(role="user", content=user_content))
 
@@ -1209,7 +1244,19 @@ class ClineAgent:
             _client_model = config_key
 
         # Build native tool definitions for the API tools parameter
-        native_tools = tool_defs_to_openai_tools()
+        native_tools = tool_defs_to_openai_tools(
+            model=self.config.model, api_url=self.config.api_url
+        )
+
+        # For non-vision models, filter image blocks from all messages
+        # before sending to API. Original messages are preserved in history.
+        from .image_utils import filter_messages_for_non_vision_model
+        from .model_capabilities import supports_vision
+
+        api_messages = self.messages
+        if not supports_vision(self.config.model, api_url=self.config.api_url):
+            api_messages = filter_messages_for_non_vision_model(self.messages)
+            log.debug("Filtered messages for non-vision model")
 
         try:
             _hidden_only_retry_count = 0
@@ -1767,7 +1814,7 @@ class ClineAgent:
                 # is defense-in-depth until that history fully flushes out.
                 if _response_visible_text.strip():
                     _tool_names_pattern = "|".join(
-                        re.escape(n) for n in get_tool_names()
+                        re.escape(n) for n in get_tool_names(model=self.config.model)
                     )
                     _response_visible_text = re.sub(
                         rf"</?(?:{_tool_names_pattern})\b[^>]*>",

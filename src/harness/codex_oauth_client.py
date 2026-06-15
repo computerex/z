@@ -337,6 +337,17 @@ class CodexOAuthClient:
                                         "total_tokens", 0
                                     ),
                                 }
+                                # Propagate any extra usage fields
+                                # (e.g. cached_tokens from OpenAI responses API)
+                                _u = first_output["usage"]
+                                for _extra in (
+                                    "cache_read_input_tokens",
+                                    "cache_creation_input_tokens",
+                                    "prompt_cached_tokens",
+                                ):
+                                    _val = _u.get(_extra)
+                                    if _val is not None:
+                                        usage[_extra] = _val
 
                     elif event_type == "response.incomplete":
                         # Response incomplete (e.g., max tokens reached)

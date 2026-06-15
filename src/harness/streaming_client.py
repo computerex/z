@@ -413,6 +413,47 @@ class StreamingJSONClient:
         # Convert messages to LiteLLM format
         litellm_messages = [m.to_dict() for m in messages]
 
+        # ── Anthropic prompt caching (cache_control) ──────────────────
+        # Anthropic's prompt caching requires explicit `cache_control`
+        # breakpoints on content blocks.  Without these the provider will
+        # **never** cache, regardless of how often the same prompt is sent.
+        #
+        # Strategy: mark the system message (position 0 — the largest and
+        # most static payload) and the *last* tool-result message so that
+        # subsequent turns benefit from cached prefix computation.
+        # LiteLLM's `drop_params=True` ensures non-Anthropic providers
+        # silently ignore these markers.
+        _is_anthropic = self.litellm_model.lower().startswith("anthropic/")
+        if _is_anthropic and litellm_messages:
+            # --- system message (index 0) ---
+            sys_msg = litellm_messages[0]
+            sys_content = sys_msg.get("content", "")
+            if isinstance(sys_content, str) and sys_content:
+                sys_msg["content"] = [
+                    {
+                        "type": "text",
+                        "text": sys_content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            elif isinstance(sys_content, list) and sys_content:
+                # Already an array of blocks — just tag the last one.
+                sys_content[-1]["cache_control"] = {"type": "ephemeral"}
+
+            # --- last tool-result message (helps cache tool outputs) ---
+            for _i in range(len(litellm_messages) - 1, 0, -1):
+                if litellm_messages[_i].get("role") == "tool":
+                    _tc = litellm_messages[_i].get("content", "")
+                    if isinstance(_tc, str) and _tc:
+                        litellm_messages[_i]["content"] = [
+                            {
+                                "type": "text",
+                                "text": _tc,
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ]
+                    break  # only tag the *last* tool result
+
         # Build request kwargs
         kwargs = {
             "model": self.litellm_model,
@@ -529,7 +570,7 @@ class StreamingJSONClient:
                                 if fn_args:
                                     acc["function"]["arguments"] += fn_args
 
-                # Extract usage info
+                # Extract usage info (including cache tokens from Anthropic etc.)
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage = {
                         "prompt_tokens": getattr(chunk.usage, "prompt_tokens", 0),
@@ -538,6 +579,18 @@ class StreamingJSONClient:
                         ),
                         "total_tokens": getattr(chunk.usage, "total_tokens", 0),
                     }
+                    # Propagate provider-specific cache & reasoning token counts
+                    # so the cost tracker can surface them in usage reports.
+                    for _extra_key in (
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                        "prompt_cached_tokens",
+                        "completion_reasoning_tokens",
+                        "reasoning_tokens",
+                    ):
+                        _extra_val = getattr(chunk.usage, _extra_key, None)
+                        if _extra_val is not None:
+                            usage[_extra_key] = _extra_val
 
                 # Extract finish reason
                 if chunk.choices and len(chunk.choices) > 0:

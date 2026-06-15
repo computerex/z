@@ -219,6 +219,15 @@ class BedrockClient:
                         "completion_tokens": u.get("outputTokens", 0),
                         "total_tokens": u.get("totalTokens", 0),
                     }
+                    # Propagate Bedrock cache-token fields so the cost
+                    # tracker can apply discounted pricing for cache hits.
+                    for _bk_key, _bk_api in (
+                        ("cache_read_input_tokens", "cacheReadInputTokens"),
+                        ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+                    ):
+                        _bk_val = u.get(_bk_api)
+                        if _bk_val is not None:
+                            usage[_bk_key] = _bk_val
 
         return {
             "content": "".join(content_buffer),

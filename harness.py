@@ -634,15 +634,20 @@ def _extract_image_paths_from_text(text: str) -> tuple[str, List[Path]]:
 
 
 def _supports_multimodal_input(api_url: str, model: str) -> bool:
-    """Best-effort heuristic for vision-capable chat models/providers.
+    """Return True only when we have authoritative evidence that the
+    model/provider accepts image input.
 
-    Most modern LLMs accept image input via the OpenAI multipart content
-    format.  We default to True and only return False for models we
-    positively know cannot do vision.
+    Uses LiteLLM's model registry first, then models.dev/api.json.
+    If neither source knows the model, returns False so images are
+    described via the analyze_image tool instead of being sent raw.
     """
-    # Almost all current-gen models support vision.  Return True broadly;
-    # the worst case is the provider silently ignoring the image block.
-    return True
+    try:
+        from harness.model_capabilities import supports_vision
+
+        return supports_vision(model, api_url=api_url)
+    except Exception:
+        # If the capability module fails to import, stay conservative.
+        return False
 
 
 def _image_path_to_data_uri(path: Path) -> str:
