@@ -1868,33 +1868,11 @@ class ClineAgent:
                 # Used below to detect hidden-only responses (reasoning but no text/tool calls).
                 _response_visible_text = full_content
 
-                # Strip <thinking>/<think> tags that the model emits as text content.
-                # Models like MIMO/Qwen sometimes output thinking tags directly in their
-                # text. The stream filter extracts reasoning into full_reasoning, but
-                # full_content still contains the raw tags. If we don't strip them:
-                # 1. The hidden-only detector is tricked (tags look like "visible text")
-                # 2. Degenerate </thinking> tags accumulate in history
-                # 3. Next turn the model sees its own broken output and cascades
+                # Strip XML tool tags that the model sometimes emits despite using
+                # native tool calling.  The old plugin docs taught XML format via
+                # <tagname>...</tagname> usage examples in the system prompt; this
+                # is defense-in-depth until that history fully flushes out.
                 if _response_visible_text.strip():
-                    # Remove thinking blocks: <thinking>...</thinking> and <think>...</think>
-                    # Use non-greedy matching and handle degenerate patterns (extra closing tags)
-                    _response_visible_text = re.sub(
-                        r"<think(?:ing)?>.*?</think(?:ing)?>",
-                        "",
-                        _response_visible_text,
-                        flags=re.DOTALL,
-                    )
-                    # Strip any orphaned/degenerate closing thinking tags
-                    _response_visible_text = re.sub(
-                        r"</?think(?:ing)?>",
-                        "",
-                        _response_visible_text,
-                    ).strip()
-
-                    # Strip XML tool tags that the model sometimes emits despite using
-                    # native tool calling.  The old plugin docs taught XML format via
-                    # <tagname>...</tagname> usage examples in the system prompt; this
-                    # is defense-in-depth until that history fully flushes out.
                     _tool_names_pattern = "|".join(
                         re.escape(n) for n in get_tool_names(model=self.config.model)
                     )
