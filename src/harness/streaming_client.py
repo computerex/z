@@ -7,6 +7,9 @@ Special handling for OAuth tokens (ChatGPT Plus/Pro subscriptions):
 - Detects OAuth tokens (starts with "oauth:")
 - Uses custom CodexOAuthClient instead of LiteLLM
 - Handles token refresh automatically
+
+Debug mode:
+- Set HARNESS_LITELLM_DEBUG=1 to enable LiteLLM debug output
 """
 
 import os
@@ -14,6 +17,14 @@ import asyncio
 import time
 from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass
+
+# Enable LiteLLM debug mode if requested
+if os.environ.get("HARNESS_LITELLM_DEBUG") == "1":
+    try:
+        import litellm
+        litellm.set_verbose = True
+    except Exception:
+        pass
 
 # Import OAuth client
 from .codex_oauth_client import (
@@ -510,6 +521,15 @@ class StreamingJSONClient:
         # Add native tool calling
         if tools:
             kwargs["tools"] = tools
+
+        # Debug: log the API call details
+        log.debug(
+            "LiteLLM request: model=%s, api_base=%s, messages=%d, tools=%s",
+            self.litellm_model,
+            self.base_url or "(default)",
+            len(messages),
+            "yes" if tools else "no",
+        )
 
         try:
             # Get streaming response (lazy import litellm)
