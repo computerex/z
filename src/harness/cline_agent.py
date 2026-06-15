@@ -918,6 +918,66 @@ class ClineAgent:
         heuristic = " ".join(summary_parts)
         return f"[Session resumed. {heuristic}. Continue where you left off or ask what you need to know.]"
 
+    def pop_last_messages(self, count: int = 1) -> int:
+        """Remove the last N messages from conversation history.
+
+        Never removes the system message (index 0). Returns the actual number
+        of messages removed.
+        """
+        if count <= 0:
+            return 0
+
+        # System message is always at index 0, don't remove it
+        if len(self.messages) <= 1:
+            return 0
+
+        # Ensure we don't try to remove more than available (minus system)
+        actual_count = min(count, len(self.messages) - 1)
+        if actual_count == 0:
+            return 0
+
+        # Pop the messages
+        removed = self.messages[-actual_count:]
+        self.messages = self.messages[:-actual_count]
+
+        log.info("pop_last_messages: removed %d messages", actual_count)
+        for i, msg in enumerate(removed, 1):
+            log.debug(
+                "  - Removed [%s] %s",
+                msg.role,
+                str(msg.content)[:100] if isinstance(msg.content, str) else "<list>",
+            )
+
+        return actual_count
+
+    def sanitize_messages(self) -> int:
+        """Sanitize message content to fix UTF-8 encoding issues.
+
+        Removes surrogate characters and other invalid UTF-8 sequences.
+        Returns the number of messages that were sanitized.
+        """
+        sanitized_count = 0
+        for msg in self.messages:
+            if isinstance(msg.content, str):
+                original = msg.content
+                try:
+                    # Encode as UTF-8 with error handling, then decode back
+                    # This will replace invalid sequences with replacement chars
+                    msg.content = original.encode("utf-8", errors="replace").decode(
+                        "utf-8", errors="replace"
+                    )
+                    if msg.content != original:
+                        sanitized_count += 1
+                        log.debug(
+                            "Sanitized message (role=%s): %s -> %s",
+                            msg.role,
+                            len(original),
+                            len(msg.content),
+                        )
+                except Exception as e:
+                    log.warning("Failed to sanitize message: %s", e)
+        return sanitized_count
+
     def clear_history(self) -> None:
         """Clear conversation history and context."""
         debug_print("clear_history: START")

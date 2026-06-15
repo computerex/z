@@ -3550,6 +3550,31 @@ def main():
                         debug_print("/clear: about to continue...")
                         continue
 
+                    elif cmd in ("/pop", "/undo"):
+                        count = int(cmd_arg) if cmd_arg and cmd_arg.isdigit() else 1
+                        removed = agent.pop_last_messages(count)
+                        if removed > 0:
+                            console.print(
+                                f"  [green]\u2713[/green] Removed [bold]{removed}[/bold] message{'s' if removed > 1 else ''} from history"
+                            )
+                        else:
+                            console.print(
+                                "  [dim]No messages to remove (system message is protected)[/dim]"
+                            )
+                        continue
+
+                    elif cmd == "/sanitize":
+                        sanitized = agent.sanitize_messages()
+                        if sanitized > 0:
+                            console.print(
+                                f"  [green]\u2713[/green] Sanitized [bold]{sanitized}[/bold] message{'s' if sanitized > 1 else ''} to fix UTF-8 issues"
+                            )
+                        else:
+                            console.print(
+                                "  [dim]No UTF-8 issues found in messages[/dim]"
+                            )
+                        continue
+
                     elif cmd == "/save":
                         agent.save_session(str(session_path))
                         console.print(
@@ -3581,6 +3606,25 @@ def main():
                         console.print(
                             f"  [dim]{len(agent.messages)} messages in conversation[/dim]"
                         )
+                        continue
+
+                    elif cmd == "/tail":
+                        count = int(cmd_arg) if cmd_arg and cmd_arg.isdigit() else 5
+                        tail_count = min(count, len(agent.messages))
+                        console.print(
+                            f"  [dim]Last {tail_count} message{'s' if tail_count > 1 else ''}:[/dim]"
+                        )
+                        for i, msg in enumerate(agent.messages[-tail_count:], start=len(agent.messages) - tail_count):
+                            role_icon = {"system": "⚙", "user": "👤", "assistant": "🤖", "tool": "🔧"}.get(msg.role, "?")
+                            if isinstance(msg.content, str):
+                                preview = msg.content[:80].replace("\n", " ")
+                                if len(msg.content) > 80:
+                                    preview += "..."
+                            else:
+                                preview = f"<{type(msg.content).__name__} with {len(msg.content)} items>"
+                            style = {"system": "cyan", "user": "green", "assistant": "blue", "tool": "dim"}.get(msg.role, "dim")
+                            console.print(f"    [{i}] [{role_icon}] [{style}]{msg.role}:[/{style}] {rich_escape(preview)}")
+                        console.print()
                         continue
 
                     elif cmd == "/cost":
@@ -4358,6 +4402,18 @@ def main():
                         )
                         console.print(
                             "  [cyan]/redo[/cyan]                [dim]Redo undone turn[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/pop[/cyan] [dim][n][/dim]             [dim]Remove last n messages (default: 1)[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/tail[/cyan] [dim][n][/dim]            [dim]Show last n messages (default: 5)[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/history[/cyan]             [dim]Show total message count[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/sanitize[/cyan]            [dim]Fix UTF-8 encoding issues in messages[/dim]"
                         )
                         console.print()
                         console.print("  [bold]Sessions[/bold]")
