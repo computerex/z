@@ -145,6 +145,51 @@ def _decode_clixml_in_text(text: str) -> str:
     )
 
 
+def _detect_log_file_encoding(log_path: str) -> str:
+    """Detect the encoding of a log file, defaulting to utf-8.
+
+    Checks for UTF-16LE BOM (0xFF 0xFE) or null byte patterns that indicate
+    UTF-16LE encoding (common in PowerShell output on Windows).
+
+    Returns:
+        "utf-16-le" if UTF-16LE is detected, "utf-8" otherwise.
+    """
+    try:
+        with open(log_path, "rb") as f:
+            # Read first 100 bytes to check for BOM or encoding patterns
+            header = f.read(100)
+            if not header:
+                return "utf-8"
+
+            # Check for UTF-16LE BOM (0xFF 0xFE)
+            if header[:2] == b"\xff\xfe":
+                return "utf-16-le"
+
+            # Check for UTF-16BE BOM (0xFE 0xFF)
+            if header[:2] == b"\xfe\xff":
+                return "utf-16-be"
+
+            # Check for null byte pattern that indicates UTF-16LE:
+            # UTF-16LE stores null bytes at even positions for ASCII text
+            # If we see many null bytes at even positions, it's likely UTF-16LE
+            null_count_even = 0
+            null_count_odd = 0
+            for i in range(min(len(header), 50)):
+                if header[i] == 0:
+                    if i % 2 == 0:
+                        null_count_even += 1
+                    else:
+                        null_count_odd += 1
+
+            # If we have multiple null bytes at even positions (e.g., >2),
+            # it's likely UTF-16LE (ASCII text would have nulls at odd positions)
+            if null_count_even >= 2 and null_count_even > null_count_odd:
+                return "utf-16-le"
+
+            # Default to UTF-8
+            return "utf-8"
+    except Exception:
+        return "utf-8"
 
 
 class ToolHandlers:
@@ -687,10 +732,11 @@ class ToolHandlers:
             return
         
         file_pos = 0
+        encoding = _detect_log_file_encoding(log_path)
         try:
             while proc.returncode is None:
                 try:
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    with open(log_path, "r", encoding=encoding, errors="replace") as f:
                         f.seek(file_pos)
                         new_data = f.read()
                         file_pos = f.tell()
@@ -716,7 +762,7 @@ class ToolHandlers:
             while idle_elapsed < 5.0:
                 await asyncio.sleep(0.5)
                 try:
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    with open(log_path, "r", encoding=encoding, errors="replace") as f:
                         f.seek(file_pos)
                         new_data = f.read()
                         file_pos = f.tell()
@@ -1500,7 +1546,7 @@ class ToolHandlers:
 
     def _wrap_shell_command(self, command: str, log_path: str) -> str:
         """Build platform shell wrapper for a command with file redirection.
-        
+
         On Windows, default to PowerShell execution for deterministic behavior
         with PowerShell syntax (the system prompt advertises PowerShell).
         Set HARNESS_WINDOWS_SHELL=cmd to force legacy cmd.exe behavior.
@@ -1509,7 +1555,15 @@ class ToolHandlers:
             win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
             if win_shell != "cmd":
                 # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
-                ps_command = "$ProgressPreference='SilentlyContinue'; " + command
+                # Force UTF-8 output to avoid UTF-16LE encoding issues in log files
+                # (especially for WSL commands which output UTF-8 that PowerShell
+                # would otherwise encode as UTF-16LE).
+                ps_command = (
+                    "$ProgressPreference='SilentlyContinue'; "
+                    "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                    + command
+                )
                 encoded = base64.b64encode(ps_command.encode("utf-16le")).decode("ascii")
                 launcher = (
                     "powershell -NoProfile -NonInteractive "
@@ -1522,14 +1576,16 @@ class ToolHandlers:
 
     def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:
         """Read new content from a log file starting at file_pos.
-        
+
         Displays new lines in the console and appends to output_lines.
         After _MAX_LIVE_DISPLAY lines, suppresses further live display —
         the final summary is printed by execute_command on completion.
         Returns the updated file position.
         """
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            # Auto-detect encoding: check for UTF-16LE BOM or null byte patterns
+            encoding = _detect_log_file_encoding(log_path)
+            with open(log_path, "r", encoding=encoding, errors="replace") as f:
                 f.seek(file_pos)
                 new_data = f.read()
                 new_pos = f.tell()
@@ -1557,7 +1613,8 @@ class ToolHandlers:
     def _read_log_file(self, log_path: str) -> str:
         """Read the entire contents of a log file."""
         try:
-            raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            encoding = _detect_log_file_encoding(log_path)
+            raw = Path(log_path).read_text(encoding=encoding, errors="replace")
             cleaned = _decode_clixml_in_text(raw)
             decoded = _decode_powershell_clixml(cleaned)
             return decoded or raw
@@ -1619,7 +1676,8 @@ class ToolHandlers:
         await asyncio.sleep(0.5)
         initial_output = []
         try:
-            data = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            bg_encoding = _detect_log_file_encoding(log_path)
+            data = Path(log_path).read_text(encoding=bg_encoding, errors="replace")
             data = _decode_clixml_in_text(data)
             initial_output = data.splitlines()[-10:]
             for line in initial_output:
