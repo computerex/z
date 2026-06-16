@@ -252,10 +252,11 @@ def run_install(
     con.print("  [cyan][23][/cyan] OpenAI Subscription (OAuth)")
     con.print("  [cyan][24][/cyan] GitHub Copilot (OAuth)")
     con.print("  [cyan][25][/cyan] Custom OpenAI-compatible API")
+    con.print("  [cyan][26][/cyan] Local Ollama")
     con.print()
 
     while True:
-        choice = input("Enter choice [1-25]: ").strip()
+        choice = input("Enter choice [1-26]: ").strip()
         if choice == "1":
             base_url = "https://api.z.ai/api/coding/paas/v4/"
             provider = "Z.AI Coding"
@@ -857,6 +858,11 @@ PROVIDER_PRESETS = {
         "Ollama Cloud",
         "https://ollama.com/v1/",
         "llama3.1",
+    ),
+    "ollama-local": (
+        "Local Ollama",
+        "http://localhost:11434/v1",
+        "",
     ),
     "openai-subscription": (
         "OpenAI Subscription (OAuth)",
@@ -1553,6 +1559,7 @@ def _choose_provider_preset_interactive(
         ("23", "openai-subscription"),
         ("24", "github-copilot"),
         ("25", "custom"),
+        ("26", "ollama-local"),
     ]
     con = Console()
     con.print("\n  [bold]Select provider:[/bold]\n")
@@ -1569,7 +1576,7 @@ def _choose_provider_preset_interactive(
         choice = input("  Enter choice [1-25]: ").strip() or "8"
         selected = dict(presets).get(choice)
         if not selected:
-            print("  Please enter 1-25.")
+            print("  Please enter 1-26.")
             continue
         if selected == "custom":
             api_url = (

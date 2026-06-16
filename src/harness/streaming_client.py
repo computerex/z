@@ -241,8 +241,11 @@ def _normalize_model_name(model: str, base_url: str = "") -> str:
         return f"deepseek/{model}"
     elif "api.groq.com" in url:
         return f"groq/{model}"
-    elif "localhost:11434" in url or "localhost:11434" in url:
-        return f"ollama/{model}"
+    elif "localhost:11434" in url:
+        # Use openai/ prefix to force the OpenAI handler with Ollama's
+        # /v1/chat/completions endpoint. The ollama/ prefix uses the native
+        # /api/chat handler which has issues with thinking/reasoning models.
+        return f"openai/{model}"
 
     # Default to openai format for OpenAI-compatible APIs
     return f"openai/{model}"
