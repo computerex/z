@@ -362,11 +362,19 @@ def strip_dsml_tags(content: str) -> str:
     """Remove DSML ``<tool_calls>`` / ``<invoke>`` / ``<parameter>`` tags
     from *content* text without parsing the tool calls.
 
-    Useful for sanitizing previously-stored content that may have
-    DSML tags in it.
+    Unlike ``parse_dsml_tool_calls`` this function does NOT require a
+    ``<tool_calls>`` wrapper — it also strips **stray** closing tags
+    (e.g. a bare ``</tool_calls>`` left over from previous contamination).
     """
-    _, cleaned = parse_dsml_tool_calls(content)
-    return cleaned
+    if not content:
+        return content
+    cleaned = _DSML_TOOL_CALLS_OPEN_RE.sub("", content)
+    cleaned = _DSML_TOOL_CALLS_CLOSE_RE.sub("", cleaned)
+    cleaned = _DSML_INVOKE_RE.sub("", cleaned)
+    cleaned = _DSML_INVOKE_CLOSE_RE.sub("", cleaned)
+    cleaned = _DSML_PARAM_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def sanitize_tool_call_groups(messages: List, logger=None) -> int:

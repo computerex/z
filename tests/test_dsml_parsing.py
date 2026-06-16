@@ -166,3 +166,33 @@ def test_empty_parameters():
     assert len(tc) == 1
     args = json.loads(tc[0]["function"]["arguments"])
     assert args == {"x": ""}
+
+def test_stray_closing_tag_stripped():
+    """A stray </tool_calls> without opening tag is stripped by strip_dsml_tags."""
+    content = "Let me run it. </tool_calls>"
+    cleaned = strip_dsml_tags(content)
+    assert cleaned == "Let me run it.", repr(cleaned)
+    # parse_dsml_tool_calls should NOT detect this as a tool call
+    tc, _ = parse_dsml_tool_calls(content)
+    assert tc == [], f"Stray closing tag should not produce tools: {tc}"
+
+
+def test_stray_invoke_stripped():
+    """Stray <invoke> without <tool_calls> wrapper is stripped."""
+    content = '<invoke name="foo"><parameter name="x">1</parameter></invoke>'
+    cleaned = strip_dsml_tags(content)
+    assert cleaned == "", repr(cleaned)
+
+
+def test_strip_independent_of_parse():
+    """strip_dsml_tags works on content that parse_dsml_tool_calls ignores."""
+    # Content with stray closing tags but no opening <tool_calls>
+    content = "Some text </tool_calls> more text"
+    # parse ignores it (no <tool_calls> wrapper)
+    tc, parse_cleaned = parse_dsml_tool_calls(content)
+    assert tc == []
+    assert parse_cleaned == content  # parse returns content unchanged
+    # strip actively removes the stray tag
+    strip_cleaned = strip_dsml_tags(content)
+    assert strip_cleaned == "Some text  more text", repr(strip_cleaned)
+

@@ -2190,20 +2190,24 @@ class ClineAgent:
                         except (KeyError, json.JSONDecodeError) as e:
                             log.warning("Failed to parse tool call: %s — %s", _tc_raw, e)
 
-                # ── DSML fallback ──────────────────────────────────────────────────
-                # DeepSeek models sometimes output tool calls in DSML format
+                # ── DSML fallback ──────────────────────────────── DeepSeek models sometimes output tool calls in DSML format
                 # (XML-like tags embedded in the content text) instead of (or
                 # in addition to) the native tool_calls JSON field.  Parse the
                 # content for DSML tool calls and strip the tags so they don't
                 # leak into the displayed output or contaminate future requests.
                 _dsml_tc, _dsml_clean = parse_dsml_tool_calls(full_content)
+                # Always use cleaned content (also strips stray tags)
+                if _dsml_clean != full_content:
+                    log.info(
+                        "DSML tags stripped from response content (len %d->%d)",
+                        len(full_content), len(_dsml_clean),
+                    )
+                    full_content = _dsml_clean
                 if _dsml_tc:
                     log.info(
                         "DSML fallback: parsed %d tool call(s) from content",
                         len(_dsml_tc),
                     )
-                    # Update full_content with DSML tags stripped
-                    full_content = _dsml_clean
                     # Only use DSML-parsed calls if native calls are empty
                     if not all_tool_calls:
                         for _tc_raw in _dsml_tc:
