@@ -1351,6 +1351,8 @@ class ClineAgent:
             _hidden_only_retry_max = 2
             _empty_nudge_count = 0
             _EMPTY_NUDGE_MAX = 3  # max consecutive empty-response nudges
+            _repetition_nudge_count = 0
+            _REPETITION_NUDGE_MAX = 2  # max consecutive repetition nudges
             for iteration in range(self.max_iterations):
                 log.info("[WATCHDOG] Starting iteration %d", iteration + 1)
 
@@ -1550,10 +1552,85 @@ class ClineAgent:
                         sys.stdout.flush()
                         _sf_had_visible = True
 
+                def _detect_and_trim_repetition(text: str) -> Optional[str]:
+                    """Check the tail of *text* for repeated patterns (model degeneration).
+
+                    Uses two complementary strategies:
+                    1. **Char-level**: a short pattern (5-100 chars) repeats 3+ times
+                       consecutively in the last 500 characters.
+                    2. **Line-level n-gram**: the same block of 2-4 lines repeats at
+                       the end (catches repeated sentences, code stubs, etc.).
+
+                    Returns the text with the repetitive tail removed, or None if
+                    no repetition is detected.
+                    """
+                    if len(text) < 30:
+                        return None
+
+                    tail = text[-500:]
+
+                    # ── Strategy 1: Character-level pattern detection ──────────
+                    for pat_len in range(5, min(101, len(tail) // 3 + 1)):
+                        pat = tail[-pat_len:]
+                        repeats = 1
+                        check_pos = len(tail) - pat_len * 2
+                        while check_pos >= 0 and tail[check_pos:check_pos + pat_len] == pat:
+                            repeats += 1
+                            if repeats >= 3:
+                                rep_start = len(text) - len(tail) + (
+                                    len(tail) - pat_len * repeats
+                                )
+                                clean = text[:rep_start].rstrip()
+                                log.warning(
+                                    "Char-level repetition: %d×%d-char pattern, "
+                                    "trimmed %d→%d chars",
+                                    repeats, pat_len, len(text), len(clean),
+                                )
+                                return clean
+                            check_pos -= pat_len
+
+                    # ── Strategy 2: Line-level n-gram detection ───────────────
+                    lines = tail.splitlines(keepends=True)
+                    if len(lines) >= 6:
+                        for ngram in range(2, min(5, len(lines) // 2 + 1)):
+                            block = lines[-ngram:]
+                            if not all(l.strip() for l in block):
+                                continue
+                            rep_count = 1
+                            pos = len(lines) - ngram * 2
+                            while pos >= 0:
+                                if lines[pos:pos + ngram] == block:
+                                    rep_count += 1
+                                    if rep_count >= 2:
+                                        trim_line_idx = len(lines) - ngram * rep_count
+                                        char_pos = sum(
+                                            len(l) for l in lines[:trim_line_idx]
+                                        )
+                                        rep_start = len(text) - len(tail) + char_pos
+                                        clean = text[:rep_start].rstrip()
+                                        log.warning(
+                                            "Line-level repetition: %d×%d-line block, "
+                                            "trimmed %d→%d chars",
+                                            rep_count, ngram, len(text), len(clean),
+                                        )
+                                        return clean
+                                    pos -= ngram
+                                else:
+                                    break
+
+                    return None
+
                 def on_chunk(chunk: str):
                     """Handle a (possibly multi-char) streaming chunk."""
                     nonlocal full_content, first_token
                     full_content += chunk
+                    # Check for repetition degeneration every ~500 chars
+                    if len(full_content) > 200 and len(full_content) % 500 < len(chunk):
+                        trimmed = _detect_and_trim_repetition(full_content)
+                        if trimmed is not None:
+                            full_content = trimmed  # remove repetitive tail
+                            get_interrupt_state().trigger("repetition")
+                            return
                     if len(full_content) % 5000 == 0:
                         log.debug(
                             "on_chunk: accumulated content_len=%d chunk_len=%d",
@@ -1872,6 +1949,65 @@ class ClineAgent:
                         _int_flag, _int_reason,
                     )
                     self.status.clear()
+
+                    # ── Repetition: trim, save, nudge, and continue ──────────
+                    if _int_reason == "repetition":
+                        _repetition_nudge_count += 1
+                        if _repetition_nudge_count > _REPETITION_NUDGE_MAX:
+                            log.warning(
+                                "Repetition nudge max exceeded (%d/%d) — giving up",
+                                _repetition_nudge_count, _REPETITION_NUDGE_MAX,
+                            )
+                            print(
+                                f"\n[STOP] Repetition persists — "
+                                f"saving partial output"
+                            )
+                            if full_content.strip():
+                                self.messages.append(
+                                    StreamingMessage(
+                                        role="assistant",
+                                        content=full_content,
+                                    )
+                                )
+                            return (
+                                "[Interrupted - model kept repeating. "
+                                "Press Enter to try again or type new request]"
+                            )
+
+                        print(
+                            "\n[STOP] Repetition detected — "
+                            f"trimming output and nudging model "
+                            f"(attempt {_repetition_nudge_count}/{_REPETITION_NUDGE_MAX})"
+                        )
+                        # Save the (already-trimmed) partial response to history
+                        if full_content.strip():
+                            self.messages.append(
+                                StreamingMessage(
+                                    role="assistant",
+                                    content=full_content,
+                                )
+                            )
+                        # Add a "continue" nudge so the model resumes from where
+                        # it left off without the degenerative tail.
+                        self.messages.append(
+                            StreamingMessage(
+                                role="user",
+                                content=(
+                                    "[SYSTEM: Your previous response started repeating. "
+                                    "The repetitive tail has been removed. "
+                                    "Please continue from where you left off."
+                                    " If you were writing code or explaining something, "
+                                    "continue that thread. Otherwise, choose a tool to "
+                                    "advance the task.]"
+                                ),
+                            )
+                        )
+                        self.console.print(
+                            "\n  [dim]→ Repetition nudge sent. Continuing loop...[/dim]"
+                        )
+                        continue
+
+                    # ── All other interrupts: save partial + stop ─────────────
                     if _int_flag:
                         print(f"\n[STOP] Interrupted ({_int_reason})")
                     else:
@@ -2019,6 +2155,7 @@ class ClineAgent:
                 if all_tool_calls:
                     _hidden_only_retry_count = 0
                     _empty_nudge_count = 0
+                    _repetition_nudge_count = 0
                     log.info(
                         "Tools parsed: %d call(s) — %s",
                         len(all_tool_calls),
@@ -2299,6 +2436,9 @@ class ClineAgent:
 
                             # Continue to next iteration to try again
                             continue
+
+                    # Valid visible response — reset repetition counter
+                    _repetition_nudge_count = 0
 
                     # No tool call — final response to user
                     self.messages.append(
