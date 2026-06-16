@@ -1,5 +1,7 @@
 """Context management utilities - Cline-style truncation and optimization."""
 
+import json
+import re
 from typing import List, Tuple, Optional, Union, Any
 from dataclasses import dataclass
 
@@ -263,6 +265,211 @@ def _tc_count(msg) -> int:
     return len(_msg_tool_calls(msg))
 
 
+def _strip_tool_calls(msg) -> None:
+    """Remove tool_calls from an assistant message (mutates in place)."""
+    if hasattr(msg, 'tool_calls'):
+        msg.tool_calls = None
+    else:
+        msg.pop('tool_calls', None)
+
+
+_DSML_TOOL_CALLS_OPEN_RE = re.compile(r"<tool_calls>", re.IGNORECASE)
+_DSML_TOOL_CALLS_CLOSE_RE = re.compile(r"</tool_calls>", re.IGNORECASE)
+_DSML_INVOKE_RE = re.compile(
+    r'<invoke\s+name="([^"]*)"\s*>', re.IGNORECASE
+)
+_DSML_INVOKE_CLOSE_RE = re.compile(r"</invoke>", re.IGNORECASE)
+_DSML_PARAM_RE = re.compile(
+    r'<parameter\s+name="([^"]*)"\s*>([^<]*)</parameter>', re.IGNORECASE
+)
+
+
+def parse_dsml_tool_calls(content: str) -> tuple:
+    """Parse DSML tool calls from *content* text.
+
+    DeepSeek's DSML format embeds tool invocations as XML-like tags
+    inside the content string rather than returning them via the
+    structured ``tool_calls`` JSON field:
+
+    .. code-block:: xml
+
+        <tool_calls>
+        <invoke name="read_file">
+        <parameter name="path">/etc/hosts</parameter>
+        </invoke>
+        </tool_calls>
+
+    Returns ``(tool_calls, cleaned_content)`` where
+    *tool_calls* is a list of native-format tool-call dicts (matching
+    the ``ChatCompletionMessageToolCall`` schema) and *cleaned_content*
+    is the content with all DSML tags stripped.
+
+    Returns ``([], content)`` if no DSML tool calls are found.
+    """
+    if not _DSML_TOOL_CALLS_OPEN_RE.search(content):
+        return [], content
+
+    tool_calls = []
+    # Find each <invoke> block
+    pos = 0
+    while True:
+        m = _DSML_INVOKE_RE.search(content, pos)
+        if not m:
+            break
+        name = m.group(1)
+        invoke_start = m.start()
+        # Find matching </invoke>
+        close_m = _DSML_INVOKE_CLOSE_RE.search(content, m.end())
+        if not close_m:
+            break
+        invoke_body = content[m.end() : close_m.start()]
+        invoke_end = close_m.end()
+
+        # Parse parameters from the invoke body
+        params: dict = {}
+        for pm in _DSML_PARAM_RE.finditer(invoke_body):
+            pname = pm.group(1)
+            pvalue = pm.group(2)
+            params[pname] = pvalue
+
+        # Generate a unique-ish call ID
+        call_id = f"dsml_{name}_{invoke_start}"
+
+        tool_calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(params),
+            },
+        })
+        pos = invoke_end
+
+    # Strip all DSML tags from content
+    cleaned = _DSML_TOOL_CALLS_OPEN_RE.sub("", content)
+    cleaned = _DSML_TOOL_CALLS_CLOSE_RE.sub("", cleaned)
+    cleaned = _DSML_INVOKE_RE.sub("", cleaned)
+    cleaned = _DSML_INVOKE_CLOSE_RE.sub("", cleaned)
+    cleaned = _DSML_PARAM_RE.sub("", cleaned)
+    # Collapse multiple blank lines left by removed tags
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+
+    return tool_calls, cleaned
+
+
+def strip_dsml_tags(content: str) -> str:
+    """Remove DSML ``<tool_calls>`` / ``<invoke>`` / ``<parameter>`` tags
+    from *content* text without parsing the tool calls.
+
+    Unlike ``parse_dsml_tool_calls`` this function does NOT require a
+    ``<tool_calls>`` wrapper — it also strips **stray** closing tags
+    (e.g. a bare ``</tool_calls>`` left over from previous contamination).
+    """
+    if not content:
+        return content
+    cleaned = _DSML_TOOL_CALLS_OPEN_RE.sub("", content)
+    cleaned = _DSML_TOOL_CALLS_CLOSE_RE.sub("", cleaned)
+    cleaned = _DSML_INVOKE_RE.sub("", cleaned)
+    cleaned = _DSML_INVOKE_CLOSE_RE.sub("", cleaned)
+    cleaned = _DSML_PARAM_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def sanitize_tool_call_groups(messages: List, logger=None) -> int:
+    """Walk messages and fix orphaned tool_calls / tool-result groups.
+
+    Ensures:
+      * Every ``assistant`` message with ``tool_calls`` has enough
+        following ``role="tool"`` messages to satisfy each call.
+      * Every ``role="tool"`` message has a preceding
+        ``assistant(tool_calls)`` that claimed it.
+
+    Fixes by:
+      * Stripping ``tool_calls`` from orphaned assistant messages
+        (sets them to ``None`` so the provider doesn't reject them).
+      * Removing orphaned ``role="tool"`` messages (they have no
+        matching ``assistant(tool_calls)`` parent).
+
+    Returns the number of messages modified or removed.
+    """
+    if not messages:
+        return 0
+
+    modified = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = _msg_role(msg)
+
+        if role == "assistant" and _has_tool_calls(msg):
+            need = _tc_count(msg)
+            have = 0
+            # Count consecutive tool messages following this assistant
+            j = i + 1
+            while j < len(messages) and _is_tool(messages[j]):
+                have += 1
+                j += 1
+
+            if have < need:
+                # Orphaned — strip tool_calls so the API doesn't 400
+                _strip_tool_calls(msg)
+                modified += 1
+                if logger:
+                    logger.debug(
+                        "sanitize: stripped tool_calls from msg[%d] "
+                        "(needed=%d, have=%d)",
+                        i, need, have,
+                    )
+            # If have >= need, the group is fine as-is.
+            # (Extra tool messages will be handled as orphans below.)
+            i = j  # skip past the tool messages we just counted
+            continue
+
+        elif role == "tool":
+            # Orphaned tool message with no preceding assistant(tool_calls).
+            # Check: is there an assistant(tool_calls) somewhere before this?
+            found_parent = False
+            for k in range(i - 1, -1, -1):
+                if _has_tool_calls(messages[k]):
+                    # Need to verify this assistant actually has enough
+                    # tool results including this one.
+                    need = _tc_count(messages[k])
+                    # Count tool messages between k+1 and after us
+                    parent_tools = 0
+                    for t in range(k + 1, len(messages)):
+                        if _is_tool(messages[t]):
+                            parent_tools += 1
+                        else:
+                            break
+                    if parent_tools >= need:
+                        # This tool belongs to a valid group — keep it
+                        found_parent = True
+                    break
+                elif _msg_role(messages[k]) == "assistant":
+                    # Another assistant without tool_calls broke the chain
+                    break
+                elif _msg_role(messages[k]) == "user":
+                    # User message broke the chain
+                    break
+
+            if not found_parent:
+                # Remove orphaned tool message
+                if logger:
+                    logger.debug(
+                        "sanitize: removing orphaned tool msg[%d]",
+                        i,
+                    )
+                messages.pop(i)
+                modified += 1
+                continue  # don't increment i
+
+        i += 1
+
+    return modified
+
+
 def truncate_conversation(
     messages: List,
     strategy: str = "half",  # "none", "lastTwo", "half", "quarter"
@@ -403,6 +610,31 @@ def truncate_conversation(
     
     # Insert notice as a user message after first pair
     notice_msg = type(messages[0])(role="user", content=notice)
+    
+    # ── Final safety net: verify ALL tool_calls groups ──────────────
+    # The group-integrity check above only validates the FIRST
+    # tool_calls group in kept_messages.  Additional groups and the
+    # preserved-start assistant (index 2) are unchecked.
+    #
+    # Scan from left to right stripping any orphaned assistant(tool_calls)
+    # and removing orphaned role="tool" messages.
+    if _has_tool_calls(preserved_start[-1]):
+        _strip_tool_calls(preserved_start[-1])
+    
+    _i = 0
+    while _i < len(kept_messages):
+        if _has_tool_calls(kept_messages[_i]):
+            _need = _tc_count(kept_messages[_i])
+            _have = 0
+            _j = _i + 1
+            while _j < len(kept_messages) and _is_tool(kept_messages[_j]):
+                _have += 1
+                _j += 1
+            if _have < _need:
+                _strip_tool_calls(kept_messages[_i])
+            _i = _j  # skip past tool messages
+        else:
+            _i += 1
     
     result = preserved_start + [notice_msg] + kept_messages
     

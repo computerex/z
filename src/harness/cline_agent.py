@@ -40,6 +40,8 @@ from .context_management import (
     truncate_output,
     truncate_file_content,
     DuplicateDetector,
+    parse_dsml_tool_calls,
+    strip_dsml_tags,
 )
 
 _agent_t1 = _time_mod_agent.perf_counter()
@@ -976,6 +978,14 @@ class ClineAgent:
                 str(msg.content)[:100] if isinstance(msg.content, str) else "<list>",
             )
 
+        # Sanitize tool_calls groups — popping can break assistant(tool_calls)/tool
+        # message pairs, which causes providers like DeepSeek to reject with 400.
+        from .context_management import sanitize_tool_call_groups
+
+        sanitized = sanitize_tool_call_groups(self.messages, log)
+        if sanitized:
+            log.info("pop_last_messages: sanitized %d orphaned tool_calls/tool messages", sanitized)
+
         return actual_count
 
     def sanitize_messages(self) -> int:
@@ -1686,6 +1696,35 @@ class ClineAgent:
                         api_t0 = time.time()
 
                     try:
+                        # Safety net: sanitize any remaining orphaned tool_calls
+                        # before sending to the API.  This catches edge cases
+                        # where compaction or /pop didn't fully repair the
+                        # message history.
+                        from .context_management import sanitize_tool_call_groups, strip_dsml_tags
+
+                        # Strip DSML tags from stored assistant content
+                        # DeepSeek's DSML format embeds tool calls as XML tags
+                        # in the content text. If these leaked through before
+                        # the DSML fallback parser was added, they need to be
+                        # cleaned up now so the API doesn't re-parse them and
+                        # reject the request with orphaned tool_calls.
+                        for _m in self.messages:
+                            if _m.role == "assistant" and _m.content:
+                                _cleaned = strip_dsml_tags(_m.content)
+                                if _cleaned != _m.content:
+                                    log.info(
+                                        "Pre-API: stripped DSML tags from assistant msg "
+                                        "(len %d-%d)", len(_m.content), len(_cleaned),
+                                    )
+                                    _m.content = _cleaned
+
+                        sanitized = sanitize_tool_call_groups(self.messages, log)
+                        if sanitized:
+                            log.info(
+                                "Pre-API sanitize: fixed %d orphaned tool_calls/tool messages",
+                                sanitized,
+                            )
+
                         api_task = asyncio.ensure_future(
                             client.chat_stream_raw(
                                 messages=self.messages,
@@ -2014,6 +2053,42 @@ class ClineAgent:
                             ))
                         except (KeyError, json.JSONDecodeError) as e:
                             log.warning("Failed to parse tool call: %s — %s", _tc_raw, e)
+
+                # ── DSML fallback ──────────────────────────────── DeepSeek models sometimes output tool calls in DSML format
+                # (XML-like tags embedded in the content text) instead of (or
+                # in addition to) the native tool_calls JSON field.  Parse the
+                # content for DSML tool calls and strip the tags so they don't
+                # leak into the displayed output or contaminate future requests.
+                _dsml_tc, _dsml_clean = parse_dsml_tool_calls(full_content)
+                # Always use cleaned content (also strips stray tags)
+                if _dsml_clean != full_content:
+                    log.info(
+                        "DSML tags stripped from response content (len %d->%d)",
+                        len(full_content), len(_dsml_clean),
+                    )
+                    full_content = _dsml_clean
+                if _dsml_tc:
+                    log.info(
+                        "DSML fallback: parsed %d tool call(s) from content",
+                        len(_dsml_tc),
+                    )
+                    # Only use DSML-parsed calls if native calls are empty
+                    if not all_tool_calls:
+                        for _tc_raw in _dsml_tc:
+                            try:
+                                all_tool_calls.append(ParsedToolCall(
+                                    name=_tc_raw["function"]["name"],
+                                    parameters=json.loads(
+                                        _tc_raw["function"].get("arguments", "{}")
+                                    ),
+                                    tool_call_id=_tc_raw.get("id"),
+                                ))
+                            except (json.JSONDecodeError, KeyError) as e:
+                                log.warning(
+                                    "Failed to parse DSML tool call: %s — %s",
+                                    _tc_raw, e,
+                                )
+
                 tool_call = all_tool_calls[-1] if all_tool_calls else None
 
                 if all_tool_calls:
@@ -2025,6 +2100,13 @@ class ClineAgent:
                         ", ".join(tc.name for tc in all_tool_calls),
                     )
                 else:
+                    # Even without tool calls, strip any stray DSML tags
+                    # that might have leaked through (e.g. from previous
+                    # contamination of the conversation history).
+                    _dsml_clean = strip_dsml_tags(full_content)
+                    if _dsml_clean != full_content:
+                        log.info("DSML tags stripped from content (no tool calls)")
+                        full_content = _dsml_clean
                     log.debug(
                         "No tool call parsed from response (len=%d)", len(full_content)
                     )

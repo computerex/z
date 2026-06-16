@@ -171,24 +171,6 @@ def test_tools_at_start_belong_to_asst():
 
 def test_tools_at_start_belong_to_asst_matched():
     """Tool at start + its assistant with tool_calls: both survive."""
-    # 10 messages, remaining = 7, half = 3 → even = 2
-    # kept = [-2:] = [tool(r1), user(u_final)]
-    # first_non_tool = 1 (u_final). u_final has no tool_calls → tool orphaned → drop
-    # That's the same as above. We need a case where the tool at the start
-    # of kept DOES belong to the first non-tool message.
-    #
-    # For that, we need: kept = [tool, tool, assistant(tc=2), ...]
-    # remaining[-4:] with first_non_tool=2 (the assistant)
-    #
-    # 12 messages, remaining = 9, half = 4 → even = 4
-    # kept = [-4:] = [r1, r2, asst(...), ...]
-    # Wait, that's tool, tool, asst - not tool, tool, asst(with tc)
-    # 
-    # 11 messages, remaining = 8, half = 4 → even = 4
-    # kept = [-4:] = [r1, r2, asst(tc=2), u_final]
-    # first_non_tool = 2 (asst). asst has tc=2.
-    # tools_before = 2, tools_after = 0
-    # need = 2, total_have = 2, missing = 0 → perfect match, keep as-is
     msgs = [
         Msg("system", "s"),
         Msg("user", "u1"),
@@ -202,12 +184,6 @@ def test_tools_at_start_belong_to_asst_matched():
         Msg("assistant", "caller", tool_calls=[{"id": "1"}, {"id": "2"}]),
         Msg("user", "u_final"),
     ]
-    # remaining = [u_rm1, a_rm1, u_rm2, a_rm2, r1, r2, caller, u_final] = 8
-    # half = 4, even = 4
-    # kept = [-4:] = [r1, r2, caller, u_final]
-    # first_non_tool = 2 (caller). caller has tc=2.
-    # tools_before = 2, tools_after = 0
-    # need = 2, total_have = 2, missing = 0 → keep as-is
     result = truncate_conversation(msgs, "half")
     roles = [m.role for m in result.messages]
     assert "tool" in roles, f"Tools should survive: {roles}"
@@ -216,14 +192,6 @@ def test_tools_at_start_belong_to_asst_matched():
 
 def test_pull_from_removed_region():
     """Tool results in removed region are pulled when needed by kept assistant."""
-    # 10 messages, remaining = 7, half = 3 → even = 2
-    # kept = [-2:] = [caller, u_final]
-    # first_non_tool = 0 (caller). caller has tc=1.
-    # tools_before = 0, tools_after = 0
-    # need = 1, total_have = 0, missing = 1
-    # Try to pull 1 tool from predecessor_slice = remaining[:5] = [u_rm1, a_rm1, u_rm2, a_rm2, result_1]
-    # reversed scan: result_1 is tool → pulled
-    # len(pulled) == 1 == missing → kept = [result_1, caller, u_final]
     msgs = [
         Msg("system", "s"),
         Msg("user", "u1"),
@@ -246,11 +214,6 @@ def test_pull_from_removed_region():
 
 def test_cannot_pull_enough_from_removed():
     """Not enough pullable tools in removed region → whole group dropped."""
-    # 10 messages, remaining = 7, half = 3 → even = 2
-    # kept = [-2:] = [caller, u_final]
-    # caller has tc=2. tools_before=0, tools_after=0, need=2, total_have=0, missing=2
-    # pulled from removed: scan backwards, find tool(r1) → 1 tool.
-    # Can only pull 1, need 2 → drop the group
     msgs = [
         Msg("system", "s"),
         Msg("user", "u1"),
@@ -272,12 +235,6 @@ def test_cannot_pull_enough_from_removed():
 
 def test_excess_tools_dropped():
     """When more tools than needed, excess at front are dropped."""
-    # 11 messages, remaining = 8, half = 4 → even = 4
-    # kept = [-4:] = [r1, r2, caller(tc=1), u_final]
-    # first_non_tool = 2 (caller). caller has tc=1.
-    # tools_before = 2, tools_after = 0
-    # need = 1, total_have = 2, missing = -1 (excess)
-    # Drop excess: kept = kept[1:] = [r2, caller, u_final]
     msgs = [
         Msg("system", "s"),
         Msg("user", "u1"),
@@ -313,3 +270,84 @@ def test_no_tool_groups_no_regression():
     result = truncate_conversation(msgs, "half")
     roles = [m.role for m in result.messages]
     assert roles == ["system", "user", "assistant", "user", "user", "assistant"], f"Got: {roles}"
+
+
+# ---- Bug-fix regression tests ----
+
+def test_first_assistant_with_tool_calls_stripped():
+    """First assistant (index 2) has tool_calls whose results are truncated.
+
+    This is a regression test for the compaction bug that caused
+    "assistant message with 'tool_calls' must be followed by tool messages"
+    errors from providers like DeepSeek.
+
+    Scenario: first assistant (index 2) called tools, results at index 3.
+    Compaction cuts the middle, leaving index 2 orphaned.
+    """
+    msgs = [
+        Msg("system", "s"),
+        Msg("user", "u1"),
+        Msg("assistant", "a1_with_tc", tool_calls=[{"id": "1"}]),  # index 2 has tc
+        Msg("tool", "r1", tool_call_id="1"),  # tool result (removed)
+        Msg("user", "u2"),
+        Msg("assistant", "a2"),
+        Msg("user", "u3"),
+        Msg("assistant", "a3"),
+    ]
+    result = truncate_conversation(msgs, "half")
+    # The tool result r1 (index 3) falls into the removed region.
+    # Index 2 must have its tool_calls stripped to prevent API 400.
+    first_asst = result.messages[2]
+    assert not _has_tool_calls(first_asst), \
+        f"First assistant should have tool_calls stripped: {first_asst}"
+    # The tool message should NOT be in the result (it was in removed region)
+    roles = [m.role for m in result.messages]
+    assert "tool" not in roles, f"Tool message should not survive: {roles}"
+
+
+def test_first_assistant_tc_dict_style():
+    """Same as test_first_assistant_with_tool_calls_stripped but with dict messages."""
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1", "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "content": "r1", "tool_call_id": "1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    result = truncate_conversation(msgs, "half")
+    first_asst = result.messages[2]
+    tc = first_asst.get("tool_calls") if isinstance(first_asst, dict) else getattr(first_asst, "tool_calls", None)
+    assert not tc, f"First assistant should have tool_calls stripped: {first_asst}"
+
+
+def test_second_tc_group_orphaned_after_first():
+    """Second tool_calls group in kept_messages has missing tool results.
+
+    The original truncation algorithm only validates the first group.
+    This tests that the safety net catches subsequent orphaned groups.
+    """
+    # 10 messages, half => remaining=7, keep=2
+    # kept = [user_kept, asst2(tc=1)] where asst2's tool result was truncated
+    msgs = [
+        Msg("system", "s"),
+        Msg("user", "u1"),
+        Msg("assistant", "a1"),
+        Msg("user", "u2"),          # removed
+        Msg("assistant", "a2"),      # removed
+        Msg("assistant", "asst1", tool_calls=[{"id": "1"}]),  # removed
+        Msg("tool", "r1", tool_call_id="1"),                   # removed
+        Msg("user", "u_kept"),       # kept
+        Msg("assistant", "asst2", tool_calls=[{"id": "3"}]),  # kept, orphaned
+        # asst2's tool result was at index 9 -- truncated
+    ]
+    result = truncate_conversation(msgs, "half")
+    # asst2 should have tool_calls stripped
+    for m in result.messages:
+        role = m.role if hasattr(m, 'role') else m.get('role', '')
+        tc = getattr(m, 'tool_calls', None) or (m.get('tool_calls') if isinstance(m, dict) else None)
+        if role == "assistant" and tc:
+            for t in tc:
+                t_id = t.get("id", "") if isinstance(t, dict) else (getattr(t, "id", "") if hasattr(t, "id") else "")
+                if t_id == "3":
+                    assert False, f"asst2 should have tool_calls stripped: {m}"
