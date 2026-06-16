@@ -976,6 +976,14 @@ class ClineAgent:
                 str(msg.content)[:100] if isinstance(msg.content, str) else "<list>",
             )
 
+        # Sanitize tool_calls groups — popping can break assistant(tool_calls)/tool
+        # message pairs, which causes providers like DeepSeek to reject with 400.
+        from .context_management import sanitize_tool_call_groups
+
+        sanitized = sanitize_tool_call_groups(self.messages, log)
+        if sanitized:
+            log.info("pop_last_messages: sanitized %d orphaned tool_calls/tool messages", sanitized)
+
         return actual_count
 
     def sanitize_messages(self) -> int:
@@ -1763,6 +1771,19 @@ class ClineAgent:
                         api_t0 = time.time()
 
                     try:
+                        # Safety net: sanitize any remaining orphaned tool_calls
+                        # before sending to the API.  This catches edge cases
+                        # where compaction or /pop didn't fully repair the
+                        # message history.
+                        from .context_management import sanitize_tool_call_groups
+
+                        sanitized = sanitize_tool_call_groups(self.messages, log)
+                        if sanitized:
+                            log.info(
+                                "Pre-API sanitize: fixed %d orphaned tool_calls/tool messages",
+                                sanitized,
+                            )
+
                         api_task = asyncio.ensure_future(
                             client.chat_stream_raw(
                                 messages=self.messages,

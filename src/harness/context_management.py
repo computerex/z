@@ -263,6 +263,107 @@ def _tc_count(msg) -> int:
     return len(_msg_tool_calls(msg))
 
 
+def _strip_tool_calls(msg) -> None:
+    """Remove tool_calls from an assistant message (mutates in place)."""
+    if hasattr(msg, 'tool_calls'):
+        msg.tool_calls = None
+    else:
+        msg.pop('tool_calls', None)
+
+
+def sanitize_tool_call_groups(messages: List, logger=None) -> int:
+    """Walk messages and fix orphaned tool_calls / tool-result groups.
+
+    Ensures:
+      * Every ``assistant`` message with ``tool_calls`` has enough
+        following ``role="tool"`` messages to satisfy each call.
+      * Every ``role="tool"`` message has a preceding
+        ``assistant(tool_calls)`` that claimed it.
+
+    Fixes by:
+      * Stripping ``tool_calls`` from orphaned assistant messages
+        (sets them to ``None`` so the provider doesn't reject them).
+      * Removing orphaned ``role="tool"`` messages (they have no
+        matching ``assistant(tool_calls)`` parent).
+
+    Returns the number of messages modified or removed.
+    """
+    if not messages:
+        return 0
+
+    modified = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = _msg_role(msg)
+
+        if role == "assistant" and _has_tool_calls(msg):
+            need = _tc_count(msg)
+            have = 0
+            # Count consecutive tool messages following this assistant
+            j = i + 1
+            while j < len(messages) and _is_tool(messages[j]):
+                have += 1
+                j += 1
+
+            if have < need:
+                # Orphaned — strip tool_calls so the API doesn't 400
+                _strip_tool_calls(msg)
+                modified += 1
+                if logger:
+                    logger.debug(
+                        "sanitize: stripped tool_calls from msg[%d] "
+                        "(needed=%d, have=%d)",
+                        i, need, have,
+                    )
+            # If have >= need, the group is fine as-is.
+            # (Extra tool messages will be handled as orphans below.)
+            i = j  # skip past the tool messages we just counted
+            continue
+
+        elif role == "tool":
+            # Orphaned tool message with no preceding assistant(tool_calls).
+            # Check: is there an assistant(tool_calls) somewhere before this?
+            found_parent = False
+            for k in range(i - 1, -1, -1):
+                if _has_tool_calls(messages[k]):
+                    # Need to verify this assistant actually has enough
+                    # tool results including this one.
+                    need = _tc_count(messages[k])
+                    # Count tool messages between k+1 and after us
+                    parent_tools = 0
+                    for t in range(k + 1, len(messages)):
+                        if _is_tool(messages[t]):
+                            parent_tools += 1
+                        else:
+                            break
+                    if parent_tools >= need:
+                        # This tool belongs to a valid group — keep it
+                        found_parent = True
+                    break
+                elif _msg_role(messages[k]) == "assistant":
+                    # Another assistant without tool_calls broke the chain
+                    break
+                elif _msg_role(messages[k]) == "user":
+                    # User message broke the chain
+                    break
+
+            if not found_parent:
+                # Remove orphaned tool message
+                if logger:
+                    logger.debug(
+                        "sanitize: removing orphaned tool msg[%d]",
+                        i,
+                    )
+                messages.pop(i)
+                modified += 1
+                continue  # don't increment i
+
+        i += 1
+
+    return modified
+
+
 def truncate_conversation(
     messages: List,
     strategy: str = "half",  # "none", "lastTwo", "half", "quarter"
@@ -403,6 +504,31 @@ def truncate_conversation(
     
     # Insert notice as a user message after first pair
     notice_msg = type(messages[0])(role="user", content=notice)
+    
+    # ── Final safety net: verify ALL tool_calls groups ──────────────
+    # The group-integrity check above only validates the FIRST
+    # tool_calls group in kept_messages.  Additional groups and the
+    # preserved-start assistant (index 2) are unchecked.
+    #
+    # Scan from left to right stripping any orphaned assistant(tool_calls)
+    # and removing orphaned role="tool" messages.
+    if _has_tool_calls(preserved_start[-1]):
+        _strip_tool_calls(preserved_start[-1])
+    
+    _i = 0
+    while _i < len(kept_messages):
+        if _has_tool_calls(kept_messages[_i]):
+            _need = _tc_count(kept_messages[_i])
+            _have = 0
+            _j = _i + 1
+            while _j < len(kept_messages) and _is_tool(kept_messages[_j]):
+                _have += 1
+                _j += 1
+            if _have < _need:
+                _strip_tool_calls(kept_messages[_i])
+            _i = _j  # skip past tool messages
+        else:
+            _i += 1
     
     result = preserved_start + [notice_msg] + kept_messages
     
