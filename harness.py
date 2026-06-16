@@ -390,8 +390,34 @@ def run_install(
             provider = "Custom"
             default_model = input("Enter default model name: ").strip() or "gpt-4"
             break
+        elif choice == "26":
+            base_url = "http://localhost:11434/v1"
+            provider = "Local Ollama"
+            default_model = ""
+            # Try to detect Ollama and fetch available models
+            try:
+                import httpx
+                r = httpx.get("http://localhost:11434/v1/models", timeout=5)
+                if r.status_code == 200:
+                    models = [m["id"] for m in r.json().get("data", [])]
+                    if models:
+                        con.print(f"\n  [dim]Found {len(models)} model(s):[/dim]")
+                        for i, m in enumerate(models, 1):
+                            con.print(f"    [{i}] {m}")
+                        model_input = input(f"\n  Select model [1-{len(models)}]: ").strip()
+                        if model_input.isdigit() and 1 <= int(model_input) <= len(models):
+                            default_model = models[int(model_input) - 1]
+                        else:
+                            default_model = model_input or ""
+                else:
+                    con.print("  [yellow]Could not reach Ollama. Check that it is running.[/yellow]")
+            except Exception:
+                con.print("  [yellow]Could not reach Ollama. Check that it is running.[/yellow]")
+            if not default_model:
+                default_model = input("  Model name: ").strip()
+            break
         else:
-            print("Please enter 1-25.")
+            print("Please enter 1-26.")
 
     con.print(f"\n  [green]\u2713[/green] Using [bold]{provider}[/bold]")
     con.print(f"    [dim]{base_url}[/dim]\n")
