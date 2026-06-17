@@ -986,87 +986,156 @@ def _detect_provider_label(api_url: str) -> str:
     return "Custom"
 
 
+# ── Provider routing table ──────────────────────────────────────────
+# Maps URL substrings to provider configuration for model listing.
+# Each entry: (url_substring, litellm_prefix, flags)
+#   litellm_prefix: str = prefix required for LiteLLM routing, None = bare IDs work
+#   flags: set of strings
+#     "custom"        — completely different API (Bedrock), handled separately
+#     "x-api-key"     — uses x-api-key header instead of Authorization: Bearer
+#     "registry-only" — no /v1/models endpoint; use LiteLLM registry only
+_PROVIDER_ROUTES = [
+    ("amazonaws.com",    None,        {"custom"}),       # Bedrock — AWS sigv4
+    ("anthropic.com",    None,        {"x-api-key"}),    # Anthropic — x-api-key auth
+    ("openrouter.ai",    "openrouter", set()),           # needs openrouter/ prefix
+    ("together.xyz",     None,        set()),            # bare model IDs work
+    ("api.deepseek.com", "deepseek",  set()),            # needs deepseek/ prefix
+    ("minimax",          "minimax",   {"registry-only"}),# registry fallback only
+    ("api.groq.com",     "groq",      {"registry-only"}),# registry fallback only
+]
+
+
 def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
-    """Fetch model IDs from a provider using LiteLLM."""
+    """Fetch model IDs from a provider using LiteLLM.
+
+    Uses a generic strategy:
+      1. Look up the URL in the provider routing table.
+      2. Try querying the provider's /v1/models endpoint (if available).
+      3. Prefix model IDs for LiteLLM routing if needed.
+      4. Fall back to LiteLLM's model registry if the API query fails.
+    """
     # Check if OAuth token FIRST, before importing streaming_client
     # This avoids the slow LiteLLM import for OAuth providers
     if api_key and api_key.startswith("oauth:"):
-        # Check URL to determine which OAuth provider
-        url_lower = (api_url or "").lower()
-        if "githubcopilot" in url_lower or "copilot" in url_lower:
-            # GitHub Copilot OAuth - return Copilot models
-            from harness.copilot_oauth_client import get_copilot_models
-
-            return get_copilot_models()
-        else:
-            # OpenAI OAuth - return Codex models
-            from harness.codex_models import get_codex_models
-
-            return get_codex_models()
+        return _fetch_oauth_models(api_url)
 
     from harness.streaming_client import search_litellm_models
-
-    # Extract model prefix from URL
     url = (api_url or "").lower()
 
-    if "bedrock" in url and "amazonaws.com" in url:
-        # Query actual AWS Bedrock API for available models
-        from harness.bedrock_provider import list_bedrock_models
+    # ── Look up URL in routing table ────────────────────────────────
+    prefix = None
+    flags: set = set()
+    for pattern, p, f in _PROVIDER_ROUTES:
+        if pattern in url:
+            prefix = p
+            flags = f
+            break
 
-        # Extract region from URL
-        region = "us-east-1"
-        if ".amazonaws.com" in url:
-            parts = url.split(".")
-            if len(parts) >= 2:
-                potential_region = parts[1]
-                if potential_region.startswith("us-") or potential_region.startswith(
-                    "eu-"
-                ):
-                    region = potential_region
+    # ── Custom provider (Bedrock) — completely different API ────────
+    if "custom" in flags:
+        return _fetch_bedrock_models(api_url, api_key)
 
-        models = list_bedrock_models(api_key, region)
-        if models:
-            return models
-        # Fallback to LiteLLM list if API query fails
-        return search_litellm_models("bedrock/")
-    elif "anthropic.com" in url:
-        return search_litellm_models("anthropic/")
-    elif "openrouter.ai" in url:
-        # Query OpenRouter's actual API (LiteLLM registry may be stale)
-        models = _fetch_models_from_provider_api(api_url, api_key)
-        if models:
-            # Prefix with openrouter/ for LiteLLM routing
-            return [f"openrouter/{m}" if not m.startswith("openrouter/") else m for m in models]
-        return search_litellm_models("openrouter/")
-    elif "together.xyz" in url:
-        # Query Together's actual API (LiteLLM registry may be empty/stale)
-        models = _fetch_models_from_provider_api(api_url, api_key)
-        if models:
-            return models
-        return search_litellm_models("together_ai/")
-    elif "minimax" in url:
-        return search_litellm_models("minimax/")
-    elif "api.deepseek.com" in url:
-        return search_litellm_models("deepseek/")
-    elif "api.groq.com" in url:
-        return search_litellm_models("groq/")
+    # ── Try querying the provider's /v1/models endpoint ─────────────
+    api_models: List[str] = []
+    if "registry-only" not in flags:
+        if "x-api-key" in flags:
+            # Anthropic: uses x-api-key header instead of Bearer
+            api_models = _fetch_models_from_provider_api(
+                api_url,
+                api_key,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+        else:
+            api_models = _fetch_models_from_provider_api(api_url, api_key)
 
-    # For custom/unknown providers, query their API directly
+    if api_models:
+        if prefix:
+            return [f"{prefix}/{m}" if not m.startswith(f"{prefix}/") else m for m in api_models]
+        return api_models
+
+    # ── Fallback to LiteLLM registry ────────────────────────────────
+    if prefix:
+        return search_litellm_models(f"{prefix}/")
+
+    # Anthropic fallback: LiteLLM registry contains many proxy/gateway
+    # routes (deepinfra/anthropic/..., openrouter/anthropic/...) which
+    # require a different API key.  Filter to only direct models.
+    if "x-api-key" in flags:
+        return _filter_anthropic_registry_models(search_litellm_models)
+
+    # Unknown provider — try generic API query
     return _fetch_models_from_provider_api(api_url, api_key)
 
 
-def _fetch_models_from_provider_api(api_url: str, api_key: str) -> List[str]:
+def _fetch_bedrock_models(api_url: str, api_key: str) -> List[str]:
+    """Fetch model IDs from AWS Bedrock.  Uses Bedrock's custom API."""
+    from harness.streaming_client import search_litellm_models
+    from harness.bedrock_provider import list_bedrock_models
+
+    url = (api_url or "").lower()
+    region = "us-east-1"
+    if ".amazonaws.com" in url:
+        parts = url.split(".")
+        if len(parts) >= 2:
+            potential_region = parts[1]
+            if potential_region.startswith("us-") or potential_region.startswith("eu-"):
+                region = potential_region
+
+    models = list_bedrock_models(api_key, region)
+    if models:
+        return models
+    return search_litellm_models("bedrock/")
+
+
+def _filter_anthropic_registry_models(
+    search_fn,
+) -> List[str]:
+    """Return only direct Anthropic models from LiteLLM's registry.
+
+    Excludes proxy/gateway routes (deepinfra/anthropic/..., openrouter/anthropic/...)
+    that require a different API key.
+    """
+    from litellm import model_cost as _anthropic_cost
+
+    bare = [
+        m
+        for m, info in _anthropic_cost.items()
+        if "/" not in m and info.get("litellm_provider") == "anthropic"
+    ]
+    litellm_matches = [m for m in search_fn("anthropic/") if m.lower().startswith("anthropic/")]
+    return sorted(set(litellm_matches + bare))
+
+
+def _fetch_oauth_models(api_url: str) -> List[str]:
+    """Fetch model IDs for OAuth-based providers (GitHub Copilot, OpenAI Codex)."""
+    url_lower = (api_url or "").lower()
+    if "githubcopilot" in url_lower or "copilot" in url_lower:
+        from harness.copilot_oauth_client import get_copilot_models
+        return get_copilot_models()
+    from harness.codex_models import get_codex_models
+    return get_codex_models()
+
+
+def _fetch_models_from_provider_api(
+    api_url: str,
+    api_key: str,
+    headers: Optional[Dict[str, str]] = None,
+) -> List[str]:
     """Query provider's /v1/models endpoint (OpenAI-compatible format).
 
-    For custom providers, we query their actual API instead of using LiteLLM's
-    global model registry. This ensures we only show models actually available.
+    By default uses ``Authorization: Bearer <key>`` auth.  Pass custom
+    *headers* to override (e.g. ``{"x-api-key": ...}`` for Anthropic).
     """
     import requests
 
     try:
-        headers = {}
-        if api_key and not api_key.startswith("oauth:"):
-            headers["Authorization"] = f"Bearer {api_key}"
+        if headers is None:
+            headers = {}
+            if api_key and not api_key.startswith("oauth:"):
+                headers["Authorization"] = f"Bearer {api_key}"
 
         response = requests.get(
             f"{api_url.rstrip('/')}/models", headers=headers, timeout=10
@@ -1074,8 +1143,7 @@ def _fetch_models_from_provider_api(api_url: str, api_key: str) -> List[str]:
         response.raise_for_status()
         data = response.json()
 
-        # Extract model IDs - handle both OpenAI format {"data": [...]}
-        # and plain list format [...] (e.g. Together AI)
+        # Handle both {"data": [...]} and plain [...] formats
         items = data if isinstance(data, list) else data.get("data", [])
         models = []
         for item in items:
@@ -1084,7 +1152,7 @@ def _fetch_models_from_provider_api(api_url: str, api_key: str) -> List[str]:
 
         return sorted(models)
     except Exception:
-        # On any error, return empty list to trigger manual entry
+        # On any error, return empty list to trigger manual entry or fallback
         return []
 
 

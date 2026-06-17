@@ -493,7 +493,14 @@ class StreamingJSONClient:
         # Go backend expects an object, not a boolean).  Models that
         # support reasoning will emit thinking tokens regardless; LiteLLM's
         # ``enable_thinking`` flag makes it surface them in the stream.
-        kwargs["enable_thinking"] = True
+        # NOTE: For Anthropic, enable_thinking is NOT a valid API parameter
+        # and LiteLLM 1.83 doesn't strip it before sending, causing a
+        # BadRequestError.  Skip it for Anthropic here.
+        _is_anthropic = self.litellm_model.lower().startswith(
+            "anthropic/"
+        ) or "/anthropic/" in self.litellm_model.lower()
+        if not _is_anthropic:
+            kwargs["enable_thinking"] = True
 
         # ZAI native reasoning stream (Claude/Cursor-like visible thinking).
         # Safe no-op for providers that ignore unknown fields.
@@ -507,7 +514,9 @@ class StreamingJSONClient:
             kwargs["clear_thinking"] = False
 
         # Pass reasoning_effort for providers that support it (e.g. OpenAI o-series).
-        # LiteLLM's drop_params=True will strip it for unsupported providers.
+        # For Anthropic, LiteLLM translates this to `thinking: {type: "adaptive"}`
+        # (extended thinking mode) which IS valid — but requires temperature=1.
+        # LiteLLM's drop_params=True will strip it for truly unsupported providers.
         if self.reasoning_effort and self.reasoning_effort != "none":
             kwargs["reasoning_effort"] = self.reasoning_effort
 
@@ -519,8 +528,13 @@ class StreamingJSONClient:
         if "bedrock" in self.litellm_model.lower():
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = self.api_key
 
-        # Add base_url for OpenAI-compatible APIs
-        if self.base_url and "bedrock" not in self.litellm_model.lower():
+        # Add base_url for OpenAI-compatible APIs.
+        # NOTE: Do NOT set api_base for providers with native LiteLLM handlers
+        # (Anthropic, Bedrock, etc.) — LiteLLM already knows the correct URL and
+        # setting api_base explicitly forces the generic OpenAI-compatible handler
+        # which routes to the wrong endpoint (e.g. /chat/completions instead of
+        # /v1/messages for Anthropic).
+        if self.base_url and not _is_anthropic and "bedrock" not in self.litellm_model.lower():
             kwargs["api_base"] = self.base_url
 
         # Add timeout
