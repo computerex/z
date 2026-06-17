@@ -1,7 +1,6 @@
 """Context management utilities - Cline-style truncation and optimization."""
 
 import json
-import re
 from typing import List, Tuple, Optional, Union, Any
 from dataclasses import dataclass
 
@@ -271,110 +270,6 @@ def _strip_tool_calls(msg) -> None:
         msg.tool_calls = None
     else:
         msg.pop('tool_calls', None)
-
-
-_DSML_TOOL_CALLS_OPEN_RE = re.compile(r"<tool_calls>", re.IGNORECASE)
-_DSML_TOOL_CALLS_CLOSE_RE = re.compile(r"</tool_calls>", re.IGNORECASE)
-_DSML_INVOKE_RE = re.compile(
-    r'<invoke\s+name="([^"]*)"\s*>', re.IGNORECASE
-)
-_DSML_INVOKE_CLOSE_RE = re.compile(r"</invoke>", re.IGNORECASE)
-_DSML_PARAM_RE = re.compile(
-    r'<parameter\s+name="([^"]*)"\s*>([^<]*)</parameter>', re.IGNORECASE
-)
-
-
-def parse_dsml_tool_calls(content: str) -> tuple:
-    """Parse DSML tool calls from *content* text.
-
-    DeepSeek's DSML format embeds tool invocations as XML-like tags
-    inside the content string rather than returning them via the
-    structured ``tool_calls`` JSON field:
-
-    .. code-block:: xml
-
-        <tool_calls>
-        <invoke name="read_file">
-        <parameter name="path">/etc/hosts</parameter>
-        </invoke>
-        </tool_calls>
-
-    Returns ``(tool_calls, cleaned_content)`` where
-    *tool_calls* is a list of native-format tool-call dicts (matching
-    the ``ChatCompletionMessageToolCall`` schema) and *cleaned_content*
-    is the content with all DSML tags stripped.
-
-    Returns ``([], content)`` if no DSML tool calls are found.
-    """
-    if not _DSML_TOOL_CALLS_OPEN_RE.search(content):
-        return [], content
-
-    tool_calls = []
-    # Find each <invoke> block
-    pos = 0
-    while True:
-        m = _DSML_INVOKE_RE.search(content, pos)
-        if not m:
-            break
-        name = m.group(1)
-        invoke_start = m.start()
-        # Find matching </invoke>
-        close_m = _DSML_INVOKE_CLOSE_RE.search(content, m.end())
-        if not close_m:
-            break
-        invoke_body = content[m.end() : close_m.start()]
-        invoke_end = close_m.end()
-
-        # Parse parameters from the invoke body
-        params: dict = {}
-        for pm in _DSML_PARAM_RE.finditer(invoke_body):
-            pname = pm.group(1)
-            pvalue = pm.group(2)
-            params[pname] = pvalue
-
-        # Generate a unique-ish call ID
-        call_id = f"dsml_{name}_{invoke_start}"
-
-        tool_calls.append({
-            "id": call_id,
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": json.dumps(params),
-            },
-        })
-        pos = invoke_end
-
-    # Strip all DSML tags from content
-    cleaned = _DSML_TOOL_CALLS_OPEN_RE.sub("", content)
-    cleaned = _DSML_TOOL_CALLS_CLOSE_RE.sub("", cleaned)
-    cleaned = _DSML_INVOKE_RE.sub("", cleaned)
-    cleaned = _DSML_INVOKE_CLOSE_RE.sub("", cleaned)
-    cleaned = _DSML_PARAM_RE.sub("", cleaned)
-    # Collapse multiple blank lines left by removed tags
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    cleaned = cleaned.strip()
-
-    return tool_calls, cleaned
-
-
-def strip_dsml_tags(content: str) -> str:
-    """Remove DSML ``<tool_calls>`` / ``<invoke>`` / ``<parameter>`` tags
-    from *content* text without parsing the tool calls.
-
-    Unlike ``parse_dsml_tool_calls`` this function does NOT require a
-    ``<tool_calls>`` wrapper — it also strips **stray** closing tags
-    (e.g. a bare ``</tool_calls>`` left over from previous contamination).
-    """
-    if not content:
-        return content
-    cleaned = _DSML_TOOL_CALLS_OPEN_RE.sub("", content)
-    cleaned = _DSML_TOOL_CALLS_CLOSE_RE.sub("", cleaned)
-    cleaned = _DSML_INVOKE_RE.sub("", cleaned)
-    cleaned = _DSML_INVOKE_CLOSE_RE.sub("", cleaned)
-    cleaned = _DSML_PARAM_RE.sub("", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
 
 
 def sanitize_tool_call_groups(messages: List, logger=None) -> int:
