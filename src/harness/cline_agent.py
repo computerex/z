@@ -2051,23 +2051,23 @@ class ClineAgent:
                         "No tool call parsed from response (len=%d)", len(full_content)
                     )
 
-                # Handle attempt_completion — agent signals it is done.
-                # If attempt_completion appears alongside other tool calls,
-                # execute those tools FIRST, then process the completion.
+                # Handle end_turn — agent signals it is done.
+                # If end_turn appears alongside other tool calls,
+                # execute those tools FIRST, then process the end_turn.
                 # This prevents silent skipping of tool calls when the model
-                # emits tools + attempt_completion in the same response.
+                # emits tools + end_turn in the same response.
                 completion_call = next(
-                    (tc for tc in all_tool_calls if tc.name == "attempt_completion"),
+                    (tc for tc in all_tool_calls if tc.name == "end_turn"),
                     None,
                 )
                 if completion_call:
-                    # Filter out attempt_completion — execute only the FIRST remaining tool (1-per-turn policy)
-                    actionable_tools = [tc for tc in all_tool_calls if tc.name != "attempt_completion"]
+                    # Filter out end_turn — execute only the FIRST remaining tool (1-per-turn policy)
+                    actionable_tools = [tc for tc in all_tool_calls if tc.name != "end_turn"]
                     if actionable_tools:
                         tc = actionable_tools[0]
                         ignored_pre = actionable_tools[1:]
                         log.info(
-                            "attempt_completion found alongside %d other tool(s) — executing first tool only: %s",
+                            "end_turn found alongside %d other tool(s) — executing first tool only: %s",
                             len(actionable_tools),
                             tc.name,
                         )
@@ -2118,13 +2118,13 @@ class ClineAgent:
                             tool_results_combined.append(
                                 f"[SYSTEM: Only 1 tool call is executed per turn. "
                                 f"{len(ignored_pre)} additional tool call(s) were NOT executed: {skipped_names}. "
-                                f"The attempt_completion was also deferred. Re-issue remaining tools one at a time.]"
+                                f"The end_turn was also deferred. Re-issue remaining tools one at a time.]"
                             )
                             # Feed the tool result + system notice back and
                             # continue the loop so the model can re-issue the
                             # dropped tools before completing.
                             log.info(
-                                "Deferring attempt_completion — %d tool(s) were dropped, feeding result back",
+                                "Deferring end_turn — %d tool(s) were dropped, feeding result back",
                                 len(ignored_pre),
                             )
                             tool_result = "\n\n".join(tool_results_combined)
@@ -2157,13 +2157,13 @@ class ClineAgent:
                                         name=_ign.name,
                                     )
                                 )
-                            # Synthetic result for the deferred attempt_completion
+                            # Synthetic result for the deferred end_turn
                             self.messages.append(
                                 StreamingMessage(
                                     role="tool",
                                     content="[Deferred — complete remaining tools first.]",
                                     tool_call_id=completion_call.tool_call_id or f"fallback_{completion_call.name}",
-                                    name="attempt_completion",
+                                    name="end_turn",
                                 )
                             )
                             continue
@@ -2171,7 +2171,7 @@ class ClineAgent:
                     result_text = completion_call.parameters.get("result", "").strip()
                     command = completion_call.parameters.get("command", "").strip()
                     log.info(
-                        "attempt_completion received (result_len=%d, has_command=%s)",
+                        "end_turn received (result_len=%d, has_command=%s)",
                         len(result_text),
                         bool(command),
                     )
@@ -2195,7 +2195,7 @@ class ClineAgent:
                                 role="tool",
                                 content=result_text or "[Task completed]",
                                 tool_call_id=completion_call.tool_call_id or f"fallback_{completion_call.name}",
-                                name="attempt_completion",
+                                name="end_turn",
                             )
                         )
                     # Render the result — stream filter suppressed it during streaming
@@ -2275,7 +2275,7 @@ class ClineAgent:
                                     content=(
                                         "Your response contained only internal reasoning with no visible output. "
                                         "Please proceed: either use a tool to continue the task, or use "
-                                        "attempt_completion to present your final result."
+                                        "end_turn to present your final result."
                                     ),
                                 )
                             )
@@ -2322,17 +2322,35 @@ class ClineAgent:
                             # Continue to next iteration to try again
                             continue
 
-                    # No tool call — final response to user
+                    # No tool call — the model produced narrative text without
+                    # using end_turn. Per the system prompt, narrative text is
+                    # internal reasoning only and is DISCARDED — it never reaches
+                    # the user. Force the model to use end_turn if it wants to
+                    # communicate.
+                    # Quote back the beginning of the discarded text so the model
+                    # can see concretely what was thrown away.
+                    discarded_preview = full_content[:120].replace("\n", " ")
                     self.messages.append(
                         StreamingMessage(
-                            role="assistant",
-                            content=full_content,
-                            provider_blocks=getattr(
-                                response, "provider_content_blocks", None
+                            role="user",
+                            content=(
+                                "Your response contained ONLY narrative text with no tool call — "
+                                "it was DISCARDED: "
+                                + ("\n  >>> " + discarded_preview + "..." if full_content else "(empty)")
+                                + "\n\n"
+                                "As stated in the system prompt, narrative text is internal "
+                                "reasoning only and is NEVER seen by the user. "
+                                "If you want to communicate with the user, you MUST call "
+                                "end_turn with your message in the 'result' parameter. "
+                                "This is the ONLY way to deliver a message to the user. "
+                                "Do NOT just write text — call end_turn."
                             ),
                         )
                     )
-                    return full_content
+                    self.console.print(
+                        "\n  [red]→ Narrative discarded (no end_turn). Quoted back to model.[/red]\n"
+                    )
+                    continue
 
                 # Execute only the FIRST tool call per turn (1 tool per turn policy).
                 # If the model emitted multiple tool calls, only the first is executed;

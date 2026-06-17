@@ -43,7 +43,7 @@ def _schema_params(func: dict) -> dict[str, bool]:
 # ── Registry → OpenAI schema reconciliation ───────────────────────
 
 # Tools handled directly in the agent loop, not via tool_handlers
-_AGENT_LOOP_TOOLS = {"attempt_completion", "manage_todos", "introspect"}
+_AGENT_LOOP_TOOLS = {"end_turn", "manage_todos", "introspect"}
 
 
 class TestRegistryToSchema:
@@ -140,8 +140,8 @@ class TestToolDispatchCoverage:
 
         missing = []
         for td in TOOL_DEFS:
-            # attempt_completion is handled outside _dispatch_tool
-            if td.name == "attempt_completion":
+            # end_turn is handled outside _dispatch_tool
+            if td.name == "end_turn":
                 continue
             if td.name not in dispatched:
                 missing.append(td.name)
