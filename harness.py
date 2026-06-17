@@ -1469,19 +1469,39 @@ def run_model_switch_wizard(
         tuple[str, str, str, dict]
     ] = []  # (profile, provider_display, model_id, cfg)
     failures: List[str] = []
+
+    # Collect work items (skip providers without credentials)
+    work_items: List[tuple[str, str, str, str, dict]] = []
     for profile, cfg in searchable:
         api_url = cfg.get("api_url", "")
         api_key = cfg.get("api_key", "")
-        provider_display = _provider_display_name(profile, cfg)
         if not api_url or not api_key:
             continue
-        try:
-            console.print(f"  [dim]Fetching: {provider_display}...[/dim]")
-            mids = _fetch_provider_model_ids_cached(api_url, api_key, refresh=refresh)
-            for mid in mids:
-                aggregate.append((profile, provider_display, mid, cfg))
-        except Exception as e:
-            failures.append(f"{provider_display}: {e}")
+        provider_display = _provider_display_name(profile, cfg)
+        work_items.append((profile, provider_display, api_url, api_key, cfg))
+        console.print(f"  [dim]Fetching: {provider_display}...[/dim]")
+
+    if not work_items:
+        return "No configured providers with valid API configuration."
+
+    # Parallel fetch all providers — each call is I/O bound (HTTP request)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(10, len(work_items))
+    ) as executor:
+        future_map = {
+            executor.submit(
+                _fetch_provider_model_ids_cached, api_url, api_key, refresh
+            ): (profile, provider_display, cfg)
+            for (profile, provider_display, api_url, api_key, cfg) in work_items
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            profile, provider_display, cfg = future_map[future]
+            try:
+                mids = future.result()
+                for mid in mids:
+                    aggregate.append((profile, provider_display, mid, cfg))
+            except Exception as e:
+                failures.append(f"{provider_display}: {e}")
 
     if failures:
         for f in failures[:5]:
