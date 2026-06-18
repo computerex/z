@@ -2192,7 +2192,12 @@ class ToolHandlers:
             return f"Error: {e}"
 
     async def send_agent_input(self, params: dict) -> str:
-        """Send input to a sub-agent and get its response."""
+        """Send input to a sub-agent and get its response.
+
+        If the sub-agent has already completed (no longer running), returns the
+        cached output directly without re-running. To start a new conversation
+        turn with a completed sub-agent, provide meaningful new input.
+        """
         name = params.get("name", "").strip()
         input_text = params.get("input", "").strip()
         if not name or input_text is None:
@@ -2200,6 +2205,15 @@ class ToolHandlers:
         if not self.sub_agent_manager:
             return "Error: Sub-agent system not initialized."
         try:
+            inst = self.sub_agent_manager.get(name)
+            if not inst:
+                return f"Error: Sub-agent '{name}' not found."
+            
+            # If agent is completed and has output, return cached output
+            # without re-running (avoids unnecessary API calls for retrieval).
+            if inst.status == "completed" and inst.task and inst.task.done() and inst.output:
+                return inst.output
+            
             self.console.print(
                 f"  [dim]\u2192[/dim] Sending input to [bold]{name}[/bold]..."
             )
