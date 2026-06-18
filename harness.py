@@ -3603,22 +3603,8 @@ def main():
                             console.print(f"  [red]\u2717 {rich_escape(str(e))}[/red]")
                     continue
 
-                # If focused on a sub-agent, route non-command input to it
-                if focused_agent:
-                    try:
-                        result = loop.run_until_complete(
-                            sub_agent_manager.run(focused_agent, user_input)
-                        )
-                        console.print(result)
-                    except KeyError:
-                        console.print(f"  [red]\u2717[/red] Sub-agent '[bold]{focused_agent}[/bold]' not found. Switching back.")
-                        focused_agent = None
-                        sub_agent_manager.set_focused(None)
-                    except Exception as e:
-                        console.print(f"  [red]\u2717[/red] Error: {e}")
-                    continue
-
-                # Handle commands
+                # Handle commands — checked BEFORE sub-agent routing so /commands
+                # work even when focused on a sub-agent
                 if user_input.startswith("/"):
                     parts = user_input.split(maxsplit=1)
                     cmd = parts[0].lower()
@@ -4820,6 +4806,21 @@ def main():
                             f"  [dim]Unknown command. Type [white]/help[/white] for available commands.[/dim]"
                         )
                         continue
+
+                # If focused on a sub-agent, route non-command input to it
+                if focused_agent:
+                    try:
+                        result = loop.run_until_complete(
+                            sub_agent_manager.run(focused_agent, user_input)
+                        )
+                        console.print(result)
+                    except KeyError:
+                        console.print(f"  [red]\u2717[/red] Sub-agent '[bold]{focused_agent}[/bold]' not found. Switching back.")
+                        focused_agent = None
+                        sub_agent_manager.set_focused(None)
+                    except Exception as e:
+                        console.print(f"  [red]\u2717[/red] Error: {e}")
+                    continue
 
                 multimodal_content: Optional[List[Dict[str, Any]]] = None
                 multimodal_label: Optional[str] = None
