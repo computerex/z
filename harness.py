@@ -2596,6 +2596,7 @@ class HarnessCompleter(Completer):
         "/session",
         "/new",
         "/delete",
+        "/fork",
         "/clear",
         "/save",
         "/history",
@@ -2730,7 +2731,7 @@ class HarnessCompleter(Completer):
                             start_position=-len(prefix),
                             display=cmd,
                         )
-            elif parts[0] in ["/session", "/delete"]:
+            elif parts[0] in ["/session", "/delete", "/fork"]:
                 # Complete session names
                 sessions_dir = get_sessions_dir(str(self.workspace))
                 if sessions_dir.exists():
@@ -3735,6 +3736,37 @@ def main():
                             )
                         else:
                             console.print(f"  [dim]Session '{target}' not found[/dim]")
+                        continue
+
+                    elif cmd == "/fork":
+                        if not cmd_arg:
+                            console.print("  [dim]Usage: /fork <source_session> [new_session][/dim]")
+                            continue
+                        parts = cmd_arg.strip().split(maxsplit=1)
+                        source_name = parts[0]
+                        dest_name = parts[1] if len(parts) > 1 else None
+                        source_path = get_session_path(workspace, source_name)
+                        if not source_path.exists():
+                            console.print(
+                                f"  [yellow]\u26a0[/yellow] Source session '[bold]{source_name}[/bold]' not found"
+                            )
+                            continue
+                        # Save current session before forking
+                        agent.save_session(str(session_path))
+                        # Load source session into agent (copies messages, source file stays intact)
+                        agent.load_session(str(source_path))
+                        if dest_name:
+                            current_session = dest_name
+                            session_path = get_session_path(workspace, current_session)
+                            agent.save_session(str(session_path))
+                            console.print(
+                                f"  [green]\u2713[/green] Forked [bold]{source_name}[/bold] \u2192 [bold]{current_session}[/bold] [dim]({len(agent.messages) - 1} messages)[/dim]"
+                            )
+                        else:
+                            agent.save_session(str(session_path))
+                            console.print(
+                                f"  [green]\u2713[/green] Forked [bold]{source_name}[/bold] into current session [bold]{current_session}[/bold] [dim]({len(agent.messages) - 1} messages)[/dim]"
+                            )
                         continue
 
                     elif cmd == "/history":
