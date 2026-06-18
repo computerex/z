@@ -17,6 +17,7 @@ Memory directory structure:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -83,9 +84,7 @@ def _compute_project_slug(cwd: Optional[str] = None) -> str:
     project_path = Path(cwd or os.getcwd()).resolve()
     # Use the directory name as the slug, with a hash suffix for uniqueness
     name = project_path.name
-    h = str(hash(str(project_path)))
-    if h.startswith("-"):
-        h = h[1:]
+    h = hashlib.md5(str(project_path).encode()).hexdigest()
     return f"{name}_{h[:12]}"
 
 
