@@ -4709,6 +4709,17 @@ def main():
                             "  [cyan]/save[/cyan]                [dim]Save current session[/dim]"
                         )
                         console.print()
+                        console.print("  [bold]Sub-Agents[/bold]")
+                        console.print(
+                            "  [cyan]/agents[/cyan]              [dim]List running/completed sub-agents[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/agent[/cyan] [dim]<name>[/dim]          [dim]Switch focus to a sub-agent[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/agent-back[/cyan]          [dim]Return focus to parent agent[/dim]"
+                        )
+                        console.print()
                         console.print("  [bold]Models & Providers[/bold]")
                         console.print(
                             "  [cyan]/model[/cyan] [dim]<query>[/dim]       [dim]Search and switch models[/dim]"
