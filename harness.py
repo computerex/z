@@ -4808,12 +4808,13 @@ def main():
                         continue
 
                 # If focused on a sub-agent, route non-command input to it
+                # The sub-agent renders its own output via TeeWriter, so no
+                # need to print the returned result text (avoids double-render).
                 if focused_agent:
                     try:
-                        result = loop.run_until_complete(
+                        loop.run_until_complete(
                             sub_agent_manager.run(focused_agent, user_input)
                         )
-                        console.print(result)
                     except KeyError:
                         console.print(f"  [red]\u2717[/red] Sub-agent '[bold]{focused_agent}[/bold]' not found. Switching back.")
                         focused_agent = None
