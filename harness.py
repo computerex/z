@@ -2732,7 +2732,7 @@ class HarnessCompleter(Completer):
                         )
             elif parts[0] in ["/session", "/delete"]:
                 # Complete session names
-                sessions_dir = self.workspace / ".forge" / "sessions"
+                sessions_dir = get_sessions_dir(str(self.workspace))
                 if sessions_dir.exists():
                     prefix = parts[-1]
                     for session_file in sessions_dir.glob("*.json"):
@@ -3650,6 +3650,7 @@ def main():
                             )
                         else:
                             agent.clear_history()
+                            agent.save_session(str(session_path))
                             console.print(
                                 f"  [green]\u2713[/green] Created new session [bold]{current_session}[/bold]"
                             )
@@ -3666,6 +3667,7 @@ def main():
                         session_path = get_session_path(workspace, current_session)
                         agent.clear_history()
                         reset_global_tracker()
+                        agent.save_session(str(session_path))
                         console.print(
                             f"  [green]\u2713[/green] Started fresh session [bold]{current_session}[/bold]"
                         )
