@@ -24,6 +24,15 @@ from .config import Config
 from .prompts import get_system_prompt
 from .cost_tracker import get_global_tracker
 from .logger import debug_print
+
+# Hooks & memory systems (mirrors Claude Code)
+from .hooks import (
+    execute_pre_tool_use_hooks,
+    execute_post_tool_use_hooks,
+    execute_post_tool_use_failure_hooks,
+)
+from .memdir import load_memory_prompt, find_relevant_memories, get_memory_dir
+
 from .interrupt import (
     is_interrupted,
     is_background_requested,
@@ -315,6 +324,11 @@ class ClineAgent:
         # Track which instruction files have been loaded (for on-demand subdir loading)
         self._loaded_instruction_paths: set = set()
 
+        # Memory system tracking
+        self._loaded_memory_paths: set = set()
+        self._memory_prompt: Optional[str] = None
+        self._memory_prompt_loaded: bool = False
+
         # Tool handlers - delegates all tool execution logic
         self.tool_handlers = ToolHandlers(
             config=self.config,
@@ -423,6 +437,35 @@ class ClineAgent:
         instructions = self._load_instruction_files()
         if instructions:
             result += "\n\n====\n\nWORKSPACE INSTRUCTIONS\n\n" + instructions
+
+        # Append memory system prompt (loaded/cached once)
+        if not self._memory_prompt_loaded:
+            try:
+                self._memory_prompt = load_memory_prompt()
+            except Exception as e:
+                debug_print(f"Failed to load memory prompt: {e}")
+                self._memory_prompt = None
+            self._memory_prompt_loaded = True
+
+        if self._memory_prompt:
+            result += "\n\n====\n\nMEMORY\n\n" + self._memory_prompt
+
+        # Self-configuration instructions for CLAUDE.md, memory & hooks
+        result += """
+
+====
+
+CLAUDE.md, MEMORY & HOOKS
+
+You can help the user configure three persistence systems:
+
+CLAUDE.md inheritance — Place CLAUDE.md (committed) or CLAUDE.local.md (private, gitignored) in any directory. Loaded from CWD up to root; deeper paths win. .claude/rules/*.md are loaded as unconditional rules. Add paths: frontmatter (e.g., paths: src/**/*.ts) to make a rule conditional on which file the model touches. Use @path/to/file.md to include other files (max depth 5, text-only). HTML block comments (<!-- -->) are stripped.
+
+Memory system — Persistent file-based memory at ~/.claude/projects/<slug>/memory/. Four types: user (role/preferences), feedback (guidance on approach), project (ongoing work context), reference (pointers to external systems). Each memory is a .md file with frontmatter: --- name: ... description: ... type: ... ---. Index entries go in MEMORY.md (e.g., - [Title](file.md) — hook). MEMORY.md is always loaded; topic files are fetched on-demand via relevance ranking. Memory recall is automatic — memories relevant to the current query are injected before each turn.
+
+Hooks — Configured in .claude/settings.json. Events: PreToolUse, PostToolUse, PostToolUseFailure, Stop, SessionStart, SessionEnd, UserPromptSubmit, InstructionsLoaded. Hook types: command (shell with $ARGUMENTS as JSON stdin), prompt (LLM with $ARGUMENTS placeholder), agent (verifier sub-agent), http (POST). Use "if":"ToolName(pattern)" to only fire on matching tool calls. Use "async":true for fire-and-forget, "asyncRewake":true to wake the model on error (exit code 2). Exit code 2 blocks the tool call; 0 = success; other = error shown to user.
+
+If the user asks you to set up any of these — walk them through the format and write the files."""
 
         return result
 
@@ -2510,12 +2553,42 @@ class ClineAgent:
         _success = True
         _error_msg = None
 
+        # ── PreToolUse hooks ──
+        try:
+            pre_results = await execute_pre_tool_use_hooks(
+                tool.name, tool.parameters
+            )
+            for r in pre_results:
+                if r.blocked:
+                    return f"Hook blocked tool call: {r.output}"
+        except Exception as e:
+            debug_print(f"PreToolUse hook failed: {e}")
+
         try:
             result = await self._dispatch_tool(tool)
+
+            # ── PostToolUse hooks ──
+            try:
+                await execute_post_tool_use_hooks(
+                    tool.name, tool.parameters, result
+                )
+            except Exception as e:
+                debug_print(f"PostToolUse hook failed: {e}")
+
             return result
+
         except Exception as e:
             _success = False
             _error_msg = str(e)
+
+            # ── PostToolUseFailure hooks ──
+            try:
+                await execute_post_tool_use_failure_hooks(
+                    tool.name, tool.parameters, str(e)
+                )
+            except Exception as e2:
+                debug_print(f"PostToolUseFailure hook failed: {e2}")
+
             log_exception(log, f"Tool execution failed: {tool.name}", e)
             self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
             return f"Error: {str(e)}"

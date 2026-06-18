@@ -128,6 +128,14 @@ from harness.logger import (
     debug_print,
 )
 
+# Hooks & memory systems
+from harness.hooks import (
+    execute_session_start_hooks,
+    execute_session_end_hooks,
+    execute_user_prompt_submit_hooks,
+)
+from harness.memdir import find_relevant_memories, get_memory_dir
+
 _mark("import_harness_core")
 from rich.console import Console
 from rich.panel import Panel
@@ -3417,12 +3425,23 @@ def main():
         log.debug("Session saved")
 
     def cleanup_and_save():
+        # Fire SessionEnd hooks (fire-and-forget)
+        try:
+            loop.run_until_complete(execute_session_end_hooks("exit"))
+        except Exception as e:
+            debug_print(f"SessionEnd hook failed: {e}")
         loop.run_until_complete(agent.cleanup_background_procs_async())
         sub_agent_manager.save_all_sessions()
         sub_agent_manager.cleanup()
         save_session()
 
     _mark("ready")
+
+    # Fire SessionStart hooks
+    try:
+        loop.run_until_complete(execute_session_start_hooks("startup"))
+    except Exception as e:
+        debug_print(f"SessionStart hook failed: {e}")
     if os.environ.get("HARNESS_BOOT_TIMING", ""):
         _print_boot_timing(console)
 
@@ -4871,6 +4890,45 @@ def main():
                 log.info(
                     "User input: %s", truncate(multimodal_label or user_input, 200)
                 )
+
+                # ── UserPromptSubmit hooks ──
+                try:
+                    _input_str = multimodal_label or (
+                        user_input if isinstance(user_input, str) else "[multimodal]"
+                    )
+                    _hook_results = loop.run_until_complete(
+                        execute_user_prompt_submit_hooks(_input_str)
+                    )
+                    for _hr in _hook_results:
+                        if _hr.blocked:
+                            console.print(f"  [yellow]Hook blocked input: {_hr.output}[/yellow]")
+                            continue
+                except Exception as e:
+                    debug_print(f"UserPromptSubmit hook failed: {e}")
+
+                # ── Load relevant memories for this turn ──
+                try:
+                    _query = multimodal_label or (
+                        user_input if isinstance(user_input, str) else ""
+                    )
+                    _mem_dir = str(get_memory_dir())
+                    _relevant = find_relevant_memories(_query, _mem_dir)
+                    if _relevant and agent.messages and agent.messages[0].role == "system":
+                        _mem_notes = []
+                        for _mp in _relevant:
+                            if _mp not in agent._loaded_memory_paths:
+                                agent._loaded_memory_paths.add(_mp)
+                                try:
+                                    _content = Path(_mp).read_text(encoding="utf-8", errors="replace")
+                                    _mem_notes.append(f"- {_mp}\n\n{_content.strip()}")
+                                except Exception:
+                                    pass
+                        if _mem_notes:
+                            agent.messages[0].content += (
+                                "\n\n====\n\nRELEVANT MEMORIES\n\n" + "\n\n".join(_mem_notes)
+                            )
+                except Exception as e:
+                    debug_print(f"Memory recall failed: {e}")
 
                 # Take checkpoint before each agent turn for undo/redo
                 try:
