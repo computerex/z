@@ -295,7 +295,7 @@ Z exposes **19 built-in tools** through OpenAI function calling — the model se
 | **Search** | `list_files`, `search_files` |
 | **External** | `analyze_image`, `web_search`, `mcp_search_tools`, `mcp_list_tools`, `mcp_call_tool` |
 | **Context** | `retrieve_tool_result` |
-| **Agent meta** | `manage_todos`, `introspect`, `end_turn` |
+| **Agent meta** | `manage_todos`, `introspect`, `attempt_completion` |
 
 All tools share a single, unified schema in `tool_registry.py` — add one tool there and it propagates to parsing, detection, dispatch, and system prompts automatically.
 

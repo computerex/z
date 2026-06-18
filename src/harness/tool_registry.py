@@ -196,11 +196,8 @@ TOOL_DEFS: List[ToolDef] = [
                         "Use when facing complex decisions, debugging tricky issues, or planning multi-step approaches.",
             params=[ToolParam("focus",
                               description="A description of what to focus your thinking on")]),
-    ToolDef("end_turn", category="agent",
-            description="[IMPORTANT: This is the ONLY way to deliver a message to the user.] "
-                        "End your turn and present the final result of the task to the user. "
-                        "Any text you produce outside a tool call is INTERNAL REASONING ONLY — the user never sees it. "
-                        "If you want the user to see something, put it in the 'result' parameter of this tool. "
+    ToolDef("attempt_completion", category="agent",
+            description="Signal that the task is complete and present the result to the user. "
                         "Use ONLY after confirming all previous tool uses succeeded. "
                         "Do NOT end the result with questions or offers for further assistance.",
             params=[ToolParam("result", required=True,
