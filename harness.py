@@ -3507,6 +3507,18 @@ def main():
 
         def _build_prompt_text():
             """Build prompt text dynamically so Ctrl+T updates are visible immediately."""
+            # Build a truncated workspace path: substitute home with ~, then shorten
+            ws = str(workspace)
+            home = os.path.expanduser("~")
+            if ws.startswith(home):
+                ws_display = "~" + ws[len(home):]
+            else:
+                ws_display = ws
+            # If too long, truncate from the left keeping the last ~35 chars
+            MAX_WS = 40
+            if len(ws_display) > MAX_WS:
+                ws_display = "…" + ws_display[-(MAX_WS - 1):]
+
             model_short = agent.config.model.split("/")[-1] if "/" in agent.config.model else agent.config.model
             active_prov = _infer_active_provider_profile(agent, providers) or ""
             effort = getattr(agent.config, "reasoning_effort", "high")
@@ -3518,7 +3530,7 @@ def main():
             if effort != "none":
                 info_parts.append(f"\x1b[38;5;{effort_color}m{effort}\x1b[0m")
             info_str = f" \x1b[38;5;243m·\x1b[0m ".join(info_parts)
-            return ANSI(f"\x1b[1m{model_short}\x1b[0m {info_str} \x1b[38;5;243m\u276f\x1b[0m ")
+            return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str} \x1b[38;5;243m\u276f\x1b[0m ")
 
         while True:
             try:
