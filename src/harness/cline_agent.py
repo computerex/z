@@ -256,6 +256,9 @@ class ClineAgent:
         console: Optional[Console] = None,
         max_iterations: int = 500,
         providers: Optional[Dict[str, dict]] = None,
+        output_stream=None,
+        enable_status_line: bool = True,
+        sub_agent_manager=None,
     ):
         self.config = config
         self.console = console or Console()
@@ -265,6 +268,12 @@ class ClineAgent:
 
         # Provider management
         self.providers = providers or {}
+
+        # Output stream for captured output (default: sys.stdout)
+        self._output_stream = output_stream or sys.stdout
+
+        # Reference to SubAgentManager (only set for parent agent)
+        self._sub_agent_manager = sub_agent_manager
 
         # Conversation history
         self.messages: List[StreamingMessage] = []
@@ -290,9 +299,12 @@ class ClineAgent:
         self._last_token_count = 0
 
         # Persistent bottom status line
-        self.status = StatusLine(enabled=sys.stdin.isatty())
-        # Wrap console so prints automatically clear/restore status line
-        self.console = self.status.wrap_console(self.console)
+        if enable_status_line:
+            self.status = StatusLine(enabled=sys.stdin.isatty())
+            # Wrap console so prints automatically clear/restore status line
+            self.console = self.status.wrap_console(self.console)
+        else:
+            self.status = StatusLine(enabled=False)
 
         # Thrash detection: track consecutive edit failures per file
         # {filepath: {"failures": int, "last_error": str}}
@@ -311,6 +323,7 @@ class ClineAgent:
             context=self.context,
             duplicate_detector=self._duplicate_detector,
             context_manager=self.smart_context,
+            sub_agent_manager=self._sub_agent_manager,
         )
         # Workspace index — built once at startup
         _t0_idx = time.perf_counter()
@@ -486,6 +499,7 @@ class ClineAgent:
         we push the model to continue (up to _INTROSPECT_MAX_CONTINUATIONS times).
         The thinking output is returned as the tool result.
         """
+        _out = self._output_stream
         log.info("Introspect tool called: focus=%r", focus[:80] if focus else "(none)")
 
         self.console.print(
@@ -528,8 +542,8 @@ class ClineAgent:
                 """Flush buffered tag to stdout (it wasn't a tool tag)."""
                 nonlocal _tag_buf
                 if _tag_buf:
-                    sys.stdout.write(_tag_buf)
-                    sys.stdout.flush()
+                    _out.write(_tag_buf)
+                    _out.flush()
                     _tag_buf = ""
 
             def on_chunk(c: str):
@@ -567,8 +581,8 @@ class ClineAgent:
                     return
 
                 self.status.clear()
-                sys.stdout.write(c)
-                sys.stdout.flush()
+                _out.write(c)
+                _out.flush()
 
             self.status.update(
                 "Thinking deeply..." if attempt == 0 else "Continuing analysis...",
@@ -1299,6 +1313,8 @@ class ClineAgent:
 
     async def _run_loop(self) -> str:
         """Main agent loop."""
+        # Output stream for captured output (sys.stdout by default)
+        _out = self._output_stream
         # Client is created inside the loop so that reasoning-mode switches
         # (which change self.config) take effect on the very next API call.
         client: Optional[StreamingJSONClient] = None
@@ -1390,6 +1406,19 @@ class ClineAgent:
                     self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
                     return "[Interrupted - session preserved. Type to continue or start new request]"
 
+                # Check for completed sub-agents (parent agent only)
+                if self._sub_agent_manager:
+                    _completed_sa = self._sub_agent_manager.check_completed()
+                    if _completed_sa:
+                        _notif = (
+                            f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
+                            f"Use send_agent_input(name='{_completed_sa}') to retrieve its output.]"
+                        )
+                        self.messages.append(
+                            StreamingMessage(role="user", content=_notif)
+                        )
+                        log.info("Injected completion notification for sub-agent '%s'", _completed_sa)
+
                 # Reset only background flag (not interrupt) for this iteration
                 # User needs to explicitly continue after interrupt
 
@@ -1472,8 +1501,8 @@ class ClineAgent:
                     if _sf_tag_buf:
                         if not _defer_markdown_render:
                             self.status.clear()
-                            sys.stdout.write(_sf_tag_buf)
-                            sys.stdout.flush()
+                            _out.write(_sf_tag_buf)
+                            _out.flush()
                             _sf_had_visible = True
                         _sf_tag_buf = ""
                         _sf_in_tag = False
@@ -1554,8 +1583,8 @@ class ClineAgent:
                     # (routed through on_reasoning above) is shown live.
                     if not _defer_markdown_render:
                         self.status.clear()
-                        sys.stdout.write(c)
-                        sys.stdout.flush()
+                        _out.write(c)
+                        _out.flush()
                         _sf_had_visible = True
 
                 def on_chunk(chunk: str):
@@ -1621,8 +1650,8 @@ class ClineAgent:
                         return
                     if not _thinking_started:
                         self.status.clear()
-                        sys.stdout.write(_thinking_header)
-                        sys.stdout.flush()
+                        _out.write(_thinking_header)
+                        _out.flush()
                         _thinking_started = True
                         _thinking_line_start = True
                     # Clear status before writing thinking content
@@ -1632,12 +1661,12 @@ class ClineAgent:
                             # Skip leading blank lines so the block starts tight.
                             if c == "\n" and not _thinking_line_has_text:
                                 continue
-                            sys.stdout.write(_thinking_prefix)
+                            _out.write(_thinking_prefix)
                             _thinking_line_start = False
                         if _tty and c != "\n":
-                            sys.stdout.write(f"{_ansi_dim}{c}{_ansi_reset}")
+                            _out.write(f"{_ansi_dim}{c}{_ansi_reset}")
                         else:
-                            sys.stdout.write(c)
+                            _out.write(c)
                         if c not in ("\n", "\r", "\t", " "):
                             _thinking_line_has_text = True
                         if c == "\n":
@@ -1869,8 +1898,8 @@ class ClineAgent:
                     _sf_tag_buf = ""
                 if _thinking_started:
                     if not _thinking_line_start:
-                        sys.stdout.write("\n")
-                    sys.stdout.flush()
+                        _out.write("\n")
+                    _out.flush()
                 self.status.clear()
                 if _sf_had_visible:
                     print()  # Newline after visible stream content
@@ -2712,6 +2741,21 @@ class ClineAgent:
             elif tool.name == "introspect":
                 focus = tool.parameters.get("focus", "")
                 result = await self._execute_introspect(focus)
+
+            elif tool.name == "create_agent":
+                result = await self.tool_handlers.create_agent(tool.parameters)
+
+            elif tool.name == "send_agent_input":
+                result = await self.tool_handlers.send_agent_input(tool.parameters)
+
+            elif tool.name == "list_agents":
+                result = await self.tool_handlers.list_agents(tool.parameters)
+
+            elif tool.name == "pause_agent":
+                result = await self.tool_handlers.pause_agent(tool.parameters)
+
+            elif tool.name == "delete_agent":
+                result = await self.tool_handlers.delete_agent(tool.parameters)
 
             else:
                 # Try plugin tools before giving up

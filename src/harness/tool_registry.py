@@ -196,6 +196,33 @@ TOOL_DEFS: List[ToolDef] = [
                         "Use when facing complex decisions, debugging tricky issues, or planning multi-step approaches.",
             params=[ToolParam("focus",
                               description="A description of what to focus your thinking on")]),
+    ToolDef("create_agent", category="agent",
+            description="Create an independent sub-agent to work on a task concurrently. "
+                        "The sub-agent runs in the background and has its own conversation history, "
+                        "context, and session - completely isolated from you. "
+                        "You'll be notified when it completes. Use send_agent_input to communicate with it.",
+            params=[ToolParam("name", required=True,
+                              description="A unique name for the sub-agent (used to reference it later)"),
+                    ToolParam("task", required=True,
+                              description="The full task description to assign to the sub-agent")]),
+    ToolDef("send_agent_input", category="agent",
+            description="Send input/text to a sub-agent and get its response. "
+                        "If the sub-agent is still running a previous task, this waits for it to complete "
+                        "first, then delivers the new input. Enables multi-turn conversation with sub-agents.",
+            params=[ToolParam("name", required=True,
+                              description="The name of the sub-agent to send input to"),
+                    ToolParam("input", required=True,
+                              description="The input/text to send to the sub-agent")]),
+    ToolDef("list_agents", category="agent",
+            description="List all sub-agents with their current status (running/completed/error)."),
+    ToolDef("pause_agent", category="agent",
+            description="Pause a running sub-agent. Its state is saved for debugging.",
+            params=[ToolParam("name", required=True,
+                              description="The name of the sub-agent to pause")]),
+    ToolDef("delete_agent", category="agent",
+            description="Delete a sub-agent completely. Cancels any running task and removes it.",
+            params=[ToolParam("name", required=True,
+                              description="The name of the sub-agent to delete")]),
     ToolDef("attempt_completion", category="agent",
             description="Signal that the task is complete and present the result to the user. "
                         "Use ONLY after confirming all previous tool uses succeeded. "

@@ -116,6 +116,7 @@ _mark("import_config")
 from harness.cline_agent import ClineAgent
 
 _mark("import_cline_agent")
+from harness.sub_agent_manager import SubAgentManager
 from harness.checkpoint import CheckpointManager
 from harness.cost_tracker import get_global_tracker, reset_global_tracker
 from harness.logger import (
@@ -2597,6 +2598,9 @@ class HarnessCompleter(Completer):
         "/new",
         "/delete",
         "/fork",
+        "/agents",
+        "/agent",
+        "/agent-back",
         "/clear",
         "/save",
         "/history",
@@ -2731,7 +2735,7 @@ class HarnessCompleter(Completer):
                             start_position=-len(prefix),
                             display=cmd,
                         )
-            elif parts[0] in ["/session", "/delete", "/fork"]:
+            elif parts[0] in ["/session", "/delete", "/fork", "/agent"]:
                 # Complete session names
                 sessions_dir = get_sessions_dir(str(self.workspace))
                 if sessions_dir.exists():
@@ -3360,10 +3364,19 @@ def main():
 
     console = Console()
 
+    # Sub-agent manager for creating and managing sub-agents
+    sub_agent_manager = SubAgentManager(
+        config=config,
+        console=console,
+        workspace=workspace,
+        get_session_path_fn=get_session_path,
+    )
+
     # Create single agent with providers for mode switching
     agent = ClineAgent(
         config,
         providers=providers,
+        sub_agent_manager=sub_agent_manager,
     )
     _mark("agent_created")
     log.info("Agent created")
@@ -3405,6 +3418,8 @@ def main():
 
     def cleanup_and_save():
         loop.run_until_complete(agent.cleanup_background_procs_async())
+        sub_agent_manager.save_all_sessions()
+        sub_agent_manager.cleanup()
         save_session()
 
     _mark("ready")
@@ -3505,6 +3520,7 @@ def main():
         )
 
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
+        focused_agent: Optional[str] = None  # Name of sub-agent currently focused
 
         def _build_prompt_text():
             """Build prompt text dynamically so Ctrl+T updates are visible immediately."""
@@ -3531,7 +3547,11 @@ def main():
             if effort != "none":
                 info_parts.append(f"\x1b[38;5;{effort_color}m{effort}\x1b[0m")
             info_str = f" \x1b[38;5;243m·\x1b[0m ".join(info_parts)
-            return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str} \x1b[38;5;243m\u276f\x1b[0m ")
+            # Add sub-agent focus indicator
+            agent_tag = ""
+            if focused_agent:
+                agent_tag = f" \x1b[38;5;220m[agent:{focused_agent}]\x1b[0m"
+            return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str}{agent_tag} \x1b[38;5;243m\u276f\x1b[0m ")
 
         while True:
             try:
@@ -3581,6 +3601,21 @@ def main():
                             console.print(result)
                         except Exception as e:
                             console.print(f"  [red]\u2717 {rich_escape(str(e))}[/red]")
+                    continue
+
+                # If focused on a sub-agent, route non-command input to it
+                if focused_agent:
+                    try:
+                        result = loop.run_until_complete(
+                            sub_agent_manager.run(focused_agent, user_input)
+                        )
+                        console.print(result)
+                    except KeyError:
+                        console.print(f"  [red]\u2717[/red] Sub-agent '[bold]{focused_agent}[/bold]' not found. Switching back.")
+                        focused_agent = None
+                        sub_agent_manager.set_focused(None)
+                    except Exception as e:
+                        console.print(f"  [red]\u2717[/red] Error: {e}")
                     continue
 
                 # Handle commands
@@ -3672,6 +3707,80 @@ def main():
                         console.print(
                             f"  [green]\u2713[/green] Started fresh session [bold]{current_session}[/bold]"
                         )
+                        continue
+
+                    elif cmd == "/agents":
+                        agents = sub_agent_manager.list()
+                        if not agents:
+                            console.print("  [dim]No sub-agents running.[/dim]")
+                        else:
+                            tbl = Table(
+                                show_header=False,
+                                box=None,
+                                padding=(0, 2),
+                                pad_edge=False,
+                            )
+                            tbl.add_column(width=2)
+                            tbl.add_column("name", style="bold")
+                            tbl.add_column("status", style="dim")
+                            tbl.add_column("elapsed", justify="right", style="dim")
+                            for a in agents:
+                                stat = a["status"]
+                                
+                                marker = " "
+                                if a["name"] == focused_agent:
+                                    marker = "[yellow]\u25b6[/yellow]"
+                                elif stat == "completed":
+                                    marker = "[green]\u2713[/green]"
+                                elif stat == "running":
+                                    marker = "[cyan]\u25b6[/cyan]"
+                                elif stat == "error":
+                                    marker = "[red]\u2717[/red]"
+                                
+                                elapsed = a["elapsed_seconds"]
+                                elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+                                tbl.add_row(
+                                    marker,
+                                    a["name"],
+                                    stat,
+                                    elapsed_str,
+                                )
+                            console.print()
+                            console.print(
+                                Panel(
+                                    tbl,
+                                    title="[bold]Sub-Agents[/bold]",
+                                    border_style="yellow",
+                                    padding=(1, 2),
+                                )
+                            )
+                            console.print("  [dim]Use [white]/agent <name>[/white] to switch, [white]/agent-back[/white] to return[/dim]\n")
+                        continue
+
+                    elif cmd == "/agent":
+                        if not cmd_arg:
+                            console.print("  [dim]Usage: /agent <sub_agent_name>[/dim]")
+                            continue
+                        name = cmd_arg.strip()
+                        inst = sub_agent_manager.get(name)
+                        if not inst:
+                            console.print(f"  [yellow]\u26a0[/yellow] Sub-agent '[bold]{name}[/bold]' not found")
+                            continue
+                        # Switch focus
+                        focused_agent = name
+                        sub_agent_manager.set_focused(name)
+                        console.print(f"  [yellow]\u25b6[/yellow] Switched to sub-agent [bold]{name}[/bold]")
+                        console.print("  [dim]Type input to send to it, use /agent-back to return[/dim]\n")
+                        continue
+
+                    elif cmd == "/agent-back":
+                        if not focused_agent:
+                            console.print("  [dim]Not currently focused on a sub-agent.[/dim]")
+                            continue
+                        name = focused_agent
+                        focused_agent = None
+                        sub_agent_manager.set_focused(None)
+                        console.print(f"  [yellow]\u25b6[/yellow] Switched back to parent agent [dim](from {name})[/dim]")
                         continue
 
                     elif cmd == "/clear":

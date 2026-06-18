@@ -202,7 +202,8 @@ class ToolHandlers:
         workspace_path: str,
         context,
         duplicate_detector,
-        context_manager=None
+        context_manager=None,
+        sub_agent_manager=None,
     ):
         """Initialize tool handlers with required dependencies.
         
@@ -213,6 +214,7 @@ class ToolHandlers:
             context: ContextContainer for managing loaded content
             duplicate_detector: DuplicateDetector for tracking file reads
             context_manager: SmartContextManager for accessing stored tool results
+            sub_agent_manager: SubAgentManager for creating/managing sub-agents
         """
         self.config = config
         self.console = console
@@ -220,6 +222,7 @@ class ToolHandlers:
         self.context = context
         self._duplicate_detector = duplicate_detector
         self._context_manager = context_manager
+        self.sub_agent_manager = sub_agent_manager
         
         # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
         self._background_procs: Dict[int, dict] = {}
@@ -2168,3 +2171,80 @@ class ToolHandlers:
                  result_id, stored.tool_name, stored.tokens, age_str)
         
         return result
+
+    # ── Sub-agent tools ──────────────────────────────────────────────
+
+    async def create_agent(self, params: dict) -> str:
+        """Create a sub-agent and start it in the background."""
+        name = params.get("name", "").strip()
+        task = params.get("task", "").strip()
+        if not name or not task:
+            return "Error: Both 'name' (unique identifier) and 'task' (description) are required."
+        if not self.sub_agent_manager:
+            return "Error: Sub-agent system not initialized."
+        try:
+            self.sub_agent_manager.create(name, task)
+            self.console.print(
+                f"  [green]\u2713[/green] Created sub-agent [bold]{name}[/bold]"
+            )
+            return f"Created sub-agent '{name}'. It is running in the background. You will be notified when it completes."
+        except ValueError as e:
+            return f"Error: {e}"
+
+    async def send_agent_input(self, params: dict) -> str:
+        """Send input to a sub-agent and get its response."""
+        name = params.get("name", "").strip()
+        input_text = params.get("input", "").strip()
+        if not name or input_text is None:
+            return "Error: Both 'name' and 'input' are required."
+        if not self.sub_agent_manager:
+            return "Error: Sub-agent system not initialized."
+        try:
+            self.console.print(
+                f"  [dim]\u2192[/dim] Sending input to [bold]{name}[/bold]..."
+            )
+            result = await self.sub_agent_manager.run(name, input_text)
+            return result
+        except KeyError:
+            return f"Error: Sub-agent '{name}' not found."
+        except Exception as e:
+            return f"Error communicating with sub-agent '{name}': {e}"
+
+    async def list_agents(self, params: dict) -> str:
+        """List all sub-agents."""
+        if not self.sub_agent_manager:
+            return "Sub-agent system not available."
+        agents = self.sub_agent_manager.list()
+        if not agents:
+            return "No sub-agents running."
+        lines = ["Sub-agents:"]
+        for a in agents:
+            elapsed = a["elapsed_seconds"]
+            elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+            status_icon = {"running": "\u25b6", "completed": "\u2713", "error": "\u2717", "created": "\u25cb"}.get(a["status"], "?")
+            lines.append(f"  {status_icon} {a['name']}: {a['status']} ({elapsed_str})")
+        return "\n".join(lines)
+
+    async def pause_agent(self, params: dict) -> str:
+        """Pause a running sub-agent."""
+        name = params.get("name", "").strip()
+        if not name:
+            return "Error: 'name' is required."
+        if not self.sub_agent_manager:
+            return "Error: Sub-agent system not initialized."
+        if self.sub_agent_manager.pause(name):
+            self.console.print(f"  [yellow]\u23f8[/yellow] Paused sub-agent [bold]{name}[/bold]")
+            return f"Sub-agent '{name}' paused."
+        return f"Error: Sub-agent '{name}' not found."
+
+    async def delete_agent(self, params: dict) -> str:
+        """Delete a sub-agent completely."""
+        name = params.get("name", "").strip()
+        if not name:
+            return "Error: 'name' is required."
+        if not self.sub_agent_manager:
+            return "Error: Sub-agent system not initialized."
+        if self.sub_agent_manager.delete(name):
+            self.console.print(f"  [red]\u2717[/red] Deleted sub-agent [bold]{name}[/bold]")
+            return f"Sub-agent '{name}' deleted."
+        return f"Error: Sub-agent '{name}' not found."
