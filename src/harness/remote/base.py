@@ -58,7 +58,7 @@ class RemoteProvider(ABC):
         self._squeue: "_queue.Queue[Optional[RemoteMessage]]" = _queue.Queue()
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
-        self._poll_thread: Optional[threading.Thread] = None
+        self._poll_thr: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
@@ -76,12 +76,12 @@ class RemoteProvider(ABC):
         self._running = True
         self._loop = asyncio.get_running_loop()
         if self._thread_based:
-            self._poll_thread = threading.Thread(
+            self._poll_thr = threading.Thread(
                 target=self._thread_poll_loop,
                 daemon=True,
                 name=f"poll-{self.name}",
             )
-            self._poll_thread.start()
+            self._poll_thr.start()
         else:
             self._poll_task = asyncio.create_task(self._async_poll_loop())
         log.info("Remote provider '%s' started (thread=%s)", self.name, self._thread_based)
@@ -98,11 +98,11 @@ class RemoteProvider(ABC):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
-        if self._poll_thread:
+        if self._poll_thr:
             # Push a sentinel to unblock the thread's queue.get()
             self._squeue.put(None)
-            self._poll_thread.join(timeout=5)
-            self._poll_thread = None
+            self._poll_thr.join(timeout=5)
+            self._poll_thr = None
         log.info("Remote provider '%s' stopped", self.name)
 
     # ── Message reading ────────────────────────────────────────────────
