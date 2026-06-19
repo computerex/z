@@ -148,19 +148,40 @@ _REASON_OPEN_RE = re.compile(
 )
 _REASON_ORPHAN_RE = re.compile(r"</?think(?:ing)?>")
 
+# DeepSeek DSML tags — used by DeepSeek Flash/R1 to wrap reasoning.
+# Format: <|DSML| |attribute|> ...content... </|DSML| |attribute|>
+# where attribute can be "parameter", "condition", "reasoning", etc.
+_DSML_TAG_RE = re.compile(
+    r"</?\|?\|?\s*DSML\s*\|\s*\|\s*\w+\s*\|?\s*>",
+    re.IGNORECASE,
+)
+# Full DSML blocks (open + content + close)
+_DSML_BLOCK_RE = re.compile(
+    r"<\|?\s*\|?DSML\|\s*\|\s*\w+\s*\|?\s*>"
+    r".*?"
+    r"</\|?\s*\|?DSML\|\s*\|\s*\w+\s*\|?\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 def _strip_text_reasoning_tags(text: str) -> str:
     """Strip text-based reasoning tags from model output.
 
     Models like MIMO/Qwen emit ``<thinking>...</thinking>`` as plain text
-    content (not via the ``reasoning_content`` API field).  When the harness
-    uses native reasoning extraction, these text tags are redundant and cause
-    double-printing.  This function removes them.
+    content (not via the ``reasoning_content`` API field).  DeepSeek Flash/R1
+    emits DSML (DeepSeek Markup Language) tags of the form
+    ``<|DSML| |attribute|>...</|DSML| |attribute|>``.
+
+    When the harness uses native reasoning extraction, these text tags are
+    redundant and cause double-printing or showing internal reasoning on
+    remote providers.  This function removes them.
 
     Degenerate patterns (multiple orphaned closing tags) are also cleaned up.
     """
     text = _REASON_OPEN_RE.sub("", text)
+    text = _DSML_BLOCK_RE.sub("", text)
     text = _REASON_ORPHAN_RE.sub("", text)
+    text = _DSML_TAG_RE.sub("", text)
     return text.strip()
 
 
@@ -2102,6 +2123,19 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     _response_visible_text = _strip_text_reasoning_tags(
                         _response_visible_text
                     )
+
+                # Unconditional DSML tag strip — DeepSeek Flash/R1 outputs
+                # reasoning in DSML blocks (<|DSML| |parameter|>...</|DSML| |...|>)
+                # even when native reasoning is not active.  Strip them so the
+                # hidden-only detector below can see there's no real content.
+                if _response_visible_text.strip():
+                    _response_visible_text = _DSML_BLOCK_RE.sub(
+                        "", _response_visible_text
+                    )
+                    _response_visible_text = _DSML_TAG_RE.sub(
+                        "", _response_visible_text
+                    )
+                    _response_visible_text = _response_visible_text.strip()
 
                 # Strip XML tool tags that the model sometimes emits despite using
                 # native tool calling.  The old plugin docs taught XML format via

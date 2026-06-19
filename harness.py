@@ -5380,13 +5380,29 @@ def main():
                     current_remote_msg = None
                     # Strip thinking/reasoning tags from the result before
                     # sending to remote — the user doesn't need to see raw
-                    # <thinking> blocks that are meant for the conversation
-                    # history, not for human consumption.
+                    # <thinking> blocks or DSML tags that are meant for the
+                    # conversation history, not for human consumption.
                     _clean_result = re.sub(
                         r"<think(?:ing)>.*?</think(?:ing)>",
                         "",
                         result,
                         flags=re.DOTALL,
+                    )
+                    # Also strip DeepSeek DSML blocks: <|DSML| |param|>...</|DSML| |...|>
+                    _clean_result = re.sub(
+                        r"<\|?\s*\|?DSML\|\s*\|\s*\w+\s*\|?\s*>"
+                        r".*?"
+                        r"</\|?\s*\|?DSML\|\s*\|\s*\w+\s*\|?\s*>",
+                        "",
+                        _clean_result,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    )
+                    # Strip any remaining orphaned DSML tags
+                    _clean_result = re.sub(
+                        r"</?\|?\|?\s*DSML\s*\|\s*\|\s*\w+\s*\|?\s*>",
+                        "",
+                        _clean_result,
+                        flags=re.IGNORECASE,
                     ).strip()
                     if not _clean_result:
                         _clean_result = result  # fallback: send as-is
