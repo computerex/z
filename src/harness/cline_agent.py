@@ -299,6 +299,7 @@ class ClineAgent:
         self.max_iterations = max_iterations
         self.workspace_path = str(Path.cwd().resolve())
         self.cost_tracker = get_global_tracker()
+        self.cost_tracker.set_api_url(getattr(config, "api_url", "") or "")
 
         # Provider management
         self.providers = providers or {}
