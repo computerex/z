@@ -72,6 +72,10 @@ from .tool_registry import (
 )
 from .logger import get_logger, log_exception, truncate as log_truncate
 
+# Scheduled tasks (cron) scheduler
+from .cron_scheduler import CronScheduler, CronSchedulerOptions
+from .cron_tasks import clear_session_tasks
+
 _agent_t4 = _time_mod_agent.perf_counter()
 
 import logging as _logging_mod
@@ -348,6 +352,10 @@ class ClineAgent:
             len(self.workspace_index.files),
         )
 
+        # Scheduled tasks (cron) scheduler — created but not started
+        self._cron_scheduler: Optional[CronScheduler] = None
+        self._qued_cron_prompts: List[str] = []
+
         # Plugin system — discover and load plugins
         from .plugin_manager import PluginManager
         from .tool_registry import TOOL_NAMES, register_plugin_tools
@@ -465,7 +473,23 @@ Memory system — Persistent file-based memory at ~/.claude/projects/<slug>/memo
 
 Hooks — Configured in .claude/settings.json. Events: PreToolUse, PostToolUse, PostToolUseFailure, Stop, SessionStart, SessionEnd, UserPromptSubmit, InstructionsLoaded. Hook types: command (shell with $ARGUMENTS as JSON stdin), prompt (LLM with $ARGUMENTS placeholder), agent (verifier sub-agent), http (POST). Use "if":"ToolName(pattern)" to only fire on matching tool calls. Use "async":true for fire-and-forget, "asyncRewake":true to wake the model on error (exit code 2). Exit code 2 blocks the tool call; 0 = success; other = error shown to user.
 
-If the user asks you to set up any of these — walk them through the format and write the files."""
+If the user asks you to set up any of these — walk them through the format and write the files.
+
+====
+
+SCHEDULED TASKS (CRON)
+
+You can schedule tasks to run at future times using the CronCreate tool, which accepts a standard 5-field cron expression in local time (``M H DoM Mon DoW``). Tasks can be one-shot (``recurring: false``, fire once then auto-delete) or recurring (``recurring: true``, the default — reschedules after each fire).
+
+Recurring tasks auto-expire after 7 days to bound session lifetime. Use CronDelete to cancel a job early. Use CronList to see all pending jobs.
+
+By default tasks are **session-only** (not written to disk, die when the harness exits). Pass ``durable: true`` to persist to disk so they survive restarts. Only use durable: true when the user explicitly asks for persistence ("keep doing this every day").
+
+The on-disk file is at ``{self.workspace_path}/.claude/scheduled_tasks.json``. The JSON format is ``{"tasks": [{"id": "...", "cron": "...", "prompt": "...", "createdAt": ..., "recurring": true/false}]}``. You can read or write this file directly with read_file/write_to_file if you need to inspect or manually edit scheduled tasks, for example to add a permanent recurring task (``"permanent": true``) that never auto-expires.
+
+The scheduler adds a small jitter to spread firing times: recurring tasks fire up to 10% of their interval late (max 15 min); one-shot tasks landing on ``:00`` or ``:30`` fire up to 90 s early. Pick off-minute cron values when the user's request is approximate (e.g. ``57 8 * * *`` instead of ``0 9 * * *``) to avoid API thundering-herd.
+
+Fired task prompts are injected as user messages when the harness is idle (between turns). The model sees them and acts on them like any other user request."""
 
         return result
 
@@ -715,8 +739,62 @@ If the user asks you to set up any of these — walk them through the format and
         )
         return result
 
+    def _ensure_cron_scheduler(self) -> CronScheduler:
+        """Create and start the cron scheduler if not yet running.
+
+        Returns the scheduler instance (idempotent).
+        """
+        if self._cron_scheduler is not None:
+            return self._cron_scheduler
+
+        scheduler = CronScheduler(CronSchedulerOptions(
+            on_fire=self._on_cron_fire,
+            project_dir=self.workspace_path,
+            lock_identity=f"session:{os.getpid()}",
+        ))
+        scheduler.start()
+        self._cron_scheduler = scheduler
+        log.info("Cron scheduler started")
+        return scheduler
+
+    def _on_cron_fire(self, prompt: str) -> None:
+        """Callback invoked when a cron task fires."""
+        labeled = f"[Scheduled Task] {prompt}"
+        self._qued_cron_prompts.append(labeled)
+        log.info("Cron task fired, queued prompt (%d chars)", len(prompt))
+        # Print visible notification to user's terminal
+        self.console.print(
+            f"\n  [yellow]\u23f0 Scheduled Task fired[/yellow]"
+        )
+        self.console.print(
+            f"  [dim]{prompt[:120]}{'...' if len(prompt) > 120 else ''}[/dim]"
+        )
+        self.console.print(
+            "  [dim]Processing...[/dim]\n"
+        )
+        # Try to unblock prompt_toolkit so cron gets auto-processed.
+        # Calling app.exit('') makes prompt() return '' which then hits
+        # the empty-input cron check and routes to agent.run().
+        try:
+            from prompt_toolkit.application.current import get_app
+            app = get_app()
+            if app and app.is_running:
+                app.exit(result='')
+        except Exception:
+            pass
+
+    def has_queued_cron_prompts(self) -> bool:
+        """Check if there are pending cron task prompts to process."""
+        return bool(self._qued_cron_prompts)
+
     async def cleanup_background_procs_async(self) -> None:
         """Terminate all background processes safely (async)."""
+        # Stop the cron scheduler first
+        if self._cron_scheduler is not None:
+            self._cron_scheduler.stop()
+            self._cron_scheduler = None
+            log.info("Cron scheduler stopped")
+
         return await self.tool_handlers.cleanup_background_procs_async()
 
     def cleanup_background_procs(self) -> None:
@@ -1086,6 +1164,9 @@ If the user asks you to set up any of these — walk them through the format and
         debug_print("clear_history: after SmartContextManager")
         self._last_token_count = 0
         self._initialized = True
+        # Clear session-only cron tasks
+        clear_session_tasks()
+        self._qued_cron_prompts.clear()
         debug_print("clear_history: DONE")
 
     def get_token_count(self) -> int:
@@ -1292,6 +1373,9 @@ If the user asks you to set up any of these — walk them through the format and
             # Keep MCP/provider config changes reflected without requiring restart.
             self.refresh_system_prompt()
 
+        # Start the cron scheduler (idempotent — safe to call every turn)
+        self._ensure_cron_scheduler()
+
         # Seamless multimodal handling:
         # - Track attached images in the context container.
         # - For vision models, pass image blocks through to the API.
@@ -1461,6 +1545,16 @@ If the user asks you to set up any of these — walk them through the format and
                             StreamingMessage(role="user", content=_notif)
                         )
                         log.info("Injected completion notification for sub-agent '%s'", _completed_sa)
+
+                # Check for queued cron task firings
+                if self._qued_cron_prompts:
+                    prompts = list(self._qued_cron_prompts)
+                    self._qued_cron_prompts.clear()
+                    for p in prompts:
+                        self.messages.append(
+                            StreamingMessage(role="user", content=p)
+                        )
+                    log.info("Injected %d cron task prompt(s) into conversation", len(prompts))
 
                 # Reset only background flag (not interrupt) for this iteration
                 # User needs to explicitly continue after interrupt
@@ -2829,6 +2923,24 @@ If the user asks you to set up any of these — walk them through the format and
 
             elif tool.name == "delete_agent":
                 result = await self.tool_handlers.delete_agent(tool.parameters)
+
+            elif tool.name == "CronCreate":
+                self.console.print(
+                    f"  [dim]•[/dim] [yellow]CronCreate[/yellow]"
+                )
+                result = await self.tool_handlers.cron_create(tool.parameters)
+
+            elif tool.name == "CronDelete":
+                self.console.print(
+                    f"  [dim]•[/dim] [yellow]CronDelete[/yellow]"
+                )
+                result = await self.tool_handlers.cron_delete(tool.parameters)
+
+            elif tool.name == "CronList":
+                self.console.print(
+                    f"  [dim]•[/dim] [cyan]CronList[/cyan]"
+                )
+                result = await self.tool_handlers.cron_list(tool.parameters)
 
             else:
                 # Try plugin tools before giving up

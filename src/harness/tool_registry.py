@@ -231,6 +231,30 @@ TOOL_DEFS: List[ToolDef] = [
                               description="The final result of the task must be complete and not require further input"),
                     ToolParam("command",
                               description="A CLI command to demonstrate the result (e.g., open a browser, run a script)")]),
+
+    # --- Scheduled tasks (cron) ---
+    ToolDef("CronCreate", category="agent",
+            description="Schedule a prompt to run at a future time — either recurring on a cron "
+                        "schedule, or once at a specific time. "
+                        "Pass durable: true to persist to .claude/scheduled_tasks.json; "
+                        "otherwise session-only.",
+            params=[ToolParam("cron", required=True,
+                              description='Standard 5-field cron expression in local time: '
+                                         '"M H DoM Mon DoW" (e.g. "*/5 * * * *" = every 5 minutes)'),
+                    ToolParam("prompt", required=True,
+                              description="The prompt to enqueue at each fire time."),
+                    ToolParam("recurring",
+                              description='true (default) = fire on every cron match until deleted '
+                                         'or auto-expired. false = fire once, then auto-delete.'),
+                    ToolParam("durable",
+                              description='true = persist to .claude/scheduled_tasks.json and '
+                                         'survive restarts. false (default) = session only.')]),
+    ToolDef("CronDelete", category="agent",
+            description="Cancel a scheduled cron job by ID.",
+            params=[ToolParam("id", required=True,
+                              description="Job ID returned by CronCreate.")]),
+    ToolDef("CronList", category="agent",
+            description="List all scheduled cron jobs."),
 ]
 
 # Derived lookups (computed once at import time)

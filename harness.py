@@ -3574,37 +3574,45 @@ def main():
 
         while True:
             try:
-                # Get input (multiline with prompt_toolkit, or simple input)
-                if prompt_session:
-                    try:
-                        user_input = prompt_session.prompt(_build_prompt_text).strip()
-                    except KeyboardInterrupt:
-                        now = time.time()
-                        if now - last_interrupt_time < 2.0:
-                            raise
-                        last_interrupt_time = now
-                        console.print(
-                            "\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]"
-                        )
-                        continue
+                # ── Check for queued cron tasks before waiting for user input ──
+                if agent.has_queued_cron_prompts():
+                    user_input = "[Scheduled task processing...]"
                 else:
-                    try:
-                        _pt = _build_prompt_text()
-                        # ANSI object -> raw string for plain input()
-                        _raw = f"{agent.config.model} \u276f "
-                        user_input = input(_raw).strip()
-                    except KeyboardInterrupt:
-                        now = time.time()
-                        if now - last_interrupt_time < 2.0:
-                            raise
-                        last_interrupt_time = now
-                        console.print(
-                            "\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]"
-                        )
-                        continue
+                    # Get input (multiline with prompt_toolkit, or simple input)
+                    if prompt_session:
+                        try:
+                            user_input = prompt_session.prompt(_build_prompt_text).strip()
+                        except KeyboardInterrupt:
+                            now = time.time()
+                            if now - last_interrupt_time < 2.0:
+                                raise
+                            last_interrupt_time = now
+                            console.print(
+                                "\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]"
+                            )
+                            continue
+                    else:
+                        try:
+                            _pt = _build_prompt_text()
+                            # ANSI object -> raw string for plain input()
+                            _raw = f"{agent.config.model} \u276f "
+                            user_input = input(_raw).strip()
+                        except KeyboardInterrupt:
+                            now = time.time()
+                            if now - last_interrupt_time < 2.0:
+                                raise
+                            last_interrupt_time = now
+                            console.print(
+                                "\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]"
+                            )
+                            continue
 
                 if not user_input:
-                    continue
+                    # Check if cron tasks fired while at prompt
+                    if agent.has_queued_cron_prompts():
+                        user_input = "[Scheduled task processing...]"
+                    else:
+                        continue
 
                 # Handle shell commands with ! prefix
                 if user_input.startswith("!"):

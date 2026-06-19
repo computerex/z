@@ -11,13 +11,16 @@ import signal
 import time
 import difflib
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from rich.console import Console
 import psutil
 
 from .context_management import truncate_file_content, truncate_output
 from .logger import get_logger, log_exception, truncate as log_truncate
 from .streaming_client import desanitize_think_tokens
+
+# Scheduled tasks tool handlers
+from .cron_tool_handlers import cron_create, cron_delete, cron_list
 
 try:
     from mcp import ClientSession, StdioServerParameters  # type: ignore
@@ -2171,6 +2174,20 @@ class ToolHandlers:
                  result_id, stored.tool_name, stored.tokens, age_str)
         
         return result
+
+    # ── Scheduled tasks (cron) tools ───────────────────────────────────
+
+    async def cron_create(self, params: Dict[str, str]) -> str:
+        """Schedule a cron task (delegates to cron_tool_handlers)."""
+        return await cron_create(self, params)
+
+    async def cron_delete(self, params: Dict[str, str]) -> str:
+        """Cancel a cron task (delegates to cron_tool_handlers)."""
+        return await cron_delete(self, params)
+
+    async def cron_list(self, params: Optional[Dict[str, str]] = None) -> str:
+        """List cron tasks (delegates to cron_tool_handlers)."""
+        return await cron_list(self, params)
 
     # ── Sub-agent tools ──────────────────────────────────────────────
 
