@@ -164,6 +164,42 @@ _DSML_BLOCK_RE = re.compile(
 )
 
 
+def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
+    """Check if text contains XML tool call patterns but no native tool call was made.
+
+    Detects patterns like:
+    - ``<invoke name="tool_name">...</invoke>``
+    - ``<tool_name><parameter ...>...</tool_name>``
+    - ``<parameter name="...">...</parameter>`` (tool parameter tags)
+    - Orphaned ``</parameter>`` or ``</invoke>`` closing tags
+
+    Returns True if any tool-related XML pattern is found.
+    """
+    # Pattern 1: <invoke name="tool_name">
+    if re.search(r'<invoke\s+name=["\'](\w+)["\']', text):
+        return True
+
+    # Pattern 2: <tool_name>...</tool_name> with <parameter> inside
+    param_before = r'<parameter\s+name=["\'](\w+)["\']'
+    for tool_name in tool_names:
+        pat = re.compile(
+            rf'<{re.escape(tool_name)}\b[^>]*>.*?{param_before}.*?</{re.escape(tool_name)}>',
+            re.DOTALL,
+        )
+        if pat.search(text):
+            return True
+
+    # Pattern 3: <parameter name="X">...</parameter> (tool param tags, even orphaned)
+    if re.search(param_before, text):
+        return True
+
+    # Pattern 4: orphaned </parameter> or </invoke> closing tags
+    if re.search(r'</(?:parameter|invoke)\b[^>]*>', text):
+        return True
+
+    return False
+
+
 def _strip_text_reasoning_tags(text: str) -> str:
     """Strip text-based reasoning tags from model output.
 
@@ -1524,6 +1560,8 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
             _hidden_only_retry_max = 2
             _empty_nudge_count = 0
             _EMPTY_NUDGE_MAX = 3  # max consecutive empty-response nudges
+            _xml_tool_nudge_count = 0
+            _XML_TOOL_NUDGE_MAX = 2  # max consecutive XML-tool-text nudges
             for iteration in range(self.max_iterations):
                 log.info("[WATCHDOG] Starting iteration %d", iteration + 1)
 
@@ -2147,17 +2185,32 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 # native tool calling.  The old plugin docs taught XML format via
                 # <tagname>...</tagname> usage examples in the system prompt; this
                 # is defense-in-depth until that history fully flushes out.
+                #
+                # ALSO detect when native tool_calls failed but the model wrote
+                # XML tool calls as text — this indicates an upstream marshalling
+                # failure.  In that case, nudge the model to retry instead of
+                # silently stripping the tags and returning garbled text.
+                _detected_xml_tool_text = False
                 if _response_visible_text.strip():
+                    _tool_names_list = get_tool_names(model=self.config.model)
                     _tool_names_pattern = "|".join(
-                        re.escape(n) for n in get_tool_names(model=self.config.model)
+                        re.escape(n) for n in _tool_names_list
                     )
+                    # Check for XML tool text if native tool_calls are missing
+                    if not response.tool_calls:
+                        _detected_xml_tool_text = _text_has_xml_tool_patterns(
+                            _response_visible_text, _tool_names_list
+                        )
+                    # Strip tool tags from display text only
                     _response_visible_text = re.sub(
                         rf"</?(?:{_tool_names_pattern})\b[^>]*>",
                         "",
                         _response_visible_text,
                     ).strip()
-                    # Also strip from full_content so history stays clean
-                    full_content = _response_visible_text
+                    # Only update full_content if we DIDN'T detect XML tool text —
+                    # otherwise preserve the original so the model sees it on retry.
+                    if not _detected_xml_tool_text:
+                        full_content = _response_visible_text
 
                 # Wrap reasoning into full_content so the pipeline can see it.
                 # Only when native reasoning was used — for text-based models
@@ -2442,6 +2495,41 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     )
 
                 if not tool_call:
+                    # ── XML tool text nudge ──
+                    # Model wrote XML tool calls as text but native tool_calls
+                    # were empty (upstream marshalling failure).  Nudge it to
+                    # retry rather than displaying garbled XML.
+                    if _detected_xml_tool_text and _xml_tool_nudge_count < _XML_TOOL_NUDGE_MAX:
+                        _xml_tool_nudge_count += 1
+                        log.warning(
+                            "XML tool text detected in response (nudge %d/%d) — nudging for native tool call",
+                            _xml_tool_nudge_count,
+                            _XML_TOOL_NUDGE_MAX,
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(
+                                    response, "provider_content_blocks", None
+                                ),
+                            )
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="user",
+                                content=(
+                                    "Your previous response contained XML-formatted tool calls as plain text "
+                                    "but the native tool call API did not return them. "
+                                    "Please retry your tool call using the proper native tool calling format."
+                                ),
+                            )
+                        )
+                        self.console.print(
+                            "  [dim]→ XML tool text detected in output. Nudging for native tool call...[/dim]"
+                        )
+                        continue
+
                     # Display the VISIBLE model text only — never the <thinking>
                     # wrapper that was spliced into full_content for the internal
                     # pipeline/history. Rich's Markdown treats <thinking> as an
