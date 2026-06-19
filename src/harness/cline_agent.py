@@ -776,13 +776,6 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         print()  # newline after stream
         api_elapsed = time.time() - api_t0
 
-        # Strip XML tool tags that the thinking model sometimes emits
-        # despite being told not to (it pattern-matches from conversation history).
-        _tool_names_pattern = "|".join(re.escape(n) for n in get_tool_names(model=self.config.model))
-        full_thinking = re.sub(
-            rf"</?(?:{_tool_names_pattern})\b[^>]*>", "", full_thinking
-        ).strip()
-
         word_count = len(full_thinking.split())
         log.info(
             "Introspect complete: %d words, %d chars, %.1fs",
@@ -2181,36 +2174,15 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     # Also strip from full_content so the returned result is clean
                     full_content = _response_visible_text
 
-                # Strip XML tool tags that the model sometimes emits despite using
-                # native tool calling.  The old plugin docs taught XML format via
-                # <tagname>...</tagname> usage examples in the system prompt; this
-                # is defense-in-depth until that history fully flushes out.
-                #
-                # ALSO detect when native tool_calls failed but the model wrote
+                # Detect when native tool_calls failed but the model wrote
                 # XML tool calls as text — this indicates an upstream marshalling
-                # failure.  In that case, nudge the model to retry instead of
-                # silently stripping the tags and returning garbled text.
+                # failure.  Nudge the model to retry in that case.
                 _detected_xml_tool_text = False
-                if _response_visible_text.strip():
+                if not response.tool_calls and _response_visible_text.strip():
                     _tool_names_list = get_tool_names(model=self.config.model)
-                    _tool_names_pattern = "|".join(
-                        re.escape(n) for n in _tool_names_list
+                    _detected_xml_tool_text = _text_has_xml_tool_patterns(
+                        _response_visible_text, _tool_names_list
                     )
-                    # Check for XML tool text if native tool_calls are missing
-                    if not response.tool_calls:
-                        _detected_xml_tool_text = _text_has_xml_tool_patterns(
-                            _response_visible_text, _tool_names_list
-                        )
-                    # Strip tool tags from display text only
-                    _response_visible_text = re.sub(
-                        rf"</?(?:{_tool_names_pattern})\b[^>]*>",
-                        "",
-                        _response_visible_text,
-                    ).strip()
-                    # Only update full_content if we DIDN'T detect XML tool text —
-                    # otherwise preserve the original so the model sees it on retry.
-                    if not _detected_xml_tool_text:
-                        full_content = _response_visible_text
 
                 # Wrap reasoning into full_content so the pipeline can see it.
                 # Only when native reasoning was used — for text-based models
