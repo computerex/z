@@ -3182,9 +3182,14 @@ def main():
         help="Telegram bot token for remote input mode (get from @BotFather)",
     )
     parser.add_argument(
+        "--telegram-username",
+        default="",
+        help="Restrict bot to this Telegram username only (e.g. computerex_1992)",
+    )
+    parser.add_argument(
         "--telegram-allow-list",
         default="",
-        help="Comma-separated list of allowed Telegram chat IDs (optional)",
+        help="Comma-separated list of allowed Telegram chat IDs (optional, less common)",
     )
     args = parser.parse_args()
 
@@ -3422,6 +3427,7 @@ def main():
             remote_manager = RemoteInputManager()
             tg_config = {
                 "token": args.telegram,
+                "allowed_username": args.telegram_username,
                 "allowed_chat_ids": args.telegram_allow_list,
             }
             tg_provider = TelegramProvider(tg_config)
@@ -3606,14 +3612,9 @@ def main():
             msg = pending[0]
             # Check authorization
             prov = remote_manager.get_provider(msg.provider)
-            if prov and hasattr(prov, 'is_chat_allowed') and not prov.is_chat_allowed(msg.chat_id):
-                loop.run_until_complete(
-                    remote_manager.send_message(
-                        msg.provider, msg.chat_id,
-                        "⛔ *Unauthorized*\n\nYou are not authorized to use this bot.\n"
-                        "Contact the administrator to get access."
-                    )
-                )
+            sender_username = msg.raw.get("from", {}).get("username", "") if msg.raw else ""
+            if prov and hasattr(prov, 'is_chat_allowed') and not prov.is_chat_allowed(msg.chat_id, username=sender_username):
+                log.debug("Rejected message from chat %s (username: @%s)", msg.chat_id, sender_username)
                 return None
             current_remote_msg = msg
             if msg.sender_id != msg.chat_id:

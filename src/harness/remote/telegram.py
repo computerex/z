@@ -82,6 +82,7 @@ class TelegramProvider(RemoteProvider):
         super().__init__(config, thread_based=True)
         self._token: str = config["token"]
         self._allowed_chat_ids: set[str] = set()
+        self._allowed_username: Optional[str] = None
         self._http_sync: httpx.Client | None = None
 
         # Parse allowed users from config
@@ -91,6 +92,11 @@ class TelegramProvider(RemoteProvider):
                 cid = cid.strip()
                 if cid:
                     self._allowed_chat_ids.add(cid)
+
+        # Parse allowed Telegram username (e.g. "computerex_1992")
+        raw_username = config.get("allowed_username", "")
+        if raw_username:
+            self._allowed_username = raw_username.lstrip("@").strip()
 
         # Track last processed update_id to avoid duplicates
         self._last_update_id: int = 0
@@ -151,6 +157,28 @@ class TelegramProvider(RemoteProvider):
                     continue
 
                 sender_id = str(msg.get("from", {}).get("id", chat_id))
+
+                # ── Username-based access control ──────────────────────
+                if self._allowed_username:
+                    sender_username = msg.get("from", {}).get("username", "")
+                    if sender_username and sender_username.startswith("@"):
+                        sender_username = sender_username[1:]
+                    if sender_username.lower() != self._allowed_username.lower():
+                        # Silently drop messages from other users
+                        log.debug(
+                            "Ignoring message from @%s (allowed: @%s)",
+                            sender_username or "?",
+                            self._allowed_username,
+                        )
+                        continue
+
+                # ── Chat-ID-based access control (fallback) ────────────
+                if self._allowed_chat_ids and chat_id not in self._allowed_chat_ids:
+                    log.debug(
+                        "Ignoring message from chat %s (not in allow list)",
+                        chat_id,
+                    )
+                    continue
 
                 yield RemoteMessage(
                     provider="telegram",
@@ -222,23 +250,28 @@ class TelegramProvider(RemoteProvider):
             bot_name,
             bot_username,
         )
-        # If no allowed_chat_ids configured, print a warning
-        if not self._allowed_chat_ids:
+        # Warn if neither username nor chat-ID filter is configured
+        if not self._allowed_username and not self._allowed_chat_ids:
             log.warning(
-                "No allowed_chat_ids configured! Any user who finds your bot "
+                "No access restrictions configured! Any user who finds your bot "
                 "can interact with it. "
-                "Set TELEGRAM_ALLOWED_CHAT_IDS env var or pass via "
-                "--telegram-allow-list."
+                "Use --telegram-username <your_username> to restrict by username."
             )
         await super().start()
 
     # ── Authorization ─────────────────────────────────────────────────
 
-    def is_chat_allowed(self, chat_id: str) -> bool:
-        """Check if a chat is authorized to interact with the bot."""
-        if not self._allowed_chat_ids:
-            return True  # No restrictions
-        return chat_id in self._allowed_chat_ids
+    def is_chat_allowed(self, chat_id: str, username: Optional[str] = None) -> bool:
+        """Check if a user/chat is authorized to interact with the bot."""
+        if self._allowed_username:
+            if username:
+                clean = username.lstrip("@")
+                if clean.lower() == self._allowed_username.lower():
+                    return True
+            return False
+        if self._allowed_chat_ids:
+            return chat_id in self._allowed_chat_ids
+        return True  # No restrictions
 
     def authorize_chat(self, chat_id: str) -> None:
         """Add a chat to the allowed list (after manual approval)."""
