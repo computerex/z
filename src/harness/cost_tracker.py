@@ -18,6 +18,8 @@ DEFAULT_PRICING = {
     "MiniMax-M2.1": {"input": 0.14, "output": 0.56},
     "MiniMax-Text-01": {"input": 0.10, "output": 0.40},
     "abab6.5s-chat": {"input": 0.01, "output": 0.01},
+    # DeepSeek models (matched via partial key so "deepseek/deepseek-v4-flash" hits this)
+    "deepseek": {"input": 0.07, "output": 0.28},
     # Default fallback
     "default": {"input": 0.50, "output": 1.50},
 }
