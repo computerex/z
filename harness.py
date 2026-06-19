@@ -5378,15 +5378,27 @@ def main():
                 if current_remote_msg is not None and result is not None:
                     _rm = current_remote_msg
                     current_remote_msg = None
+                    # Strip thinking/reasoning tags from the result before
+                    # sending to remote — the user doesn't need to see raw
+                    # <thinking> blocks that are meant for the conversation
+                    # history, not for human consumption.
+                    _clean_result = re.sub(
+                        r"<think(?:ing)>.*?</think(?:ing)>",
+                        "",
+                        result,
+                        flags=re.DOTALL,
+                    ).strip()
+                    if not _clean_result:
+                        _clean_result = result  # fallback: send as-is
                     try:
                         loop.run_until_complete(
                             remote_manager.send_message(
-                                _rm.provider, _rm.chat_id, result
+                                _rm.provider, _rm.chat_id, _clean_result
                             )
                         )
                         log.info(
-                            "Sent response to %s chat %s (%d chars)",
-                            _rm.provider, _rm.chat_id, len(result),
+                            "Sent response to %s chat %s (%d chars, stripped from %d)",
+                            _rm.provider, _rm.chat_id, len(_clean_result), len(result),
                         )
                     except Exception as _e:
                         log.error("Failed to send response to %s: %s", _rm.provider, _e)
