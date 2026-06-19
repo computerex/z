@@ -2373,6 +2373,14 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             print(result_text)
                         if command:
                             self.console.print(f"\n  [dim]$ {command}[/dim]")
+                        # Include result_text in the return value so remote providers
+                        # (Telegram) receive the actual narrative, not just the
+                        # streamed content (which may be empty or contain only
+                        # internal reasoning when the model uses attempt_completion).
+                        if full_content:
+                            full_content += "\n\n" + result_text
+                        else:
+                            full_content = result_text
                     return full_content
 
                 # Debug output - save full content for analysis
