@@ -3738,6 +3738,24 @@ def main():
                     if prompt_session:
                         try:
                             user_input = prompt_session.prompt(_build_prompt_text, pre_run=_capture_pt_app).strip()
+                            # Check for sub-agent completed while user was typing
+                            if sub_agent_manager and (
+                                _cs := sub_agent_manager.check_completed()
+                            ):
+                                user_input = (
+                                    f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
+                                    f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
+                                    f"or list_agents(name='{_cs}') to see a summary.]"
+                                )
+                                console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
+                                if _last_remote_chat is not None:
+                                    from src.harness.remote.base import RemoteMessage as _RM
+                                    current_remote_msg = _RM(
+                                        provider=_last_remote_chat[0],
+                                        chat_id=_last_remote_chat[1],
+                                        text=user_input,
+                                        sender_id=_last_remote_chat[1],
+                                    )
                         except KeyboardInterrupt:
                             now = time.time()
                             if now - last_interrupt_time < 2.0:
@@ -3753,6 +3771,24 @@ def main():
                             # ANSI object -> raw string for plain input()
                             _raw = f"{agent.config.model} \u276f "
                             user_input = input(_raw).strip()
+                            # Check for sub-agent completed while user was typing
+                            if sub_agent_manager and (
+                                _cs := sub_agent_manager.check_completed()
+                            ):
+                                user_input = (
+                                    f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
+                                    f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
+                                    f"or list_agents(name='{_cs}') to see a summary.]"
+                                )
+                                console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
+                                if _last_remote_chat is not None:
+                                    from src.harness.remote.base import RemoteMessage as _RM
+                                    current_remote_msg = _RM(
+                                        provider=_last_remote_chat[0],
+                                        chat_id=_last_remote_chat[1],
+                                        text=user_input,
+                                        sender_id=_last_remote_chat[1],
+                                    )
                         except KeyboardInterrupt:
                             now = time.time()
                             if now - last_interrupt_time < 2.0:
