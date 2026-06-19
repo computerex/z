@@ -3597,6 +3597,25 @@ def main():
             else None
         )
 
+        # Capture a reference to the prompt_toolkit Application so the
+        # background polling thread can wake prompt_toolkit from outside
+        # the event loop (get_app() uses thread-local storage).
+        _pt_app_captured = [False]  # mutable nonlocal singleton
+        if remote_manager and remote_manager.has_providers():
+            from src.harness.remote.base import set_pt_app
+
+            def _capture_pt_app():
+                if not _pt_app_captured[0]:
+                    _pt_app_captured[0] = True
+                    try:
+                        from prompt_toolkit.application.current import get_app
+                        set_pt_app(get_app())
+                    except Exception:
+                        pass
+        else:
+            def _capture_pt_app():
+                pass  # no remote providers — nothing to capture
+
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         focused_agent: Optional[str] = None  # Name of sub-agent currently focused
         current_remote_msg: Optional["RemoteMessage"] = None
@@ -3668,7 +3687,7 @@ def main():
                     # Get input (multiline with prompt_toolkit, or simple input)
                     if prompt_session:
                         try:
-                            user_input = prompt_session.prompt(_build_prompt_text).strip()
+                            user_input = prompt_session.prompt(_build_prompt_text, pre_run=_capture_pt_app).strip()
                         except KeyboardInterrupt:
                             now = time.time()
                             if now - last_interrupt_time < 2.0:

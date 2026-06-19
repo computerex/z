@@ -7,8 +7,8 @@ Two polling models are supported:
    Suitable when the REPL loop is also asyncio-based.
 
 2. **Thread polling**: override `_poll_thread()` as a synchronous
-   generator.  The base class runs it in a daemon thread and bridges
-   messages into an asyncio.Queue via `loop.call_soon_threadsafe`.
+   generator.  The base class runs it in a daemon thread and stores
+   messages in a thread-safe deque.
    This is REQUIRED when the REPL loop blocks on prompt_toolkit
    (because prompt blocks the main thread and no asyncio task can run).
 
@@ -16,14 +16,32 @@ Set ``thread_based=True`` in __init__ to use thread polling.
 """
 
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 import asyncio
 import logging
-import queue as _queue
 import threading
 
 log = logging.getLogger(__name__)
+
+# ── Cross-thread prompt_toolkit Application reference ───────────────
+#
+# The main thread captures the Application object and stores it here so
+# the background polling thread can call app.exit('') to unblock the
+# prompt without needing get_app() (which uses thread-local storage).
+
+_pt_app: Optional["Application"] = None  # type: ignore[name-defined]
+
+
+def set_pt_app(app: Optional["Application"]) -> None:  # type: ignore[name-defined]
+    """Store a reference to the running prompt_toolkit Application.
+
+    Called from the main thread after the first ``prompt()`` call so
+    the background polling thread can wake prompt_toolkit.
+    """
+    global _pt_app
+    _pt_app = app
 
 
 @dataclass
@@ -54,12 +72,16 @@ class RemoteProvider(ABC):
     def __init__(self, config: dict, *, thread_based: bool = False):
         self.config = config
         self._thread_based = thread_based
-        self._aq: "asyncio.Queue[RemoteMessage]" = asyncio.Queue()
-        self._squeue: "_queue.Queue[Optional[RemoteMessage]]" = _queue.Queue()
+
+        # Thread-safe message buffer: the polling thread (or async loop)
+        # appends messages here; next_message() pops them.
+        self._buf: deque[RemoteMessage] = deque()
+        self._buf_lock: threading.Lock = threading.Lock()
+
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._poll_thr: Optional[threading.Thread] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stop_event: threading.Event = threading.Event()
 
     @property
     @abstractmethod
@@ -74,7 +96,7 @@ class RemoteProvider(ABC):
         if self._running:
             return
         self._running = True
-        self._loop = asyncio.get_running_loop()
+        self._stop_event.clear()
         if self._thread_based:
             self._poll_thr = threading.Thread(
                 target=self._thread_poll_loop,
@@ -91,6 +113,7 @@ class RemoteProvider(ABC):
         if not self._running:
             return
         self._running = False
+        self._stop_event.set()  # unblock thread if sleeping
         if self._poll_task:
             self._poll_task.cancel()
             try:
@@ -99,8 +122,6 @@ class RemoteProvider(ABC):
                 pass
             self._poll_task = None
         if self._poll_thr:
-            # Push a sentinel to unblock the thread's queue.get()
-            self._squeue.put(None)
             self._poll_thr.join(timeout=5)
             self._poll_thr = None
         log.info("Remote provider '%s' stopped", self.name)
@@ -109,10 +130,15 @@ class RemoteProvider(ABC):
 
     async def next_message(self) -> Optional[RemoteMessage]:
         """Get the next queued message, or None if empty."""
-        try:
-            return await asyncio.wait_for(self._aq.get(), timeout=0.1)
-        except asyncio.TimeoutError:
+        with self._buf_lock:
+            if self._buf:
+                return self._buf.popleft()
             return None
+
+    def _enqueue_message(self, msg: RemoteMessage) -> None:
+        """Thread-safe append to the message buffer."""
+        with self._buf_lock:
+            self._buf.append(msg)
 
     # ── Poll loops ─────────────────────────────────────────────────────
 
@@ -121,7 +147,7 @@ class RemoteProvider(ABC):
         while self._running:
             try:
                 async for msg in self._poll():
-                    await self._aq.put(msg)
+                    self._enqueue_message(msg)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -131,39 +157,43 @@ class RemoteProvider(ABC):
     def _thread_poll_loop(self):
         """Continuously poll for new messages in a daemon thread.
 
-        Bridges messages into the asyncio queue via
-        ``loop.call_soon_threadsafe``.
+        Messages are stored directly into a thread-safe deque (no asyncio
+        bridging needed). prompt_toolkit is woken via the stored
+        Application reference instead of ``get_app()`` (which uses
+        thread-local storage and doesn't work from background threads).
         """
         while self._running:
             try:
                 for msg in self._poll_thread():
                     if msg is None:
                         return  # sentinel
-                    # Bridge from thread → asyncio queue.
-                    # loop.call_soon_threadsafe works even when the loop is
-                    # not actively running — it queues the callback and wakes
-                    # the event loop's internal pipe; the callback will be
-                    # processed during the next loop.run_until_complete() call.
-                    self._loop.call_soon_threadsafe(self._aq.put_nowait, msg)
-                    # Wake prompt_toolkit on the MAIN thread so that
-                    # get_app() can find the running Application
-                    # (Application is stored in thread-local storage).
-                    self._loop.call_soon_threadsafe(self._wake_prompt_toolkit)
+                    # Thread-safe: store directly into deque
+                    self._enqueue_message(msg)
+                    # Wake prompt_toolkit from here (direct call, not
+                    # call_soon_threadsafe — the event loop may not be
+                    # running when the REPL is blocked on prompt()).
+                    self._wake_prompt_toolkit()
             except Exception:
                 log.exception("Thread poll error in provider '%s'", self.name)
-                import time
-                time.sleep(5)
+                # Wait with interruptible sleep so stop() is responsive
+                if self._stop_event.wait(timeout=5):
+                    break
 
     @staticmethod
     def _wake_prompt_toolkit():
-        """Unblock prompt_toolkit if it is currently waiting for input."""
-        try:
-            from prompt_toolkit.application.current import get_app
-            app = get_app()
-            if app and app.is_running:
-                app.exit(result='')
-        except Exception:
-            pass
+        """Unblock prompt_toolkit if it is currently waiting for input.
+
+        Uses the module-level ``_pt_app`` reference set by the main thread
+        rather than ``get_app()``, because ``get_app()`` uses thread-local
+        storage and cannot find the Application from a background thread.
+        """
+        global _pt_app
+        if _pt_app is not None:
+            try:
+                if hasattr(_pt_app, 'is_running') and _pt_app.is_running:
+                    _pt_app.exit(result='')
+            except Exception:
+                pass
 
     # ── Subclass hooks ─────────────────────────────────────────────────
 
