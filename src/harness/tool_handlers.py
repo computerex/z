@@ -2242,7 +2242,7 @@ class ToolHandlers:
             return f"Error communicating with sub-agent '{name}': {e}"
 
     async def list_agents(self, params: dict) -> str:
-        """List all sub-agents."""
+        """List all sub-agents with current output."""
         if not self.sub_agent_manager:
             return "Sub-agent system not available."
         agents = self.sub_agent_manager.list()
@@ -2254,6 +2254,19 @@ class ToolHandlers:
             elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
             status_icon = {"running": "\u25b6", "completed": "\u2713", "error": "\u2717", "created": "\u25cb"}.get(a["status"], "?")
             lines.append(f"  {status_icon} {a['name']}: {a['status']} ({elapsed_str})")
+            # Include output snippet if available
+            output_snippet = a.get("output", "")
+            if output_snippet:
+                if a["status"] == "completed":
+                    # Full output for completed agents — parent needs the result
+                    display = output_snippet.replace("\n", "\n    ")
+                    lines.append(f"    Output:\n    {display}")
+                else:
+                    # Truncated snippet for running agents
+                    display = output_snippet[:600].replace("\n", "\n    ")
+                    if len(output_snippet) > 600:
+                        display += "\n    [...]"
+                    lines.append(f"    Output:\n    {display}")
         return "\n".join(lines)
 
     async def pause_agent(self, params: dict) -> str:

@@ -228,13 +228,13 @@ class SubAgentManager:
             # Truncate to a manageable snippet
             output_snippet = ""
             if output_text:
-                # For running agents: show the last N chars (most recent activity)
-                # For completed agents: show the first N chars (summary/result)
                 _MAX_SNIPPET = 500
-                if inst.status == "running" and len(output_text) > _MAX_SNIPPET:
-                    output_snippet = "[...] " + output_text[-_MAX_SNIPPET:]
+                # For running agents: show the last N chars (most recent activity)
+                # For completed agents: show the full output (final result)
+                if inst.status == "completed":
+                    output_snippet = output_text
                 elif len(output_text) > _MAX_SNIPPET:
-                    output_snippet = output_text[:_MAX_SNIPPET] + " [...]"
+                    output_snippet = "[...] " + output_text[-_MAX_SNIPPET:]
                 else:
                     output_snippet = output_text
 

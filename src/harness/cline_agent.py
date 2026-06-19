@@ -1560,7 +1560,8 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     if _completed_sa:
                         _notif = (
                             f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
-                            f"Use send_agent_input(name='{_completed_sa}') to retrieve its output.]"
+                            f"Use send_agent_input(name='{_completed_sa}', input='') to retrieve its full output, "
+                            f"or list_agents() to see a summary.]"
                         )
                         self.messages.append(
                             StreamingMessage(role="user", content=_notif)
