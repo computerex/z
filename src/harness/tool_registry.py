@@ -223,6 +223,13 @@ TOOL_DEFS: List[ToolDef] = [
             description="Delete a sub-agent completely. Cancels any running task and removes it.",
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent to delete")]),
+    ToolDef("get_agent_output", category="agent",
+            description="Retrieve a completed sub-agent's full output without sending new input. "
+                        "Returns the cached TeeWriter buffer (all stdout) from the sub-agent's run. "
+                        "Does NOT start a new turn — unlike send_agent_input which sends input and "
+                        "waits for a response, this tool simply fetches the already-produced output.",
+            params=[ToolParam("name", required=True,
+                              description="The name of the sub-agent to retrieve output from")]),
     ToolDef("attempt_completion", category="agent",
             description="Signal that the task is complete and present the result to the user. "
                         "Use ONLY after confirming all previous tool uses succeeded. "

@@ -2281,7 +2281,30 @@ class ToolHandlers:
             return f"Sub-agent '{name}' paused."
         return f"Error: Sub-agent '{name}' not found."
 
-    async def delete_agent(self, params: dict) -> str:
+    async def get_agent_output(self, params: dict) -> str:
+        """Retrieve a completed sub-agent's full output without sending new input."""
+        name = params.get("name", "").strip()
+        if not name:
+            return "Error: 'name' is required."
+        if not self.sub_agent_manager:
+            return "Error: Sub-agent system not initialized."
+        try:
+            inst = self.sub_agent_manager.get(name)
+            if not inst:
+                return f"Error: Sub-agent '{name}' not found."
+            if inst.status != "completed":
+                return f"Sub-agent '{name}' is still {inst.status}. Use list_agents() to check its progress, then try again when it completes."
+            # Return the full cached output
+            output_text = inst.output or ""
+            if not output_text and inst.tee:
+                output_text = inst.tee.getvalue() or ""
+            if not output_text:
+                return f"Sub-agent '{name}' completed but produced no output."
+            return output_text
+        except Exception as e:
+            return f"Error retrieving output from '{name}': {e}"
+
+    async def list_agents(self, params: dict) -> str:
         """Delete a sub-agent completely."""
         name = params.get("name", "").strip()
         if not name:

@@ -1560,8 +1560,9 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     if _completed_sa:
                         _notif = (
                             f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
-                            f"Use send_agent_input(name='{_completed_sa}', input='') to retrieve its full output, "
-                            f"or list_agents() to see a summary.]"
+                            f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
+                            f"or list_agents() to see a summary. "
+                            f"Use send_agent_input(name='{_completed_sa}', input='...') to start a new turn.]"
                         )
                         self.messages.append(
                             StreamingMessage(role="user", content=_notif)
@@ -2968,10 +2969,14 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
             elif tool.name == "delete_agent":
                 result = await self.tool_handlers.delete_agent(tool.parameters)
-
-            elif tool.name == "CronCreate":
                 self.console.print(
-                    f"  [dim]•[/dim] [yellow]CronCreate[/yellow]"
+                    f"  [dim]\u2022[/dim] [red]Delete agent[/red] [dim]{tool.parameters.get('name', '')}[/dim]"
+                )
+
+            elif tool.name == "get_agent_output":
+                result = await self.tool_handlers.get_agent_output(tool.parameters)
+                self.console.print(
+                    f"  [dim]\u2022[/dim] [cyan]Get agent output[/cyan] [dim]{tool.parameters.get('name', '')}[/dim]"
                 )
                 result = await self.tool_handlers.cron_create(tool.parameters)
 
