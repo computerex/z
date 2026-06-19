@@ -513,7 +513,15 @@ class ToolHandlers:
             except Exception:
                 # Reset broken sessions so next call recreates cleanly.
                 await self._close_mcp_session(name)
-                raise
+                # Retry exactly once — the session may have been a zombie
+                # whose background sse_reader crashed (e.g. server closed the
+                # SSE connection).  Recreating it transparently recovers.
+                try:
+                    session = await self._get_or_create_mcp_session(name, cfg)
+                    return await asyncio.wait_for(fn(session), timeout=45)
+                except Exception:
+                    await self._close_mcp_session(name)
+                    raise
 
     async def mcp_list_tools(self, params: Dict[str, str]) -> str:
         name = (params.get("server") or "").strip()
