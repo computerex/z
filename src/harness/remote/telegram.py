@@ -12,6 +12,7 @@ When a new message arrives, the polling thread:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -24,6 +25,69 @@ log = logging.getLogger(__name__)
 
 _TELEGRAM_API = "https://api.telegram.org/bot"
 _MAX_MESSAGE_LEN = 4096  # Telegram's max message length
+
+
+def _md_to_html(text: str) -> str:
+    """Convert common Markdown patterns to Telegram-compatible HTML.
+
+    Handles: bold, italic, inline code, fenced code blocks, links,
+    headers, and horizontal rules.  All text is HTML-escaped first
+    so that raw ``<``, ``>``, ``&`` in the input don't break Telegram's
+    HTML parser.
+    """
+    # ── Step 0: Normalise line endings ────────────────────────────────
+    text = text.replace("\r\n", "\n")
+
+    # ── Step 1: HTML-escape the raw text ──────────────────────────────
+    # Must be done BEFORE adding HTML tags so < > & don't break the output.
+    import html as _html
+
+    text = _html.escape(text)
+
+    # ── Step 2: Markdown → HTML conversion ────────────────────────────
+    # Order matters: code blocks before inline code, bold before italic.
+
+    # Fenced code blocks with optional language: ```lang\n...\n```
+    text = re.sub(
+        r"```(\w*)\s*\n(.*?)\n```",
+        lambda m: f"<pre>{m.group(1) + ' ' if m.group(1) else ''}{m.group(2)}</pre>",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Inline code: `code` (must be after fenced blocks)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+
+    # Bold: **text**
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+    # Italic: *text* (single asterisk, not bold's double)
+    text = re.sub(
+        r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
+        r"<i>\1</i>",
+        text,
+    )
+
+    # Links: [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Headers: # ## ### ####
+    text = re.sub(
+        r"^(#{1,6})\s+(.+?)$",
+        lambda m: f"<b>{m.group(2)}</b>",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # Horizontal rules: --- *** ___
+    text = re.sub(
+        r"^[-*_]{3,}\s*$",
+        "────────────────────",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    return text
 
 
 def _split_long_message(text: str, max_len: int = _MAX_MESSAGE_LEN) -> list[str]:
@@ -192,9 +256,15 @@ class TelegramProvider(RemoteProvider):
     # ── Sending messages (called from asyncio side) ────────────────────
 
     async def send_message(self, chat_id: str, text: str) -> None:
-        """Send a text message to the given chat."""
-        for part in _split_long_message(text):
-            self._sync_api("sendMessage", chat_id=chat_id, text=part)
+        """Send a text message to the given chat with Markdown rendered as HTML."""
+        html = _md_to_html(text)
+        for part in _split_long_message(html):
+            self._sync_api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=part,
+                parse_mode="HTML",
+            )
 
     async def send_chunk(
         self, chat_id: str, text: str, message_id: Optional[str] = None
@@ -204,13 +274,15 @@ class TelegramProvider(RemoteProvider):
         If *message_id* is provided, edit that existing message.
         Returns the message_id (for subsequent edits).
         """
+        html = _md_to_html(text)
         if message_id:
             # Edit existing message
             resp = self._sync_api(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=int(message_id),
-                text=text[:_MAX_MESSAGE_LEN],
+                text=html[:_MAX_MESSAGE_LEN],
+                parse_mode="HTML",
             )
             if resp.get("ok"):
                 result = resp.get("result", {})
@@ -223,7 +295,8 @@ class TelegramProvider(RemoteProvider):
             resp = self._sync_api(
                 "sendMessage",
                 chat_id=chat_id,
-                text=text[:_MAX_MESSAGE_LEN],
+                text=html[:_MAX_MESSAGE_LEN],
+                parse_mode="HTML",
             )
             if resp.get("ok"):
                 result = resp.get("result", {})
