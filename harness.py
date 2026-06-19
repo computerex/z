@@ -3715,6 +3715,24 @@ def main():
                             text=user_input,
                             sender_id=_last_remote_chat[1],
                         )
+                # ── Check for completed sub-agents ──
+                elif sub_agent_manager:
+                    _completed_sa = sub_agent_manager.check_completed()
+                    if _completed_sa:
+                        user_input = (
+                            f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
+                            f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
+                            f"or list_agents(name='{_completed_sa}') to see a summary.]"
+                        )
+                        console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
+                        if _last_remote_chat is not None:
+                            from src.harness.remote.base import RemoteMessage as _RM
+                            current_remote_msg = _RM(
+                                provider=_last_remote_chat[0],
+                                chat_id=_last_remote_chat[1],
+                                text=user_input,
+                                sender_id=_last_remote_chat[1],
+                            )
                 else:
                     # Get input (multiline with prompt_toolkit, or simple input)
                     if prompt_session:
@@ -3762,6 +3780,25 @@ def main():
                                 text=user_input,
                                 sender_id=_last_remote_chat[1],
                             )
+                    # Check if any sub-agents have completed
+                    elif sub_agent_manager:
+                        _completed_sa = sub_agent_manager.check_completed()
+                        if _completed_sa:
+                            user_input = (
+                                f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
+                                f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
+                                f"or list_agents(name='{_completed_sa}') to see a summary.]"
+                            )
+                            console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
+                            # Route to the last active remote chat if any
+                            if _last_remote_chat is not None:
+                                from src.harness.remote.base import RemoteMessage as _RM
+                                current_remote_msg = _RM(
+                                    provider=_last_remote_chat[0],
+                                    chat_id=_last_remote_chat[1],
+                                    text=user_input,
+                                    sender_id=_last_remote_chat[1],
+                                )
                     else:
                         continue
 
