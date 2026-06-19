@@ -2312,11 +2312,14 @@ class ToolHandlers:
         except Exception as e:
             return f"Error retrieving output from '{name}': {e}"
 
-    async def list_agents(self, params: dict) -> str:
+    async def delete_agent(self, params: dict) -> str:
         """Delete a sub-agent completely."""
         name = params.get("name", "").strip()
         if not name:
             return "Error: 'name' is required."
+        confirm = params.get("confirm", False)
+        if not confirm:
+            return "Error: 'confirm' must be set to true to delete a sub-agent. This is irreversible."
         if not self.sub_agent_manager:
             return "Error: Sub-agent system not initialized."
         if self.sub_agent_manager.delete(name):

@@ -223,9 +223,12 @@ TOOL_DEFS: List[ToolDef] = [
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent to pause")]),
     ToolDef("delete_agent", category="agent",
-            description="Delete a sub-agent completely. Cancels any running task and removes it.",
+            description="Delete a sub-agent completely. Cancels any running task and removes it. "
+                        "You MUST set confirm=True to proceed — this is destructive and irreversible.",
             params=[ToolParam("name", required=True,
-                              description="The name of the sub-agent to delete")]),
+                              description="The name of the sub-agent to delete"),
+                    ToolParam("confirm", required=True,
+                              description="Set to true to confirm deletion. Required as a safety guard.")]),
     ToolDef("get_agent_output", category="agent",
             description="Retrieve a completed sub-agent's full output without sending new input. "
                         "Returns the cached TeeWriter buffer (all stdout) from the sub-agent's run. "
