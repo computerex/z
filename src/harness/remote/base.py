@@ -139,11 +139,16 @@ class RemoteProvider(ABC):
                 for msg in self._poll_thread():
                     if msg is None:
                         return  # sentinel
-                    # Bridge from thread → asyncio queue
-                    if self._loop and self._loop.is_running():
-                        self._loop.call_soon_threadsafe(self._aq.put_nowait, msg)
-                    # Wake up prompt_toolkit so the message gets seen
-                    self._wake_prompt_toolkit()
+                    # Bridge from thread → asyncio queue.
+                    # loop.call_soon_threadsafe works even when the loop is
+                    # not actively running — it queues the callback and wakes
+                    # the event loop's internal pipe; the callback will be
+                    # processed during the next loop.run_until_complete() call.
+                    self._loop.call_soon_threadsafe(self._aq.put_nowait, msg)
+                    # Wake prompt_toolkit on the MAIN thread so that
+                    # get_app() can find the running Application
+                    # (Application is stored in thread-local storage).
+                    self._loop.call_soon_threadsafe(self._wake_prompt_toolkit)
             except Exception:
                 log.exception("Thread poll error in provider '%s'", self.name)
                 import time
