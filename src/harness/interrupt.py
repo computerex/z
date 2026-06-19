@@ -77,111 +77,84 @@ def reset_background():
 
 
 class KeyboardMonitor:
-    """Monitor for escape key and Ctrl+B during streaming."""
-    
-    def __init__(self):
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._original_sigint = None
-        self._generation = 0  # Prevent zombie threads from prior start/stop cycles
-    
-    def start(self):
-        """Start monitoring for keys."""
-        # ALWAYS reset interrupt state, even if already running, to clear
-        # stale ctrl-c / escape flags from a previous turn.
-        reset_interrupt()
+    """Monitor for escape key and Ctrl+B during streaming.
 
-        if self._running and self._thread and self._thread.is_alive():
-            _log.debug("KeyboardMonitor.start() — already running")
+    Uses a SINGLE persistent daemon thread (started on first enable) that
+    stays alive for the lifetime of the process.  Callers enable/disable
+    monitoring via the ``enable()`` / ``disable()`` methods rather than
+    destroying and recreating threads — this eliminates the zombie-thread
+    race that caused Escape key events to be silently consumed and lost.
+    """
+
+    def __init__(self):
+        self._enabled = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._sigint_installed = False  # SIGINT handler installed at most once
+
+    def enable(self):
+        """Enable monitoring for keys.  Resets any stale interrupt state."""
+        _log.debug("KeyboardMonitor.enable()")
+        reset_interrupt()
+        self._enabled.set()
+        if self._thread is None:
+            self._install_sigint()
+            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self._thread.start()
+
+    def disable(self):
+        """Disable monitoring.  The persistent thread stays alive but idle."""
+        _log.debug("KeyboardMonitor.disable()")
+        self._enabled.clear()
+
+    # ── Signal handling ────────────────────────────────────────────────
+
+    def _install_sigint(self):
+        """Install SIGINT handler (once).  Never uninstalled — the monitor
+        is a singleton that lives for the whole process lifetime."""
+        if self._sigint_installed:
             return
-        
-        _log.debug("KeyboardMonitor.start()")
-        self._generation += 1
-        gen = self._generation
-        self._running = True
-        self._stop_event.clear()
-        
-        # Install Ctrl+C handler
-        self._original_sigint = signal.signal(signal.SIGINT, self._sigint_handler)
-        
-        self._thread = threading.Thread(target=self._monitor_loop, args=(gen,), daemon=True)
-        self._thread.start()
-    
-    def _sigint_handler(self, signum, frame):
-        """Handle Ctrl+C by triggering interrupt.
-        
-        First Ctrl+C → soft interrupt (set flag, agent checks it).
-        Second Ctrl+C → hard exit (raise KeyboardInterrupt).
-        """
-        was_already_interrupted = _interrupt_state.interrupted
+        self._orig_sigint = signal.signal(signal.SIGINT, self._on_sigint)
+        self._sigint_installed = True
+
+    def _on_sigint(self, signum, frame):
+        """First Ctrl+C → soft interrupt.  Second Ctrl+C → hard exit."""
+        was_already = _interrupt_state.interrupted
         _interrupt_state.trigger("ctrl-c")
-        if was_already_interrupted:
-            # Second Ctrl+C while already interrupted — hard exit
+        if was_already:
             _log.warning("Second Ctrl+C — hard exit")
-            if self._original_sigint and self._original_sigint != signal.SIG_DFL:
-                self._original_sigint(signum, frame)
+            if self._orig_sigint and self._orig_sigint != signal.SIG_DFL:
+                self._orig_sigint(signum, frame)
             else:
                 raise KeyboardInterrupt()
-    
-    def stop(self):
-        """Stop monitoring."""
-        _log.debug("KeyboardMonitor.stop()")
-        self._running = False
-        self._stop_event.set()
-        
-        # Restore original signal handler
-        if self._original_sigint is not None:
-            signal.signal(signal.SIGINT, self._original_sigint)
-            self._original_sigint = None
-        
-        if self._thread:
-            self._thread.join(timeout=0.2)
-            self._thread = None
-    
-    def _monitor_loop(self, gen: int):
-        """Monitor for keys in background thread."""
-        if gen != self._generation:
-            _log.debug("Stale monitor thread (gen=%d, current=%d) — exiting", gen, self._generation)
-            return
-        if sys.platform == 'win32':
-            self._monitor_windows(gen)
+
+    # ── Monitor loop (persistent) ──────────────────────────────────────
+
+    def _monitor_loop(self):
+        """Persistent top-level monitor loop — dispatches to platform handler."""
+        if sys.platform == "win32":
+            try:
+                self._monitor_windows()
+            except Exception as e:
+                _log.warning("Win32 console API monitor failed (%s), falling back to msvcrt", e)
+                self._monitor_windows_msvcrt()
         else:
-            self._monitor_unix(gen)
-    
-    def _monitor_windows(self, gen: int):
-        """Windows-specific keyboard monitoring using Win32 Console API.
+            self._monitor_unix()
 
-        Uses ReadConsoleInput to get proper KEY_EVENT_RECORD structures
-        with virtual key codes, completely avoiding the msvcrt.kbhit()/getch()
-        problem where VT escape sequences, terminal focus events, and other
-        injected bytes produce phantom 0x1b that looks like the Escape key.
-        """
-        try:
-            self._monitor_windows_console_api(gen)
-        except Exception as e:
-            _log.warning("Win32 console API monitor failed (%s), falling back to msvcrt", e)
-            self._monitor_windows_msvcrt(gen)
+    # ── Windows: Win32 Console API (primary) ──────────────────────────
 
-    def _monitor_windows_console_api(self, gen: int):
-        """Primary Windows monitor using Win32 ReadConsoleInput."""
+    def _monitor_windows(self):
         import ctypes
         from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
-
-        # Get console input handle
-        STD_INPUT_HANDLE = -10
-        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
         if handle is None or handle == -1:
             raise RuntimeError("Failed to get console input handle")
 
-        # Constants
         KEY_EVENT = 0x0001
         VK_ESCAPE = 0x1B
-        CTRL_MASK = 0x0008 | 0x0004  # LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED
+        CTRL_MASK = 0x0008 | 0x0004
 
-        # Win32 structures
         class CHAR_UNION(ctypes.Union):
             _fields_ = [("UnicodeChar", wintypes.WCHAR), ("AsciiChar", ctypes.c_char)]
 
@@ -202,49 +175,34 @@ class KeyboardMonitor:
 
         _log.info("Win32 console API monitor started (handle=%s)", handle)
 
-        # Flush stale events left over from previous user input
-        kernel32.FlushConsoleInputBuffer(handle)
-
         buf = INPUT_RECORD()
         n = wintypes.DWORD(0)
 
-        while self._running and not self._stop_event.is_set() and gen == self._generation:
+        # ── Persistent loop — single thread for the entire process lifetime ──
+        while True:
             if not kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(n)) or n.value == 0:
-                self._stop_event.wait(0.02)
+                threading.Event().wait(0.02)
                 continue
 
-            # Read one event from the buffer
             if not kernel32.ReadConsoleInputW(handle, ctypes.byref(buf), 1, ctypes.byref(n)) or n.value == 0:
-                self._stop_event.wait(0.02)
+                threading.Event().wait(0.02)
                 continue
 
-            # Bail if a new generation started while we were blocked in ReadConsoleInputW
-            if gen != self._generation:
-                _log.debug("Zombie monitor thread detected (gen=%d, current=%d) — exiting", gen, self._generation)
-                return
+            # When disabled, drain events silently (don't act, don't pile up)
+            if not self._enabled.is_set():
+                continue
 
-            # Log ALL event types for diagnosis
             if buf.EventType != KEY_EVENT:
-                _log.debug("Console event: type=%d (non-key, discarded)", buf.EventType)
-                continue  # Discard mouse, resize, focus, menu events
+                continue
             ke = buf.Event.KeyEvent
             if not ke.bKeyDown:
-                continue  # Discard key-up events
+                continue
 
             vk = ke.wVirtualKeyCode
             scan = ke.wVirtualScanCode
             ctrl = bool(ke.dwControlKeyState & CTRL_MASK)
-            char_val = ke.uChar.UnicodeChar
 
-            _log.debug(
-                "KEY_EVENT: vk=0x%02X scan=0x%02X ctrl=%s char=%r state=0x%08X",
-                vk, scan, ctrl, char_val, ke.dwControlKeyState,
-            )
-
-            # Real key presses have a non-zero scan code.  VT sequence bytes
-            # injected by the terminal (focus events, cursor keys in VT mode,
-            # etc.) have scan code 0 — reject those for ALL shortcut checks
-            # to avoid phantom interrupts.
+            # Real keys have non-zero scan code — reject injected VT sequences
             if scan == 0:
                 continue
 
@@ -252,51 +210,43 @@ class KeyboardMonitor:
                 _interrupt_state.trigger("escape")
             elif ctrl and vk == 0x42:  # Ctrl+B
                 _interrupt_state.trigger_background()
-            # NOTE: Ctrl+C (VK_C with ctrl) is intentionally NOT handled here.
-            # Ctrl+C is reliably delivered as SIGINT via SetConsoleCtrlHandler
-            # (independent of ENABLE_PROCESSED_INPUT mode), and our _sigint_handler
-            # already handles it.  Processing KEY_EVENTs for Ctrl+C here causes
-            # phantom interrupts from stale events, ConPTY-injected sequences, and
-            # zombie monitor threads.
-            # All other events are silently consumed and discarded
 
-    def _monitor_windows_msvcrt(self, gen: int):
-        """Fallback Windows monitor using msvcrt (no Escape support)."""
+    # ── Windows: msvcrt fallback (Ctrl+B only) ─────────────────────────
+
+    def _monitor_windows_msvcrt(self):
         import msvcrt
-
-        while self._running and not self._stop_event.is_set() and gen == self._generation:
+        while True:
+            if not self._enabled.is_set():
+                threading.Event().wait(0.02)
+                continue
             if msvcrt.kbhit():
                 key = msvcrt.getch()
-                # Skip Escape entirely in fallback — too unreliable via msvcrt.
-                # Skip Ctrl+C — handled by _sigint_handler via SIGINT.
-                if key == b'\x02':  # Ctrl+B
+                if key == b"\x02":  # Ctrl+B
                     _interrupt_state.trigger_background()
-            self._stop_event.wait(0.02)
-    
-    def _monitor_unix(self, gen: int):
-        """Unix-specific keyboard monitoring."""
+            threading.Event().wait(0.02)
+
+    # ── Unix ───────────────────────────────────────────────────────────
+
+    def _monitor_unix(self):
         import select
         import termios
         import tty
-        
+
         old_settings = None
         try:
             old_settings = termios.tcgetattr(sys.stdin)
             tty.setcbreak(sys.stdin.fileno())
-            
-            while self._running and not self._stop_event.is_set() and gen == self._generation:
+            while True:
+                if not self._enabled.is_set():
+                    threading.Event().wait(0.02)
+                    continue
                 if select.select([sys.stdin], [], [], 0.02)[0]:
                     key = sys.stdin.read(1)
-                    if key == '\x1b':  # Escape
+                    if key == "\x1b":  # Escape
                         _interrupt_state.trigger("escape")
-                        # Don't break - keep monitoring
-                    elif key == '\x02':  # Ctrl+B
+                    elif key == "\x02":  # Ctrl+B
                         _interrupt_state.trigger_background()
-                    # NOTE: Ctrl+C (0x03) is NOT handled here.
-                    # setcbreak() keeps ISIG, so Ctrl+C still generates SIGINT;
-                    # the 0x03 byte never reaches stdin.read().
-                    # _sigint_handler handles Ctrl+C reliably.
-        except:
+        except Exception:
             pass
         finally:
             if old_settings:
@@ -316,10 +266,10 @@ def get_monitor() -> KeyboardMonitor:
 
 
 def start_monitoring():
-    """Start keyboard monitoring."""
-    get_monitor().start()
+    """Enable keyboard monitoring (persistent thread)."""
+    get_monitor().enable()
 
 
 def stop_monitoring():
-    """Stop keyboard monitoring."""
-    get_monitor().stop()
+    """Disable keyboard monitoring (thread stays alive)."""
+    get_monitor().disable()
