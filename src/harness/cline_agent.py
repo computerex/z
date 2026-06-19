@@ -2136,6 +2136,8 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         "", _response_visible_text
                     )
                     _response_visible_text = _response_visible_text.strip()
+                    # Also strip from full_content so the returned result is clean
+                    full_content = _response_visible_text
 
                 # Strip XML tool tags that the model sometimes emits despite using
                 # native tool calling.  The old plugin docs taught XML format via
