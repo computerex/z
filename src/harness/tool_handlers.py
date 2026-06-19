@@ -2248,6 +2248,14 @@ class ToolHandlers:
         agents = self.sub_agent_manager.list()
         if not agents:
             return "No sub-agents running."
+        
+        # Optional name filter
+        filter_name = params.get("name", "").strip()
+        if filter_name:
+            agents = [a for a in agents if a["name"] == filter_name]
+            if not agents:
+                return f"No sub-agent named '{filter_name}' found."
+        
         lines = ["Sub-agents:"]
         for a in agents:
             elapsed = a["elapsed_seconds"]
@@ -2293,7 +2301,7 @@ class ToolHandlers:
             if not inst:
                 return f"Error: Sub-agent '{name}' not found."
             if inst.status != "completed":
-                return f"Sub-agent '{name}' is still {inst.status}. Use list_agents() to check its progress, then try again when it completes."
+                return f"Sub-agent '{name}' is still {inst.status}. Use list_agents(name='{name}') to check its progress."
             # Return the full cached output
             output_text = inst.output or ""
             if not output_text and inst.tee:

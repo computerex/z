@@ -214,7 +214,10 @@ TOOL_DEFS: List[ToolDef] = [
                     ToolParam("input", required=True,
                               description="The input/text to send to the sub-agent")]),
     ToolDef("list_agents", category="agent",
-            description="List all sub-agents with their current status (running/completed/error)."),
+            description="List all sub-agents with their current status (running/completed/error). "
+                        "Optionally filter by name to get details on a specific sub-agent.",
+            params=[ToolParam("name",
+                              description="Optional: filter to a specific sub-agent by name")]),
     ToolDef("pause_agent", category="agent",
             description="Pause a running sub-agent. Its state is saved for debugging.",
             params=[ToolParam("name", required=True,
