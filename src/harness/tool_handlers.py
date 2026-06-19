@@ -2301,6 +2301,14 @@ class ToolHandlers:
             if not inst:
                 return f"Error: Sub-agent '{name}' not found."
             if inst.status != "completed":
+                # Race condition: the background task may have finished writing
+                # to the TeeWriter but instance.status hasn't been set to
+                # "completed" yet. Check if the task actually finished.
+                if inst.task and inst.task.done():
+                    output_text = inst.tee.getvalue() if inst.tee else ""
+                    if output_text:
+                        # Task is done, output exists — return it
+                        return output_text
                 return f"Sub-agent '{name}' is still {inst.status}. Use list_agents(name='{name}') to check its progress."
             # Return the full cached output
             output_text = inst.output or ""
