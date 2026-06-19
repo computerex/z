@@ -3619,10 +3619,12 @@ def main():
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         focused_agent: Optional[str] = None  # Name of sub-agent currently focused
         current_remote_msg: Optional["RemoteMessage"] = None
+        # Track the last remote chat that sent a message, for routing cron results
+        _last_remote_chat: Optional[tuple[str, str]] = None  # (provider, chat_id)
 
         def _check_remote_messages():
             """Check for messages from remote providers (Telegram etc.)."""
-            nonlocal current_remote_msg
+            nonlocal current_remote_msg, _last_remote_chat
             if not remote_manager:
                 return None
             pending = loop.run_until_complete(remote_manager.get_pending_messages())
@@ -3636,6 +3638,7 @@ def main():
                 log.debug("Rejected message from chat %s (username: @%s)", msg.chat_id, sender_username)
                 return None
             current_remote_msg = msg
+            _last_remote_chat = (msg.provider, msg.chat_id)
             if msg.sender_id != msg.chat_id:
                 label = f"[{msg.provider}:{msg.sender_id}] {msg.text}"
             else:
@@ -3649,7 +3652,7 @@ def main():
             Resets ``current_remote_msg`` so subsequent prompts don't also
             get routed to the remote chat.
             """
-            nonlocal current_remote_msg
+            nonlocal current_remote_msg, _last_remote_chat
             if current_remote_msg is not None and remote_manager:
                 try:
                     loop.run_until_complete(
@@ -3703,6 +3706,15 @@ def main():
                 # ── Check for queued cron tasks before waiting for user input ──
                 elif agent.has_queued_cron_prompts():
                     user_input = "[Scheduled task processing...]"
+                    # Route cron output to the last active remote chat (if any)
+                    if _last_remote_chat is not None:
+                        from src.harness.remote.base import RemoteMessage as _RM
+                        current_remote_msg = _RM(
+                            provider=_last_remote_chat[0],
+                            chat_id=_last_remote_chat[1],
+                            text=user_input,
+                            sender_id=_last_remote_chat[1],
+                        )
                 else:
                     # Get input (multiline with prompt_toolkit, or simple input)
                     if prompt_session:
@@ -3741,6 +3753,15 @@ def main():
                     # Check if cron tasks fired while at prompt
                     elif agent.has_queued_cron_prompts():
                         user_input = "[Scheduled task processing...]"
+                        # Route cron output to the last active remote chat
+                        if _last_remote_chat is not None:
+                            from src.harness.remote.base import RemoteMessage as _RM
+                            current_remote_msg = _RM(
+                                provider=_last_remote_chat[0],
+                                chat_id=_last_remote_chat[1],
+                                text=user_input,
+                                sender_id=_last_remote_chat[1],
+                            )
                     else:
                         continue
 
@@ -4067,11 +4088,13 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Forked [bold]{source_name}[/bold] \u2192 [bold]{current_session}[/bold] [dim]({len(agent.messages) - 1} messages)[/dim]"
                             )
+                            _echo_remote(f"Forked '{source_name}' → '{current_session}' ({len(agent.messages) - 1} messages)")
                         else:
                             agent.save_session(str(session_path))
                             console.print(
                                 f"  [green]\u2713[/green] Forked [bold]{source_name}[/bold] into current session [bold]{current_session}[/bold] [dim]({len(agent.messages) - 1} messages)[/dim]"
                             )
+                            _echo_remote(f"Forked '{source_name}' into current session ({len(agent.messages) - 1} messages)")
                         continue
 
                     elif cmd == "/history":
@@ -4099,6 +4122,7 @@ def main():
                             style = {"system": "cyan", "user": "green", "assistant": "blue", "tool": "dim"}.get(msg.role, "dim")
                             console.print(f"    [{i}] [{role_icon}] [{style}]{msg.role}:[/{style}] {rich_escape(preview)}")
                         console.print()
+                        _echo_remote(f"Last {tail_count} messages (see terminal for details)")
                         continue
 
                     elif cmd == "/cost":
@@ -4116,6 +4140,7 @@ def main():
                             session_name=current_session,
                         )
                         console.print(f"  [dim]Opened usage report in browser[/dim]")
+                        _echo_remote("Usage report opened in browser")
                         continue
 
                     elif cmd == "/bg":
@@ -4161,6 +4186,7 @@ def main():
                         console.print(
                             "  [dim]/mode is deprecated. Use [white]/providers[/white] and [white]/model[/white] instead.[/dim]"
                         )
+                        _echo_remote("/mode is deprecated. Use /providers and /model instead.")
                         continue
 
                     elif cmd == "/ctx":
@@ -4361,6 +4387,9 @@ def main():
                         else:
                             console.print("  [dim]No compactions yet.[/dim]")
                         console.print()
+                        _echo_remote(
+                            f"Smart Context: {total_tokens:,} / {context_window:,} tokens ({pct:.0f}%) — {len(agent.messages)} messages, {len(active_todos)} active todos"
+                        )
                         continue
 
                     elif cmd == "/dump":
@@ -4396,6 +4425,9 @@ def main():
                             console.print(
                                 "  [red]\u2717 No system message found![/red]"
                             )
+                        _echo_remote(
+                            f"Dump: {breakdown['total']:,}t total ({breakdown['message_count']} msgs) \u2192 {dump_path.name}"
+                        )
                         continue
 
                     elif cmd == "/policyeval":
@@ -4464,8 +4496,10 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Policy replay report: [cyan]{rich_escape(str(op))}[/cyan]"
                             )
+                            _echo_remote(f"Policy replay report saved to {op.name}")
                         else:
                             console.print(report)
+                            _echo_remote(f"Policy replay complete (see terminal for report)")
                         continue
 
                     elif cmd == "/config":
@@ -4479,8 +4513,10 @@ def main():
                                     workspace, console, agent, providers, scope
                                 )
                                 console.print(f"  [dim]{result}[/dim]")
+                                _echo_remote(result or "Config setup complete")
                             except KeyboardInterrupt:
                                 console.print("\n  [dim]Config wizard cancelled.[/dim]")
+                                _echo_remote("Config wizard cancelled")
                             continue
 
                         key_preview = (
@@ -4529,45 +4565,54 @@ def main():
                             "  [dim][white]/providers[/white] to manage providers, [white]/model[/white] to switch models.[/dim]"
                         )
                         console.print()
+                        _echo_remote(
+                            f"Config: model={agent.config.model}, max_tokens={agent.config.max_tokens:,}, temperature={agent.config.temperature}"
+                        )
                         continue
 
                     elif cmd in ("/provider", "/providers"):
                         try:
                             if cmd == "/providers":
-                                result = run_providers_hub(
+                                result_text = run_providers_hub(
                                     workspace, console, agent, providers, cmd_arg
                                 )
                             else:
-                                result = run_provider_manager(
+                                result_text = run_provider_manager(
                                     workspace, console, agent, providers, cmd_arg
                                 )
-                            if result:
-                                console.print(f"  [dim]{result}[/dim]")
+                            if result_text:
+                                console.print(f"  [dim]{result_text}[/dim]")
+                                _echo_remote(result_text)
                         except KeyboardInterrupt:
                             console.print("\n  [dim]Cancelled.[/dim]")
+                            _echo_remote("Provider command cancelled")
                         continue
 
                     elif cmd == "/model":
                         try:
-                            result = run_model_switch_wizard(
+                            result_text = run_model_switch_wizard(
                                 workspace, console, agent, providers, cmd_arg
                             )
-                            if result:
-                                console.print(f"  [dim]{result}[/dim]")
+                            if result_text:
+                                console.print(f"  [dim]{result_text}[/dim]")
+                                _echo_remote(result_text)
                         except KeyboardInterrupt:
                             console.print("\n  [dim]Cancelled.[/dim]")
+                            _echo_remote("Model command cancelled")
                         continue
 
                     elif cmd == "/mcp":
                         try:
-                            result = run_mcp_manager(console, cmd_arg)
+                            result_text = run_mcp_manager(console, cmd_arg)
                             refreshed = agent.refresh_system_prompt()
-                            if result:
-                                console.print(f"  [dim]{result}[/dim]")
+                            if result_text:
+                                console.print(f"  [dim]{result_text}[/dim]")
+                                _echo_remote(result_text)
                             if refreshed:
                                 console.print(
                                     "  [dim]System prompt refreshed (MCP config updated).[/dim]"
                                 )
+                                _echo_remote("System prompt refreshed (MCP config updated)")
                         except KeyboardInterrupt:
                             console.print("\n  [dim]Cancelled.[/dim]")
                         continue
@@ -4577,6 +4622,7 @@ def main():
                             console.print(
                                 f"  [dim]Max tokens:[/dim] [bold]{agent.config.max_tokens:,}[/bold]"
                             )
+                            _echo_remote(f"Max tokens: {agent.config.max_tokens:,}")
                             console.print(
                                 "  [dim]Usage: /maxctx <tokens>  e.g. /maxctx 8000, /maxctx 32k[/dim]"
                             )
@@ -4609,6 +4655,7 @@ def main():
                         console.print(
                             f"  [green]\u2713[/green] Max tokens set to [bold]{parsed:,}[/bold]"
                         )
+                        _echo_remote(f"Max tokens set to {parsed:,}")
                         continue
 
                     elif cmd == "/compactthresh":
@@ -4673,6 +4720,7 @@ def main():
                                 console.print(
                                     f"  [green]\u2713[/green] Compaction threshold set to [bold]{int(token_value):,} tokens[/bold] ({pct}%)"
                                 )
+                                _echo_remote(f"Compaction threshold set to {int(token_value):,} tokens ({pct}%)")
                             else:
                                 # Parse as percentage
                                 parsed = float(arg.replace("%", "").strip())
@@ -4695,6 +4743,7 @@ def main():
                                 console.print(
                                     f"  [dim]Compaction will now start at ~{threshold_tokens:,} tokens[/dim]"
                                 )
+                                _echo_remote(f"Compaction threshold set to {int(parsed)}% (~{threshold_tokens:,} tokens)")
                         except ValueError:
                             console.print(
                                 "  [dim]Usage: /compactthresh <percent|tokens>  e.g. /compactthresh 65, /compactthresh 50k, /compactthresh 25000[/dim]"
@@ -4706,6 +4755,7 @@ def main():
                             console.print(
                                 f"  [dim]Max iterations:[/dim] [bold]{agent.max_iterations}[/bold]"
                             )
+                            _echo_remote(f"Max iterations: {agent.max_iterations}")
                             continue
                         try:
                             new_val = int(cmd_arg.strip())
@@ -4718,6 +4768,7 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Max iterations set to [bold]{new_val}[/bold]"
                             )
+                            _echo_remote(f"Max iterations set to {new_val}")
                         except ValueError:
                             console.print("  [dim]Usage: /iter <number>[/dim]")
                         continue
@@ -4747,10 +4798,15 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Index rebuilt: {len(idx.files)} files in {idx._build_time:.2f}s"
                             )
+                            _echo_remote(f"Index rebuilt: {len(idx.files)} files in {idx._build_time:.2f}s")
                         elif cmd_arg.strip().lower() == "tree":
-                            console.print(f"[dim]{idx.compact_tree()}[/dim]")
+                            tree_text = idx.compact_tree()
+                            console.print(f"[dim]{tree_text}[/dim]")
+                            _echo_remote(f"Index tree:\n{tree_text[:500]}" if len(tree_text) > 500 else f"Index tree:\n{tree_text}")
                         else:
-                            console.print(f"  [dim]{idx.summary()}[/dim]")
+                            summary = idx.summary()
+                            console.print(f"  [dim]{summary}[/dim]")
+                            _echo_remote(summary)
                             console.print(
                                 "  [dim][white]/index rebuild[/white]  re-scan workspace[/dim]"
                             )
@@ -4765,6 +4821,7 @@ def main():
                         )
                         if not os.path.exists(log_file):
                             console.print("  [dim]No log file yet.[/dim]")
+                            _echo_remote("No log file yet.")
                         else:
                             size_kb = os.path.getsize(log_file) / 1024
                             console.print(
@@ -4785,12 +4842,53 @@ def main():
                                 console.print(
                                     f"  [dim]{rich_escape(ln.rstrip())}[/dim]"
                                 )
+                            _echo_remote(f"Log: {size_kb:.0f} KB, showing last {n} lines (see terminal)")
                         continue
 
                     elif cmd == "/undo":
                         if not checkpoint_mgr.can_undo():
                             console.print("  [dim]Nothing to undo[/dim]")
                             continue
+                        result = checkpoint_mgr.undo(agent.messages)
+                        if result is None:
+                            console.print("  [red]Undo failed[/red]")
+                            continue
+                        cp, diff, restored_msgs = result
+                        agent.messages = restored_msgs
+                        # Show summary
+                        n_files = (
+                            len(diff.files_modified)
+                            + len(diff.files_added)
+                            + len(diff.files_deleted)
+                        )
+                        parts = []
+                        if diff.files_modified:
+                            parts.append(f"{len(diff.files_modified)} modified")
+                        if diff.files_added:
+                            parts.append(f"{len(diff.files_added)} added")
+                        if diff.files_deleted:
+                            parts.append(f"{len(diff.files_deleted)} deleted")
+                        file_summary = ", ".join(parts) if parts else "no file changes"
+                        console.print(
+                            f"  [red]\u21b6[/red] [bold]Undone[/bold] \u2014 restored {file_summary}"
+                        )
+                        if n_files > 0:
+                            for f in (
+                                diff.files_modified
+                                + diff.files_added
+                                + diff.files_deleted
+                            )[:8]:
+                                console.print(f"    [dim]{f}[/dim]")
+                            remaining = n_files - 8
+                            if remaining > 0:
+                                console.print(f"    [dim]...and {remaining} more[/dim]")
+                        console.print(f"  [dim]Request was: {cp.user_input}[/dim]")
+                        if checkpoint_mgr.can_redo():
+                            console.print(
+                                "  [dim]Type [white]/redo[/white] to re-apply[/dim]"
+                            )
+                        _echo_remote(f"Undone: restored {file_summary}")
+                        continue
                         result = checkpoint_mgr.undo(agent.messages)
                         if result is None:
                             console.print("  [red]Undo failed[/red]")
@@ -4872,6 +4970,7 @@ def main():
                                 + diff.files_deleted
                             )[:8]:
                                 console.print(f"    [dim]{f}[/dim]")
+                        _echo_remote(f"Redo: restored {file_summary}")
                         continue
 
                     elif cmd in ("/help", "/-"):
