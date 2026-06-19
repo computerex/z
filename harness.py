@@ -3643,6 +3643,26 @@ def main():
             console.print(f"\n  [cyan]\u260e[/cyan] Remote input: [bold]{label}[/bold]")
             return msg.text
 
+        def _echo_remote(text: str) -> None:
+            """Echo text back to the remote provider (if input came from one).
+
+            Resets ``current_remote_msg`` so subsequent prompts don't also
+            get routed to the remote chat.
+            """
+            nonlocal current_remote_msg
+            if current_remote_msg is not None and remote_manager:
+                try:
+                    loop.run_until_complete(
+                        remote_manager.send_message(
+                            current_remote_msg.provider,
+                            current_remote_msg.chat_id,
+                            text,
+                        )
+                    )
+                except Exception:
+                    pass
+                current_remote_msg = None
+
         def _build_prompt_text():
             """Build prompt text dynamically so Ctrl+T updates are visible immediately."""
             # Build a truncated workspace path: substitute home with ~, then shorten
@@ -3736,8 +3756,10 @@ def main():
                                 )
                             )
                             console.print(result)
+                            _echo_remote(f"$ {shell_cmd}\n{result}")
                         except Exception as e:
                             console.print(f"  [red]\u2717 {rich_escape(str(e))}[/red]")
+                            _echo_remote(f"$ {shell_cmd}\nError: {str(e)}")
                     continue
 
                 # Handle commands — checked BEFORE sub-agent routing so /commands
@@ -3789,6 +3811,16 @@ def main():
                                 )
                             )
                             console.print()
+                            # Build a text summary for remote echo
+                            _session_lines = []
+                            for name, mtime, count in sessions:
+                                marker = "●" if name == current_session else " "
+                                _session_lines.append(f"  {marker} {name} ({count} msgs)")
+                            _echo_remote(
+                                "Sessions:\n" + "\n".join(_session_lines)
+                                if _session_lines
+                                else "No sessions yet."
+                            )
                         continue
 
                     elif cmd == "/session":
@@ -3796,6 +3828,7 @@ def main():
                             console.print(
                                 f"  [dim]Current session:[/dim] [bold]{current_session}[/bold]"
                             )
+                            _echo_remote(f"Current session: {current_session}")
                             continue
                         agent.save_session(str(session_path))
                         new_name = cmd_arg.strip()
@@ -3807,12 +3840,14 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Switched to [bold]{current_session}[/bold] [dim]({msg_count} messages)[/dim]"
                             )
+                            _echo_remote(f"Switched to session '{current_session}' ({msg_count} messages)")
                         else:
                             agent.clear_history()
                             agent.save_session(str(session_path))
                             console.print(
                                 f"  [green]\u2713[/green] Created new session [bold]{current_session}[/bold]"
                             )
+                            _echo_remote(f"Created new session '{current_session}'")
                         continue
 
                     elif cmd == "/new":
@@ -3830,12 +3865,14 @@ def main():
                         console.print(
                             f"  [green]\u2713[/green] Started fresh session [bold]{current_session}[/bold]"
                         )
+                        _echo_remote(f"Started fresh session '{current_session}'")
                         continue
 
                     elif cmd == "/agents":
-                        agents = sub_agent_manager.list()
-                        if not agents:
+                        agents_list = sub_agent_manager.list()
+                        if not agents_list:
                             console.print("  [dim]No sub-agents running.[/dim]")
+                            _echo_remote("No sub-agents running")
                         else:
                             tbl = Table(
                                 show_header=False,
@@ -3847,7 +3884,7 @@ def main():
                             tbl.add_column("name", style="bold")
                             tbl.add_column("status", style="dim")
                             tbl.add_column("elapsed", justify="right", style="dim")
-                            for a in agents:
+                            for a in agents_list:
                                 stat = a["status"]
                                 
                                 marker = " "
@@ -3878,6 +3915,9 @@ def main():
                                 )
                             )
                             console.print("  [dim]Use [white]/agent <name>[/white] to switch, [white]/agent-back[/white] to return[/dim]\n")
+                            # Build text summary for remote
+                            _agent_lines = [f"  {'●' if a['name'] == focused_agent else ' '} {a['name']} — {a['status']} ({a['elapsed_seconds']}s)" for a in agents_list]
+                            _echo_remote("Sub-Agents:\n" + "\n".join(_agent_lines))
                         continue
 
                     elif cmd == "/agent":
@@ -3894,6 +3934,7 @@ def main():
                         sub_agent_manager.set_focused(name)
                         console.print(f"  [yellow]\u25b6[/yellow] Switched to sub-agent [bold]{name}[/bold]")
                         console.print("  [dim]Type input to send to it, use /agent-back to return[/dim]\n")
+                        _echo_remote(f"Switched to sub-agent '{name}'")
                         continue
 
                     elif cmd == "/agent-back":
@@ -3904,6 +3945,7 @@ def main():
                         focused_agent = None
                         sub_agent_manager.set_focused(None)
                         console.print(f"  [yellow]\u25b6[/yellow] Switched back to parent agent [dim](from {name})[/dim]")
+                        _echo_remote(f"Switched back to parent agent (from {name})")
                         continue
 
                     elif cmd == "/telegram-auth":
@@ -3940,6 +3982,7 @@ def main():
                         reset_global_tracker()
                         debug_print("/clear: resetting done, printing...")
                         console.print("  [green]\u2713[/green] History cleared")
+                        _echo_remote("History cleared")
                         debug_print("/clear: about to continue...")
                         continue
 
@@ -3950,6 +3993,7 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Removed [bold]{removed}[/bold] message{'s' if removed > 1 else ''} from history"
                             )
+                            _echo_remote(f"Removed {removed} message(s) from history")
                         else:
                             console.print(
                                 "  [dim]No messages to remove (system message is protected)[/dim]"
@@ -3962,6 +4006,7 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Sanitized [bold]{sanitized}[/bold] message{'s' if sanitized > 1 else ''} to fix UTF-8 issues"
                             )
+                            _echo_remote(f"Sanitized {sanitized} message(s)")
                         else:
                             console.print(
                                 "  [dim]No UTF-8 issues found in messages[/dim]"
@@ -3973,6 +4018,7 @@ def main():
                         console.print(
                             f"  [green]\u2713[/green] Session [bold]{current_session}[/bold] saved"
                         )
+                        _echo_remote(f"Session saved: {current_session}")
                         continue
 
                     elif cmd == "/delete":
@@ -3991,8 +4037,10 @@ def main():
                             console.print(
                                 f"  [green]\u2713[/green] Deleted session [bold]{target}[/bold]"
                             )
+                            _echo_remote(f"Deleted session '{target}'")
                         else:
                             console.print(f"  [dim]Session '{target}' not found[/dim]")
+                            _echo_remote(f"Session '{target}' not found")
                         continue
 
                     elif cmd == "/fork":
@@ -4027,9 +4075,11 @@ def main():
                         continue
 
                     elif cmd == "/history":
+                        msg_count = len(agent.messages)
                         console.print(
-                            f"  [dim]{len(agent.messages)} messages in conversation[/dim]"
+                            f"  [dim]{msg_count} messages in conversation[/dim]"
                         )
+                        _echo_remote(f"{msg_count} messages in conversation")
                         continue
 
                     elif cmd == "/tail":
@@ -4053,6 +4103,7 @@ def main():
 
                     elif cmd == "/cost":
                         _render_cost_report(console)
+                        _echo_remote("Cost report displayed in terminal")
                         continue
 
                     elif cmd == "/usage":
@@ -4073,6 +4124,7 @@ def main():
                             console.print(
                                 "  [dim]No background processes running[/dim]"
                             )
+                            _echo_remote("No background processes running")
                         else:
                             tbl = Table(box=box.SIMPLE_HEAD, padding=(0, 1))
                             tbl.add_column("ID", style="bold")
@@ -4102,6 +4154,7 @@ def main():
                                 )
                             )
                             console.print()
+                            _echo_remote(f"{len(procs)} background process(es) running. Use /bg to see details in terminal.")
                         continue
 
                     elif cmd == "/mode":
@@ -4134,6 +4187,9 @@ def main():
                             f"  [dim]{stats['messages']} messages \u00b7 {stats['context_items']} context items[/dim]"
                         )
                         console.print()
+                        _echo_remote(
+                            f"Context: {stats['tokens']:,} / {stats['context_window']:,} tokens ({pct:.0f}%) — {stats['messages']} messages"
+                        )
                         continue
 
                     elif cmd == "/tokens":
@@ -4174,6 +4230,9 @@ def main():
                                     f"    [dim]{role:>10}  {tokens:>6,}t  {rich_escape(preview)}[/dim]"
                                 )
                         console.print()
+                        _echo_remote(
+                            f"Tokens: system={breakdown['system']:,}, conversation={breakdown['conversation']:,}, total={breakdown['total']:,}"
+                        )
                         continue
 
                     elif cmd == "/compact":
@@ -4184,15 +4243,18 @@ def main():
                         console.print(
                             f"  [green]\u2713[/green] Compacted [bold]{before:,}[/bold] \u2192 [bold]{after:,}[/bold] tokens [dim](-{removed:,})[/dim]"
                         )
+                        _echo_remote(f"Compacted: {before:,} → {after:,} tokens (-{removed:,})")
                         continue
 
                     elif cmd == "/todo":
                         if not cmd_arg:
                             agent.todo_manager.print_todo_panel(console)
+                            _echo_remote("Todo list displayed in terminal")
                         elif cmd_arg.startswith("add "):
                             title = cmd_arg[4:].strip()
                             agent.todo_manager.add(title=title)
                             console.print(f"  [green]\u2713[/green] Added: {title}")
+                            _echo_remote(f"Todo added: {title}")
                             agent.todo_manager.print_todo_panel(console)
                         elif cmd_arg.startswith("done "):
                             try:
@@ -4208,6 +4270,7 @@ def main():
                                     console.print(
                                         f"  [green]\u2713[/green] Completed: {item.title}"
                                     )
+                                    _echo_remote(f"Todo completed: {item.title}")
                                 agent.todo_manager.print_todo_panel(console)
                             except ValueError:
                                 console.print("  [dim]Usage: /todo done <id>[/dim]")
@@ -4220,12 +4283,14 @@ def main():
                                     )
                                 else:
                                     console.print(f"  [green]\u2713[/green] Removed")
+                                    _echo_remote(f"Todo #{item_id} removed")
                                 agent.todo_manager.print_todo_panel(console)
                             except ValueError:
                                 console.print("  [dim]Usage: /todo rm <id>[/dim]")
                         elif cmd_arg.strip() == "clear":
                             agent.todo_manager.clear()
                             console.print("  [green]\u2713[/green] All todos cleared")
+                            _echo_remote("All todos cleared")
                         else:
                             console.print(
                                 "  [dim]Usage: /todo [add <title> | done <id> | rm <id> | clear][/dim]"
@@ -4966,12 +5031,14 @@ def main():
                                 "  [cyan]Ctrl+T[/cyan]               [dim]Toggle reasoning effort[/dim]"
                             )
                         console.print()
+                        _echo_remote("Available commands listed in the terminal. Key ones: /compact, /ctx, /clear, /help, /session, /todo")
                         continue
 
                     else:
                         console.print(
-                            f"  [dim]Unknown command. Type [white]/help[/white] for available commands.[/dim]"
+                            f"  [dim]Unknown command: {cmd}. Type /help for available commands.[/dim]"
                         )
+                        _echo_remote(f"Unknown command: {cmd}. Type /help for available commands.")
                         continue
 
                 # If focused on a sub-agent, route non-command input to it
