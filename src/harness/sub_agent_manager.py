@@ -213,7 +213,9 @@ class SubAgentManager:
         """Return info for all sub-agents, including a snippet of current output."""
         result = []
         for name, inst in self._agents.items():
-            elapsed = time.time() - inst.created_at
+            # Freeze elapsed time at completion so the counter doesn't keep ticking
+            end_time = inst.completed_at if inst.status == "completed" else time.time()
+            elapsed = end_time - inst.created_at
 
             # Read live output from the TeeWriter buffer
             output_text = ""
