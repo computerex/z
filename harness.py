@@ -4,6 +4,7 @@
 import sys
 import os
 import time as _time_mod
+import traceback
 import warnings
 
 # Suppress Pydantic serialization warnings from LiteLLM
@@ -3176,6 +3177,16 @@ def main():
         action="store_true",
         help="Freeze current harness as the new safe mode version",
     )
+    parser.add_argument(
+        "--telegram",
+        default="",
+        help="Telegram bot token for remote input mode (get from @BotFather)",
+    )
+    parser.add_argument(
+        "--telegram-allow-list",
+        default="",
+        help="Comma-separated list of allowed Telegram chat IDs (optional)",
+    )
     args = parser.parse_args()
 
     # Safe mode handling
@@ -3389,6 +3400,38 @@ def main():
     _mark("agent_created")
     log.info("Agent created")
 
+    # Remote input/output manager (Telegram, Slack, etc.)
+    remote_manager = None
+    if args.telegram:
+        try:
+            from src.harness.remote.manager import RemoteInputManager
+            from src.harness.remote.telegram import TelegramProvider
+        except ImportError:
+            traceback.print_exc()
+            console.print(
+                "[red]Failed to import remote provider modules. "
+                "Make sure src/harness/remote/ package exists.[/red]"
+            )
+            sys.exit(1)
+
+        try:
+            remote_manager = RemoteInputManager()
+            tg_config = {
+                "token": args.telegram,
+                "allowed_chat_ids": args.telegram_allow_list,
+            }
+            tg_provider = TelegramProvider(tg_config)
+            remote_manager.register(tg_provider)
+            loop.run_until_complete(remote_manager.start_all())
+            console.print(
+                "  [green]\u2713[/green] Telegram bot connected — remote input mode enabled"
+            )
+        except Exception as e:
+            console.print(
+                f"  [red]\u2717[/red] Failed to start Telegram bot: [bold]{e}[/bold]"
+            )
+            sys.exit(1)
+
     # Checkpoint manager for undo/redo
     checkpoint_mgr = CheckpointManager(workspace)
     checkpoint_mgr._workspace_index = agent.workspace_index
@@ -3434,6 +3477,12 @@ def main():
         sub_agent_manager.save_all_sessions()
         sub_agent_manager.cleanup()
         save_session()
+        # Stop remote providers
+        if remote_manager:
+            try:
+                loop.run_until_complete(remote_manager.stop_all())
+            except Exception as e:
+                debug_print(f"Remote manager cleanup failed: {e}")
 
     _mark("ready")
 
@@ -3540,6 +3589,35 @@ def main():
 
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         focused_agent: Optional[str] = None  # Name of sub-agent currently focused
+        current_remote_msg: Optional["RemoteMessage"] = None
+
+        def _check_remote_messages():
+            """Check for messages from remote providers (Telegram etc.)."""
+            nonlocal current_remote_msg
+            if not remote_manager:
+                return None
+            pending = loop.run_until_complete(remote_manager.get_pending_messages())
+            if not pending:
+                return None
+            msg = pending[0]
+            # Check authorization
+            prov = remote_manager.get_provider(msg.provider)
+            if prov and hasattr(prov, 'is_chat_allowed') and not prov.is_chat_allowed(msg.chat_id):
+                loop.run_until_complete(
+                    remote_manager.send_message(
+                        msg.provider, msg.chat_id,
+                        "⛔ *Unauthorized*\n\nYou are not authorized to use this bot.\n"
+                        "Contact the administrator to get access."
+                    )
+                )
+                return None
+            current_remote_msg = msg
+            if msg.sender_id != msg.chat_id:
+                label = f"[{msg.provider}:{msg.sender_id}] {msg.text}"
+            else:
+                label = f"[{msg.provider}] {msg.text}"
+            console.print(f"\n  [cyan]\u260e[/cyan] Remote input: [bold]{label}[/bold]")
+            return msg.text
 
         def _build_prompt_text():
             """Build prompt text dynamically so Ctrl+T updates are visible immediately."""
@@ -3574,8 +3652,12 @@ def main():
 
         while True:
             try:
+                # ── Check for remote provider messages (Telegram etc.) ──
+                _remote_text = _check_remote_messages()
+                if _remote_text is not None:
+                    user_input = _remote_text
                 # ── Check for queued cron tasks before waiting for user input ──
-                if agent.has_queued_cron_prompts():
+                elif agent.has_queued_cron_prompts():
                     user_input = "[Scheduled task processing...]"
                 else:
                     # Get input (multiline with prompt_toolkit, or simple input)
@@ -3608,8 +3690,12 @@ def main():
                             continue
 
                 if not user_input:
+                    # Check for remote messages
+                    _remote_text = _check_remote_messages()
+                    if _remote_text is not None:
+                        user_input = _remote_text
                     # Check if cron tasks fired while at prompt
-                    if agent.has_queued_cron_prompts():
+                    elif agent.has_queued_cron_prompts():
                         user_input = "[Scheduled task processing...]"
                     else:
                         continue
@@ -3794,6 +3880,31 @@ def main():
                         focused_agent = None
                         sub_agent_manager.set_focused(None)
                         console.print(f"  [yellow]\u25b6[/yellow] Switched back to parent agent [dim](from {name})[/dim]")
+                        continue
+
+                    elif cmd == "/telegram-auth":
+                        if not remote_manager:
+                            console.print("  [dim]No remote provider configured. Use [white]--telegram[/white] flag on launch.[/dim]")
+                            continue
+                        tg = remote_manager.get_provider("telegram")
+                        if not tg:
+                            console.print("  [dim]Telegram provider not active.[/dim]")
+                            continue
+                        if not cmd_arg:
+                            console.print("  [dim]Usage: /telegram-auth <chat_id>[/dim]")
+                            continue
+                        chat_id = cmd_arg.strip()
+                        tg.authorize_chat(chat_id)
+                        if tg.approve_pending(chat_id):
+                            console.print(f"  [green]\u2713[/green] Authorized chat [bold]{chat_id}[/bold]")
+                            loop.run_until_complete(
+                                remote_manager.send_message(
+                                    "telegram", chat_id,
+                                    "✅ *Authorized!*\n\nYou can now send messages to the bot."
+                                )
+                            )
+                        else:
+                            console.print(f"  [green]\u2713[/green] Added [bold]{chat_id}[/bold] to allowed list")
                         continue
 
                     elif cmd == "/clear":
@@ -4799,6 +4910,11 @@ def main():
                             "  [cyan]/log[/cyan] [dim][n][/dim]             [dim]Show last n log lines[/dim]"
                         )
                         console.print()
+                        console.print("  [bold]Remote[/bold]")
+                        console.print(
+                            "  [cyan]/telegram-auth[/cyan] [dim]<chat_id>[/dim] [dim]Authorize a Telegram chat[/dim]"
+                        )
+                        console.print()
                         console.print("  [bold]Keys[/bold]")
                         console.print(
                             "  [cyan]Esc[/cyan]                  [dim]Stop / interrupt agent[/dim]"
@@ -5033,16 +5149,58 @@ def main():
                     agent.todo_manager.print_todo_panel(console)
                 except KeyboardInterrupt:
                     log.warning("KeyboardInterrupt during run_single")
+                    _rm = current_remote_msg
+                    current_remote_msg = None
+                    if _rm and remote_manager:
+                        try:
+                            loop.run_until_complete(
+                                remote_manager.send_message(
+                                    _rm.provider, _rm.chat_id,
+                                    "⚠️ The request was interrupted."
+                                )
+                            )
+                        except Exception:
+                            pass
                     console.print(
                         "\n  [yellow]Interrupted[/yellow] [dim]- press Ctrl+C again to exit[/dim]"
                     )
                     last_interrupt_time = time.time()
                 except Exception as e:
                     log_exception(log, "run_single failed", e)
+                    _rm = current_remote_msg
+                    current_remote_msg = None
+                    if _rm and remote_manager:
+                        try:
+                            loop.run_until_complete(
+                                remote_manager.send_message(
+                                    _rm.provider, _rm.chat_id,
+                                    f"⚠️ Error: {str(e)[:500]}"
+                                )
+                            )
+                        except Exception:
+                            pass
                     console.print(f"  [red]\u2717 {rich_escape(str(e))}[/red]")
 
                 # Auto-save session after each exchange
                 agent.save_session(str(session_path))
+
+                # Send response back to remote provider if input was from one
+                if current_remote_msg is not None and result is not None:
+                    _rm = current_remote_msg
+                    current_remote_msg = None
+                    try:
+                        loop.run_until_complete(
+                            remote_manager.send_message(
+                                _rm.provider, _rm.chat_id, result
+                            )
+                        )
+                        log.info(
+                            "Sent response to %s chat %s (%d chars)",
+                            _rm.provider, _rm.chat_id, len(result),
+                        )
+                    except Exception as _e:
+                        log.error("Failed to send response to %s: %s", _rm.provider, _e)
+
                 if (
                     isinstance(original_user_input_for_cleanup, str)
                     and "[[clipboard_image:" in original_user_input_for_cleanup
