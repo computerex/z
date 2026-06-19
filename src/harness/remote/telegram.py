@@ -90,6 +90,31 @@ def _md_to_html(text: str) -> str:
     return text
 
 
+def _close_open_html_tags(html: str) -> str:
+    """Close any unclosed HTML tags at the end of a truncated string.
+
+    Telegram rejects HTML messages with unclosed tags.  This function
+    finds all opened-but-not-closed tags and appends their closing tags.
+    """
+    # Find all opening tags (<b>, <i>, <code>, <pre>, <a href="...">)
+    # and their corresponding closing tags.
+    opened: list[str] = []
+    for m in re.finditer(r"</?(\w+)(?:\s[^>]*)?\s*/?>", html):
+        tag = m.group(1).lower()
+        if tag in ("b", "i", "u", "s", "code", "pre", "a", "spoiler"):
+            if m.group(0).startswith("</"):
+                # Closing tag — pop from stack if present
+                if opened and opened[-1] == tag:
+                    opened.pop()
+            else:
+                # Opening tag — push onto stack
+                opened.append(tag)
+    # Append closing tags in reverse order
+    for tag in reversed(opened):
+        html += f"</{tag}>"
+    return html
+
+
 def _split_long_message(text: str, max_len: int = _MAX_MESSAGE_LEN) -> list[str]:
     """Split a long message into multiple chunks at sensible boundaries."""
     if len(text) <= max_len:
@@ -257,12 +282,13 @@ class TelegramProvider(RemoteProvider):
 
     async def send_message(self, chat_id: str, text: str) -> None:
         """Send a text message to the given chat with Markdown rendered as HTML."""
-        html = _md_to_html(text)
-        for part in _split_long_message(html):
+        # Split BEFORE HTML conversion so tag boundaries aren't broken.
+        for part in _split_long_message(text):
+            html = _md_to_html(part)
             self._sync_api(
                 "sendMessage",
                 chat_id=chat_id,
-                text=part,
+                text=html,
                 parse_mode="HTML",
             )
 
@@ -275,13 +301,17 @@ class TelegramProvider(RemoteProvider):
         Returns the message_id (for subsequent edits).
         """
         html = _md_to_html(text)
+        if len(html) > _MAX_MESSAGE_LEN:
+            html = html[:_MAX_MESSAGE_LEN]
+            # Close any unclosed tags at the cut boundary
+            html = _close_open_html_tags(html)
         if message_id:
             # Edit existing message
             resp = self._sync_api(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=int(message_id),
-                text=html[:_MAX_MESSAGE_LEN],
+                text=html,
                 parse_mode="HTML",
             )
             if resp.get("ok"):
@@ -295,7 +325,7 @@ class TelegramProvider(RemoteProvider):
             resp = self._sync_api(
                 "sendMessage",
                 chat_id=chat_id,
-                text=html[:_MAX_MESSAGE_LEN],
+                text=html,
                 parse_mode="HTML",
             )
             if resp.get("ok"):
