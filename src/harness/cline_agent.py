@@ -1568,6 +1568,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             StreamingMessage(role="user", content=_notif)
                         )
                         log.info("Injected completion notification for sub-agent '%s'", _completed_sa)
+                        self.console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
 
                 # Check for queued cron task firings
                 if self._qued_cron_prompts:
