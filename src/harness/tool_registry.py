@@ -200,7 +200,9 @@ TOOL_DEFS: List[ToolDef] = [
             description="Create an independent sub-agent to work on a task concurrently. "
                         "The sub-agent runs in the background and has its own conversation history, "
                         "context, and session - completely isolated from you. "
-                        "You'll be notified when it completes. Use send_agent_input to communicate with it.",
+                        "You'll be notified when it completes. "
+                        "To retrieve results: use get_agent_output(name) after completion. "
+                        "To check progress: use list_agents(name) while it runs.",
             params=[ToolParam("name", required=True,
                               description="A unique name for the sub-agent (used to reference it later)"),
                     ToolParam("task", required=True,
@@ -208,34 +210,37 @@ TOOL_DEFS: List[ToolDef] = [
     ToolDef("send_agent_input", category="agent",
             description="Send input/text to a sub-agent and get its response. "
                         "If the sub-agent is still running a previous task, this waits for it to complete "
-                        "first, then delivers the new input. Enables multi-turn conversation with sub-agents.",
+                        "first, then delivers the new input. Enables multi-turn conversation with sub-agents. "
+                        "To simply read a completed agent's output without starting a new turn, use get_agent_output(name).",
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent to send input to"),
                     ToolParam("input", required=True,
                               description="The input/text to send to the sub-agent")]),
     ToolDef("list_agents", category="agent",
-            description="List all sub-agents with their current status (running/completed/error). "
-                        "Optionally filter by name to get details on a specific sub-agent.",
-            params=[ToolParam("name",
-                              description="Optional: filter to a specific sub-agent by name")]),
+            description="Check the status of sub-agents. Returns each agent's current state "
+                        "(running/completed/error), how long it's been running, and a snippet of "
+                        "its latest output. This is the RIGHT tool to check on an agent's progress. "
+                        "Pass name='...' to check a specific agent.",
+            params=[ToolParam("name", required=False,
+                              description="Agent name to check. Omit to list all agents.")]),
     ToolDef("pause_agent", category="agent",
-            description="Pause a running sub-agent. Its state is saved for debugging.",
+            description="Pause a running sub-agent. Use list_agents() first to confirm it's still running.",
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent to pause")]),
     ToolDef("delete_agent", category="agent",
-            description="Delete a sub-agent completely. Cancels any running task and removes it. "
-                        "You MUST set confirm=True to proceed — this is destructive and irreversible.",
+            description="DANGER: Permanently destroy a sub-agent and erase all of its output. "
+                        "This is IRREVERSIBLE. Do NOT use this to check an agent's status or retrieve "
+                        "its results — use list_agents(name) for status and get_agent_output(name) for results instead. "
+                        "Only use this if you are certain you want to discard the agent permanently.",
             params=[ToolParam("name", required=True,
-                              description="The name of the sub-agent to delete"),
-                    ToolParam("confirm", required=True,
-                              description="Set to true to confirm deletion. Required as a safety guard.")]),
+                              description="The name of the sub-agent to permanently destroy")]),
     ToolDef("get_agent_output", category="agent",
-            description="Retrieve a completed sub-agent's full output without sending new input. "
-                        "Returns the cached TeeWriter buffer (all stdout) from the sub-agent's run. "
-                        "Does NOT start a new turn — unlike send_agent_input which sends input and "
-                        "waits for a response, this tool simply fetches the already-produced output.",
+            description="Retrieve the full output from a sub-agent that has completed. "
+                        "Returns the complete stdout log with all tool results. "
+                        "This is the RIGHT tool to get results from a finished agent. "
+                        "If the agent is still running, check list_agents(name) first to see its progress.",
             params=[ToolParam("name", required=True,
-                              description="The name of the sub-agent to retrieve output from")]),
+                              description="The name of the sub-agent whose output to retrieve")]),
     ToolDef("attempt_completion", category="agent",
             description="Signal that the task is complete and present the result to the user. "
                         "Use ONLY after confirming all previous tool uses succeeded. "

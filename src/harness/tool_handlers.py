@@ -2317,9 +2317,6 @@ class ToolHandlers:
         name = params.get("name", "").strip()
         if not name:
             return "Error: 'name' is required."
-        confirm = params.get("confirm", False)
-        if not confirm:
-            return "Error: 'confirm' must be set to true to delete a sub-agent. This is irreversible."
         if not self.sub_agent_manager:
             return "Error: Sub-agent system not initialized."
         if self.sub_agent_manager.delete(name):
