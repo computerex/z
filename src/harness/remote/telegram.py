@@ -1,15 +1,20 @@
 """Telegram remote input/output provider.
 
-Uses the Telegram Bot API via HTTP (no third-party library required beyond httpx).
-Polling-based: fetches new messages via getUpdates every second.
+Uses the Telegram Bot API via HTTP calls.  Polling runs in a **background
+thread** (``thread_based=True``) so that incoming messages are discovered even
+when the REPL loop is blocked on ``prompt_toolkit``.
+
+When a new message arrives, the polling thread:
+  1. Bridges the message into the asyncio queue via ``loop.call_soon_threadsafe``
+  2. Calls ``app.exit('')`` to unblock prompt_toolkit (same pattern as cron)
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
-from typing import Any, AsyncIterator, Optional
+import threading
+import time
+from typing import Any, Optional
 
 import httpx
 
@@ -19,7 +24,6 @@ log = logging.getLogger(__name__)
 
 _TELEGRAM_API = "https://api.telegram.org/bot"
 _MAX_MESSAGE_LEN = 4096  # Telegram's max message length
-_CHUNK_INTERVAL = 0.3  # seconds between sending streaming chunks
 
 
 def _split_long_message(text: str, max_len: int = _MAX_MESSAGE_LEN) -> list[str]:
@@ -42,14 +46,43 @@ def _split_long_message(text: str, max_len: int = _MAX_MESSAGE_LEN) -> list[str]
     return parts
 
 
+def _tg_api_call(token: str, method: str, **kwargs) -> dict[str, Any]:
+    """Synchronous call to Telegram Bot API.
+
+    Used by the background polling thread.  Not the asyncio path.
+    """
+    url = f"{_TELEGRAM_API}{token}/{method}"
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.post(url, json=kwargs)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                log.warning("Telegram API error: %s", data.get("description", "unknown"))
+            return data
+    except httpx.HTTPStatusError as e:
+        log.error("Telegram API HTTP error: %s", e)
+        return {"ok": False, "description": str(e)}
+    except httpx.TimeoutException:
+        log.warning("Telegram API timeout")
+        return {"ok": False, "description": "timeout"}
+    except Exception as e:
+        log.debug("Telegram API call failed: %s", e)
+        return {"ok": False, "description": str(e)}
+
+
 class TelegramProvider(RemoteProvider):
-    """Remote provider that connects to the Telegram Bot API."""
+    """Remote provider that connects to the Telegram Bot API.
+
+    Polling runs in a daemon thread so it works even when the REPL is
+    blocked on prompt_toolkit.
+    """
 
     def __init__(self, config: dict):
-        super().__init__(config)
+        super().__init__(config, thread_based=True)
         self._token: str = config["token"]
         self._allowed_chat_ids: set[str] = set()
-        self._http: httpx.AsyncClient | None = None
+        self._http_sync: httpx.Client | None = None
 
         # Parse allowed users from config
         raw_allowed = config.get("allowed_chat_ids", "")
@@ -62,107 +95,90 @@ class TelegramProvider(RemoteProvider):
         # Track last processed update_id to avoid duplicates
         self._last_update_id: int = 0
 
-        # Track streaming message IDs per chat
-        self._stream_msg_ids: dict[str, str] = {}
-
-        # Pending authentication requests: chat_id -> asyncio.Event
-        self._pending_auth: dict[str, asyncio.Event] = {}
+        # Pending authentication requests: chat_id -> threading.Event
+        self._pending_auth: dict[str, threading.Event] = {}
 
     @property
     def name(self) -> str:
         return "telegram"
 
-    async def _ensure_client(self):
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=10.0)
+    # ── Async API calls (used by send_message / send_chunk) ────────────
 
-    async def _api(self, method: str, **kwargs) -> dict[str, Any]:
-        """Call a Telegram Bot API method."""
-        await self._ensure_client()
-        url = f"{_TELEGRAM_API}{self._token}/{method}"
-        try:
-            r = await self._http.post(url, json=kwargs)
-            r.raise_for_status()
-            data = r.json()
+    def _sync_api(self, method: str, **kwargs) -> dict[str, Any]:
+        """Synchronous call to Telegram Bot API.
+
+        Used both by the polling thread and internally for sends.
+        """
+        return _tg_api_call(self._token, method, **kwargs)
+
+    # ── Thread-based polling ───────────────────────────────────────────
+
+    def _poll_thread(self):
+        """Synchronous generator — runs in a background daemon thread.
+
+        Long-polls ``getUpdates`` with a 10-second timeout, then yields
+        any messages found.
+        """
+        while True:
+            params: dict[str, Any] = {
+                "timeout": 10,
+                "allowed_updates": ["message"],
+            }
+            if self._last_update_id:
+                params["offset"] = self._last_update_id + 1
+
+            data = _tg_api_call(self._token, "getUpdates", **params)
             if not data.get("ok"):
-                log.warning("Telegram API error: %s", data.get("description", "unknown"))
-            return data
-        except httpx.HTTPStatusError as e:
-            log.error("Telegram API HTTP error: %s", e)
-            return {"ok": False, "description": str(e)}
-        except httpx.TimeoutException:
-            log.warning("Telegram API timeout")
-            return {"ok": False, "description": "timeout"}
-
-    async def _poll(self) -> AsyncIterator[RemoteMessage]:
-        """Poll getUpdates, yielding messages from allowed users."""
-        await self._ensure_client()
-
-        params: dict[str, Any] = {
-            "timeout": 10,
-            "allowed_updates": ["message"],
-        }
-        if self._last_update_id:
-            params["offset"] = self._last_update_id + 1
-
-        try:
-            r = await self._http.get(
-                f"{_TELEGRAM_API}{self._token}/getUpdates",
-                params=params,
-                timeout=12.0,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            log.debug("Telegram poll error: %s", e)
-            return
-
-        if not data.get("ok"):
-            return
-
-        for update in data.get("result", []):
-            upd_id = update.get("update_id", 0)
-            if upd_id > self._last_update_id:
-                self._last_update_id = upd_id
-
-            msg = update.get("message")
-            if not msg:
+                time.sleep(5)
                 continue
 
-            chat = msg.get("chat", {})
-            chat_id = str(chat.get("id", ""))
-            if not chat_id:
-                continue
+            for update in data.get("result", []):
+                upd_id = update.get("update_id", 0)
+                if upd_id > self._last_update_id:
+                    self._last_update_id = upd_id
 
-            text = msg.get("text", "").strip()
-            if not text:
-                continue
+                msg = update.get("message")
+                if not msg:
+                    continue
 
-            sender_id = str(msg.get("from", {}).get("id", chat_id))
+                chat = msg.get("chat", {})
+                chat_id = str(chat.get("id", ""))
+                if not chat_id:
+                    continue
 
-            yield RemoteMessage(
-                provider="telegram",
-                text=text,
-                sender_id=sender_id,
-                chat_id=chat_id,
-                message_id=str(msg.get("message_id", "")),
-                raw=msg,
-            )
+                text = msg.get("text", "").strip()
+                if not text:
+                    continue
+
+                sender_id = str(msg.get("from", {}).get("id", chat_id))
+
+                yield RemoteMessage(
+                    provider="telegram",
+                    text=text,
+                    sender_id=sender_id,
+                    chat_id=chat_id,
+                    message_id=str(msg.get("message_id", "")),
+                    raw=msg,
+                )
+
+    # ── Sending messages (called from asyncio side) ────────────────────
 
     async def send_message(self, chat_id: str, text: str) -> None:
         """Send a text message to the given chat."""
         for part in _split_long_message(text):
-            await self._api("sendMessage", chat_id=chat_id, text=part)
+            self._sync_api("sendMessage", chat_id=chat_id, text=part)
 
-    async def send_chunk(self, chat_id: str, text: str, message_id: Optional[str] = None) -> Optional[str]:
+    async def send_chunk(
+        self, chat_id: str, text: str, message_id: Optional[str] = None
+    ) -> Optional[str]:
         """Send or update a streaming chunk message.
 
         If *message_id* is provided, edit that existing message.
-        Returns the message_id of the message (for subsequent edits).
+        Returns the message_id (for subsequent edits).
         """
         if message_id:
             # Edit existing message
-            resp = await self._api(
+            resp = self._sync_api(
                 "editMessageText",
                 chat_id=chat_id,
                 message_id=int(message_id),
@@ -176,7 +192,7 @@ class TelegramProvider(RemoteProvider):
             return await self.send_chunk(chat_id, text, message_id=None)
         else:
             # Send new message
-            resp = await self._api(
+            resp = self._sync_api(
                 "sendMessage",
                 chat_id=chat_id,
                 text=text[:_MAX_MESSAGE_LEN],
@@ -186,11 +202,12 @@ class TelegramProvider(RemoteProvider):
                 return str(result.get("message_id", ""))
             return None
 
+    # ── Lifecycle ──────────────────────────────────────────────────────
+
     async def start(self):
-        """Start the provider and verify the bot token first."""
-        await self._ensure_client()
-        # Verify token
-        me = await self._api("getMe")
+        """Verify the bot token, then start the polling thread."""
+        # Verify token (synchronous — quick check)
+        me = _tg_api_call(self._token, "getMe")
         if not me.get("ok"):
             log.error(
                 "Telegram bot token is invalid. "
@@ -208,10 +225,14 @@ class TelegramProvider(RemoteProvider):
         # If no allowed_chat_ids configured, print a warning
         if not self._allowed_chat_ids:
             log.warning(
-                "No allowed_chat_ids configured! Any user who finds your bot can interact with it. "
-                "Set TELEGRAM_ALLOWED_CHAT_IDS env var or pass via --telegram-allow-list."
+                "No allowed_chat_ids configured! Any user who finds your bot "
+                "can interact with it. "
+                "Set TELEGRAM_ALLOWED_CHAT_IDS env var or pass via "
+                "--telegram-allow-list."
             )
         await super().start()
+
+    # ── Authorization ─────────────────────────────────────────────────
 
     def is_chat_allowed(self, chat_id: str) -> bool:
         """Check if a chat is authorized to interact with the bot."""
@@ -225,7 +246,7 @@ class TelegramProvider(RemoteProvider):
 
     async def send_auth_request(self, chat_id: str) -> bool:
         """Send an authentication request and wait for approval."""
-        await self._api(
+        self._sync_api(
             "sendMessage",
             chat_id=chat_id,
             text=(
@@ -237,18 +258,19 @@ class TelegramProvider(RemoteProvider):
             parse_mode="Markdown",
         )
         # Wait for approval (up to 5 minutes)
-        event = asyncio.Event()
+        event = threading.Event()
         self._pending_auth[chat_id] = event
         try:
-            await asyncio.wait_for(event.wait(), timeout=300)
-            return True
-        except asyncio.TimeoutError:
-            return False
+            # Wait in a thread so we don't block the event loop
+            import asyncio
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: event.wait(timeout=300)
+            )
         finally:
             self._pending_auth.pop(chat_id, None)
 
     def approve_pending(self, chat_id: str) -> bool:
-        """Approve a pending authorization request. Called from /telegram-auth command."""
+        """Approve a pending authorization request from /telegram-auth."""
         event = self._pending_auth.get(chat_id)
         if event:
             event.set()
