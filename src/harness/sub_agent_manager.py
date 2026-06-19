@@ -210,16 +210,41 @@ class SubAgentManager:
         return True
 
     def list(self) -> List[Dict[str, Any]]:
-        """Return info for all sub-agents."""
+        """Return info for all sub-agents, including a snippet of current output."""
         result = []
         for name, inst in self._agents.items():
             elapsed = time.time() - inst.created_at
+
+            # Read live output from the TeeWriter buffer
+            output_text = ""
+            if inst.tee:
+                try:
+                    output_text = inst.tee.getvalue() or ""
+                except Exception:
+                    output_text = ""
+            if not output_text:
+                output_text = inst.output or ""
+
+            # Truncate to a manageable snippet
+            output_snippet = ""
+            if output_text:
+                # For running agents: show the last N chars (most recent activity)
+                # For completed agents: show the first N chars (summary/result)
+                _MAX_SNIPPET = 500
+                if inst.status == "running" and len(output_text) > _MAX_SNIPPET:
+                    output_snippet = "[...] " + output_text[-_MAX_SNIPPET:]
+                elif len(output_text) > _MAX_SNIPPET:
+                    output_snippet = output_text[:_MAX_SNIPPET] + " [...]"
+                else:
+                    output_snippet = output_text
+
             result.append({
                 "name": name,
                 "status": inst.status,
                 "elapsed_seconds": int(elapsed),
-                "has_output": bool(inst.output),
+                "has_output": bool(output_text),
                 "completed": inst.status == "completed",
+                "output": output_snippet,
             })
         return result
 
