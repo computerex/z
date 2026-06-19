@@ -4,7 +4,6 @@
 import sys
 import os
 import time as _time_mod
-import traceback
 import warnings
 
 # Suppress Pydantic serialization warnings from LiteLLM
@@ -3404,10 +3403,15 @@ def main():
     remote_manager = None
     if args.telegram:
         try:
+            # Ensure the harness root is on sys.path so 'src' is importable
+            _root_dir = os.path.dirname(os.path.abspath(__file__))
+            if _root_dir not in sys.path:
+                sys.path.insert(0, _root_dir)
             from src.harness.remote.manager import RemoteInputManager
             from src.harness.remote.telegram import TelegramProvider
         except ImportError:
-            traceback.print_exc()
+            import traceback as _tb
+            _tb.print_exc()
             console.print(
                 "[red]Failed to import remote provider modules. "
                 "Make sure src/harness/remote/ package exists.[/red]"
