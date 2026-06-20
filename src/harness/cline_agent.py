@@ -165,38 +165,13 @@ _DSML_BLOCK_RE = re.compile(
 
 
 def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
-    """Check if text contains XML tool call patterns but no native tool call was made.
+    """Check if text contains DSML tool call patterns but no native tool call was made.
 
-    Only triggers on COMPLETE tool call structures to avoid false positives
-    from casual mentions of XML tags in thinking/reasoning content.
-
-    Detects patterns like:
-    - ``<invoke name="tool_name">...</invoke>``
-    - ``<tool_name><parameter ...>...</tool_name>``
-    - DSML tags (``<|DSML| |...|>`` / ``</|DSML| |...|>``)
-
-    Returns True if any tool-related XML pattern is found.
+    Only checks for DSML tags (``<|DSML| |...|>`` / ``</|DSML| |...|>``) —
+    these are the only reliable indicator that the model wrote XML tool
+    calls as plain text (native tool_calls marshalling failure).
     """
-    # Pattern 1: <invoke name="tool_name"> (opening tag is enough — if the model
-    # is writing invoke blocks, the tool call definitely failed upstream).
-    if re.search(r'<invoke\s+name=["\'](\w+)["\']', text):
-        return True
-
-    # Pattern 2: <tool_name>...</tool_name> with <parameter> inside
-    param_before = r'<parameter\s+name=["\'](\w+)["\']'
-    for tool_name in tool_names:
-        pat = re.compile(
-            rf'<{re.escape(tool_name)}\b[^>]*>.*?{param_before}.*?</{re.escape(tool_name)}>',
-            re.DOTALL,
-        )
-        if pat.search(text):
-            return True
-
-    # Pattern 3: any tag containing DSML (<|DSML| |...|>, </|DSML| |...|>)
-    if re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE):
-        return True
-
-    return False
+    return bool(re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE))
 
 
 def _strip_text_reasoning_tags(text: str) -> str:
