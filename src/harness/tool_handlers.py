@@ -381,42 +381,38 @@ class ToolHandlers:
         except Exception:
             pass
 
+    _mcp_sse_suppressor_installed = False
+
     def _mcp_suppress_reader_errors(self):
-        """Context manager that suppresses asyncio "Error in sse_reader" messages.
+        """Install a permanent asyncio exception handler that filters out
+        ``sse_reader`` errors from the MCP SDK's internal background task.
 
         The MCP SDK starts internal background reader tasks (``sse_reader``)
         that aren't properly awaited.  When the server closes the SSE connection,
-        the task crashes with a traceback printed by Python's asyncio event loop,
-        which looks scary even though our retry logic handles it transparently.
-
-        This context manager temporarily patches the event loop's exception
-        handler to filter out ``sse_reader``-related task failures.
+        the task crashes with a traceback printed by Python's asyncio event loop.
+        The handler is installed once and stays for the event loop's lifetime
+        (the sse_reader task outlives any single session creation context).
         """
-        class _Suppressor:
-            def __enter__(self2):
-                loop = asyncio.get_running_loop()
-                self2._orig = loop.get_exception_handler()
-                self2._loop = loop
-                loop.set_exception_handler(self2._handler)
-                return self2
-            def _handler(self2, loop, context):
-                task = context.get("task")
-                msg = context.get("message", "")
-                if task is not None and "sse_reader" in str(task):
-                    return  # Suppress — background reader crash handled by retry
-                if "sse_reader" in msg:
-                    return
-                # Pass through to original handler
-                orig = self2._orig
-                if orig is not None:
-                    orig(loop, context)
-                else:
-                    loop.default_exception_handler(context)
-            def __exit__(self2, *exc):
-                if hasattr(self2, "_loop") and hasattr(self2, "_orig"):
-                    self2._loop.set_exception_handler(self2._orig)
-                return False
-        return _Suppressor()
+        # Idempotent: install once.
+        if self._mcp_sse_suppressor_installed:
+            return
+        loop = asyncio.get_running_loop()
+        _orig = loop.get_exception_handler()
+
+        def _handler(loop, context):
+            task = context.get("task")
+            msg = context.get("message", "")
+            if task is not None and "sse_reader" in str(task):
+                return
+            if "sse_reader" in msg:
+                return
+            if _orig is not None:
+                _orig(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_handler)
+        self._mcp_sse_suppressor_installed = True
 
     async def _get_or_create_mcp_session(self, name: str, cfg: dict):
         if not HAS_MCP_SDK:
@@ -489,23 +485,23 @@ class ToolHandlers:
                 headers = {str(k): str(v) for k, v in headers_cfg.items()}
 
             if stype == "sse":
-                with self._mcp_suppress_reader_errors():
-                    cm = sse_client(url, headers=headers, timeout=20, sse_read_timeout=300)
-                    read_stream, write_stream = await cm.__aenter__()
-                    session_cm = ClientSession(read_stream, write_stream)
-                    session = await session_cm.__aenter__()
+                self._mcp_suppress_reader_errors()
+                cm = sse_client(url, headers=headers, timeout=20, sse_read_timeout=300)
+                read_stream, write_stream = await cm.__aenter__()
+                session_cm = ClientSession(read_stream, write_stream)
+                session = await session_cm.__aenter__()
+                try:
+                    await asyncio.wait_for(session.initialize(), timeout=20)
+                except Exception:
                     try:
-                        await asyncio.wait_for(session.initialize(), timeout=20)
+                        await session_cm.__aexit__(None, None, None)
                     except Exception:
-                        try:
-                            await session_cm.__aexit__(None, None, None)
-                        except Exception:
-                            pass
-                        try:
-                            await cm.__aexit__(None, None, None)
-                        except Exception:
-                            pass
-                        raise
+                        pass
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    raise
                 self._mcp_sessions[name] = {
                     "cfg_key": cfg_key,
                     "stype": stype,
