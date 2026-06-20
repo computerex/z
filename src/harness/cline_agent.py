@@ -197,6 +197,10 @@ def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
     if re.search(r'</(?:parameter|invoke)\b[^>]*>', text):
         return True
 
+    # Pattern 5: any tag containing DSML (<|DSML| |...|>, </|DSML| |...|>)
+    if re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE):
+        return True
+
     return False
 
 
