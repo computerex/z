@@ -167,15 +167,18 @@ _DSML_BLOCK_RE = re.compile(
 def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
     """Check if text contains XML tool call patterns but no native tool call was made.
 
+    Only triggers on COMPLETE tool call structures to avoid false positives
+    from casual mentions of XML tags in thinking/reasoning content.
+
     Detects patterns like:
     - ``<invoke name="tool_name">...</invoke>``
     - ``<tool_name><parameter ...>...</tool_name>``
-    - ``<parameter name="...">...</parameter>`` (tool parameter tags)
-    - Orphaned ``</parameter>`` or ``</invoke>`` closing tags
+    - DSML tags (``<|DSML| |...|>`` / ``</|DSML| |...|>``)
 
     Returns True if any tool-related XML pattern is found.
     """
-    # Pattern 1: <invoke name="tool_name">
+    # Pattern 1: <invoke name="tool_name"> (opening tag is enough — if the model
+    # is writing invoke blocks, the tool call definitely failed upstream).
     if re.search(r'<invoke\s+name=["\'](\w+)["\']', text):
         return True
 
@@ -189,15 +192,7 @@ def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
         if pat.search(text):
             return True
 
-    # Pattern 3: <parameter name="X">...</parameter> (tool param tags, even orphaned)
-    if re.search(param_before, text):
-        return True
-
-    # Pattern 4: orphaned </parameter> or </invoke> closing tags
-    if re.search(r'</(?:parameter|invoke)\b[^>]*>', text):
-        return True
-
-    # Pattern 5: any tag containing DSML (<|DSML| |...|>, </|DSML| |...|>)
+    # Pattern 3: any tag containing DSML (<|DSML| |...|>, </|DSML| |...|>)
     if re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE):
         return True
 
