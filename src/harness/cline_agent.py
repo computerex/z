@@ -1190,7 +1190,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     )
                     if msg.content != original:
                         sanitized_count += 1
-                        log.debug(
+                        log.warning(
                             "Sanitized message (role=%s): %s -> %s",
                             msg.role,
                             len(original),
@@ -2182,6 +2182,13 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     _tool_names_list = get_tool_names(model=self.config.model)
                     _detected_xml_tool_text = _text_has_xml_tool_patterns(
                         _response_visible_text, _tool_names_list
+                    )
+                    log.debug(
+                        "XML tool text detector: tool_calls=%s visible_len=%d detected=%s preview=%.200s",
+                        bool(response.tool_calls),
+                        len(_response_visible_text),
+                        _detected_xml_tool_text,
+                        _response_visible_text.replace("\n", " "),
                     )
 
                 # Wrap reasoning into full_content so the pipeline can see it.
