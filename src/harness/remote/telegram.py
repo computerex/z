@@ -153,7 +153,7 @@ def _tg_api_call(token: str, method: str, **kwargs) -> dict[str, Any]:
         log.error("Telegram API HTTP error: %s", e)
         return {"ok": False, "description": str(e)}
     except httpx.TimeoutException:
-        log.warning("Telegram API timeout")
+        log.debug("Telegram API timeout")
         return {"ok": False, "description": "timeout"}
     except Exception as e:
         log.debug("Telegram API call failed: %s", e)

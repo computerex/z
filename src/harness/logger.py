@@ -131,12 +131,20 @@ def init_logging(
     handler.setFormatter(fmt)
     root.addHandler(handler)
 
-    # Also log to stderr if HARNESS_DEBUG is set (useful during development)
+    # Suppress propagation to root logger — prevents Python's lastResort
+    # handler from printing WARNING+ messages to stderr.
+    root.propagate = False
+
+    # Stderr handler at ERROR level so severe issues are visible even when
+    # not running with HARNESS_DEBUG.  DEBUG/INFO/WARNING go to file only.
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setFormatter(fmt)
+    root.addHandler(stderr_handler)
+
+    # Also log to stderr at DEBUG level if HARNESS_DEBUG is set
     if os.environ.get("HARNESS_DEBUG"):
-        stderr_handler = logging.StreamHandler(sys.stderr)
         stderr_handler.setLevel(logging.DEBUG)
-        stderr_handler.setFormatter(fmt)
-        root.addHandler(stderr_handler)
 
     root.info(
         "=== Logging initialised === pid=%d python=%s log=%s",
