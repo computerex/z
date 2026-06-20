@@ -284,6 +284,7 @@ class CheckpointManager:
             # process spawns helpers that inherit stdout/stderr handles.
             kwargs = dict(
                 text=True,
+                errors="replace",  # Don't crash on non-ASCII in git output
                 cwd=self.workspace_path,
             )
             if capture:
@@ -352,12 +353,12 @@ class CheckpointManager:
                     )
                 except OSError:
                     pass
-            exclude_file.write_text("\n".join(exclude_parts) + "\n")
+            exclude_file.write_text("\n".join(exclude_parts) + "\n", encoding="utf-8")
 
             self._initialized = True
             return True
         except Exception as e:
-            log.error("Failed to initialize checkpoint repo: %s", e)
+            log.warning("Failed to initialize checkpoint repo: %s", e)
             return False
 
     # ── Snapshot operations ──────────────────────────────────────
