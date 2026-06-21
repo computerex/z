@@ -3021,6 +3021,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     f"  [dim]\u2022[/dim] [cyan]Get agent output[/cyan] [dim]{tool.parameters.get('name', '')}[/dim]"
                 )
 
+            elif tool.name == "CronCreate":
+                self.console.print(
+                    f"  [dim]•[/dim] [yellow]CronCreate[/yellow]"
+                )
+                result = await self.tool_handlers.cron_create(tool.parameters)
+
             elif tool.name == "CronDelete":
                 self.console.print(
                     f"  [dim]•[/dim] [yellow]CronDelete[/yellow]"
