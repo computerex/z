@@ -2158,7 +2158,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         _response_visible_text, _tool_names_list
                     )
                     log.debug(
-                        "XML tool text detector: tool_calls=%s visible_len=%d detected=%s preview=%.200s",
+                        "DSML tag detector: tool_calls=%s visible_len=%d detected=%s preview=%.200s",
                         bool(response.tool_calls),
                         len(_response_visible_text),
                         _detected_xml_tool_text,
@@ -2455,7 +2455,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     if _detected_xml_tool_text and _xml_tool_nudge_count < _XML_TOOL_NUDGE_MAX:
                         _xml_tool_nudge_count += 1
                         log.warning(
-                            "XML tool text detected in response (nudge %d/%d) — nudging for native tool call",
+                            "DSML tags detected in response (nudge %d/%d) — retrying",
                             _xml_tool_nudge_count,
                             _XML_TOOL_NUDGE_MAX,
                         )
@@ -2472,14 +2472,13 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             StreamingMessage(
                                 role="user",
                                 content=(
-                                    "Your previous response contained XML-formatted tool calls as plain text "
-                                    "but the native tool call API did not return them. "
-                                    "Please retry your tool call using the proper native tool calling format."
+                                    "Your previous response was not received correctly by the API. "
+                                    "Please retry what you were doing."
                                 ),
                             )
                         )
                         self.console.print(
-                            "  [dim]→ XML tool text detected in output. Nudging for native tool call...[/dim]"
+                            "  [dim]→ Model response not received correctly. Retrying...[/dim]"
                         )
                         continue
 
