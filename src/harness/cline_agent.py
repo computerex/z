@@ -165,13 +165,21 @@ _DSML_BLOCK_RE = re.compile(
 
 
 def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
-    """Check if text contains DSML tool call patterns but no native tool call was made.
+    """Check if text contains XML tool call patterns indicating a native
+    tool_calls marshalling failure.
 
-    Only checks for DSML tags (``<|DSML| |...|>`` / ``</|DSML| |...|>``) —
-    these are the only reliable indicator that the model wrote XML tool
-    calls as plain text (native tool_calls marshalling failure).
+    Two patterns are checked:
+    1. DSML tags (``<|DSML| |...|>`` / ``</|DSML| |...|>``) — DeepSeek models
+       emit these as reasoning markup that sometimes leaks into visible text.
+    2. Orphaned tool closing tags (``</parameter>``, ``</invoke>``,
+       ``</tool_call>``) — when the model writes XML tool calls as plain text
+       and the opening tags get consumed/stripped but closing tags remain.
     """
-    return bool(re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE))
+    if re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE):
+        return True
+    if re.search(r'</(?:parameter|invoke|tool_call)\b[^>]*>', text):
+        return True
+    return False
 
 
 def _strip_text_reasoning_tags(text: str) -> str:
