@@ -415,6 +415,12 @@ class ToolHandlers:
         self._mcp_sse_suppressor_installed = True
 
     async def _get_or_create_mcp_session(self, name: str, cfg: dict):
+        # Suppress noisy non-JSON-line errors from MCP SDK's background readers
+        # (e.g. when an MCP server prints timestamped log lines to stdout/SSE).
+        # Our retry logic handles transient failures transparently.
+        for _mcp_logger in ("mcp.client.stdio", "mcp.client.sse", "httpx_sse"):
+            logging.getLogger(_mcp_logger).setLevel(logging.ERROR)
+
         if not HAS_MCP_SDK:
             raise RuntimeError(
                 "MCP SDK is not installed. Install package 'mcp' to enable MCP server execution."
