@@ -1,35 +1,26 @@
-# Ignore virtual environments
-.venv/
-venv/
-ENV/
-env/
-
-# Ignore build artifacts (but not dist/ - needed for testing)
-build/
-*.egg-info/
-*.egg
-__pycache__/
+# Docker build context — exclude everything not needed at runtime
+__pycache__
 *.pyc
 *.pyo
-
-# Ignore git
-.git/
+.git
 .gitignore
-
-# Ignore IDE
-.vscode/
-.idea/
-
-# Ignore sessions and cache
-.sessions/
-.pytest_cache/
-
-# Ignore test artifacts
+.claude
+.forge
+.forge/sessions
+*.spec
+Dockerfile*
+build/
+dist/
+*.egg-info
+tickets/
+tests/
+torture_test/
+examples/
+cmd/
+*.md
+!README.md
+.venv
+venv
+node_modules
+.env
 *.log
-debug_output.txt
-test_output*.txt
-
-# Ignore large model files if any
-*.bin
-*.pt
-*.onnx

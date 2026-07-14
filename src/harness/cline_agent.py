@@ -392,6 +392,10 @@ class ClineAgent:
         self._memory_prompt: Optional[str] = None
         self._memory_prompt_loaded: bool = False
 
+        # Output protocol tracking
+        self._last_iteration_count: int = 0
+        self._output_schema: Optional[dict] = None
+
         # Tool handlers - delegates all tool execution logic
         self.tool_handlers = ToolHandlers(
             config=self.config,
@@ -1663,7 +1667,22 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
             _xml_tool_nudge_count = 0
             _XML_TOOL_NUDGE_MAX = 2  # max consecutive XML-tool-text nudges
             for iteration in range(self.max_iterations):
+                self._last_iteration_count = iteration
                 log.info("[WATCHDOG] Starting iteration %d", iteration + 1)
+
+                # Progress event: iteration start
+                try:
+                    from .output_protocol import emit_progress, set_iteration_count
+                    set_iteration_count(iteration + 1)
+                    ctx_tokens = estimate_messages_tokens(self.messages)
+                    emit_progress(
+                        "phase_start",
+                        phase="reasoning",
+                        iteration=iteration + 1,
+                        context_size=ctx_tokens,
+                    )
+                except Exception:
+                    pass
 
                 # (Re)create client if needed
                 log.debug("[WATCHDOG] Ensuring client...")

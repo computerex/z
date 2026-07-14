@@ -1,10 +1,30 @@
-FROM python:3.12-slim
+# ── Slim production runtime image for z/harness ─────────────────────────
+# Build:  docker build -f Dockerfile.z -t z:latest .
+# Run:    docker run --rm -v $PWD:/workspace -v ~/.z.json:/root/.z.json z --json "do something"
 
-# Z harness runtime
+# Stage 1: Build dependencies (cached layer)
+FROM python:3.12-slim AS builder
 WORKDIR /app
-COPY harness.py pyproject.toml requirements.txt /app/
+COPY pyproject.toml /app/
+# Install only runtime deps, no dev extras
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir $(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); print(' '.join(d['project']['dependencies']))") \
+    && pip install --no-cache-dir -e /app/ --no-deps
+
+# Stage 2: Minimal runtime image
+FROM python:3.12-slim AS runtime
+WORKDIR /app
+
+# Copy only what's needed at runtime
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY harness.py /app/
 COPY src/ /app/src/
-RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -e /app/
+COPY pyproject.toml /app/
+
+# Install the package (no deps — already in site-packages from builder)
+RUN pip install --no-cache-dir -e /app/ --no-deps
 
 # Config mounted at runtime, workspace at /workspace
+VOLUME ["/workspace"]
+WORKDIR /workspace
 ENTRYPOINT ["z"]

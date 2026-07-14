@@ -23,6 +23,17 @@ from .streaming_client import desanitize_think_tokens
 # Scheduled tasks tool handlers
 from .cron_tool_handlers import cron_create, cron_delete, cron_list
 
+# ── Output protocol file tracking ──────────────────────────────────────
+
+def _track_write(path: Path) -> None:
+    """Track a file write for the output protocol (--json mode)."""
+    try:
+        from .output_protocol import track_file_written, emit_progress
+        track_file_written(str(path))
+        emit_progress("writing_file", file=str(path), action="write")
+    except Exception:
+        pass
+
 try:
     from mcp import ClientSession, StdioServerParameters  # type: ignore
     from mcp.client.stdio import stdio_client  # type: ignore
@@ -758,6 +769,7 @@ class ToolHandlers:
         total = len(content)
         if total < self.LARGE_WRITE_FEEDBACK_THRESHOLD:
             path.write_text(content, encoding="utf-8")
+            _track_write(path)
             return
 
         self.console.print(f"[dim]   {action} {self._display_path(path)} ({total:,} chars)[/dim]")
@@ -774,7 +786,8 @@ class ToolHandlers:
                     next_report += 10
                     await asyncio.sleep(0)
         self.console.print("[dim]     ... 100%[/dim]")
-    
+        _track_write(path)
+
     async def _background_log_tailer(self, bg_id: int, proc: asyncio.subprocess.Process,
                                       log_path: str):
         """Continuously tail a log file for a background process.

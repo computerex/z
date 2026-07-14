@@ -110,7 +110,7 @@ _mark("stdlib_imports")
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from harness.config import Config
+from harness.config import Config, _merge_non_empty
 
 _mark("import_config")
 from harness.cline_agent import ClineAgent
@@ -3021,7 +3021,22 @@ async def run_single(
     user_label: Optional[str] = None,
 ) -> str:
     """Run a single user request."""
+    from harness.output_protocol import (
+        emit_progress, emit_json_result, emit_error,
+        reset_files_written, set_iteration_count,
+        classify_api_error, get_files_written, track_file_written,
+    )
+
     start_time = time.time()
+    reset_files_written()
+    set_iteration_count(0)
+
+    # Progress: phase starting
+    emit_progress("phase_start", phase="agent_run", agent_input=truncate(
+        user_label or (user_input if isinstance(user_input, str) else "[multimodal]"),
+        200,
+    ))
+
     log.debug(
         "run_single START input=%s",
         truncate(
@@ -3030,6 +3045,7 @@ async def run_single(
             120,
         ),
     )
+    error_info = None
     try:
         if isinstance(user_input, str):
             result = await agent.run(user_input)
@@ -3041,18 +3057,73 @@ async def run_single(
         log.warning("run_single cancelled after %.1fs", time.time() - start_time)
         console.print("\n  [yellow]Cancelled[/yellow]")
         result = "[Interrupted]"
+        error_info = classify_api_error(Exception("Request cancelled by user"))
+        emit_error(**error_info)
     except KeyboardInterrupt:
         log.warning(
             "run_single KeyboardInterrupt after %.1fs", time.time() - start_time
         )
         console.print("\n  [yellow]Interrupted[/yellow]")
         result = "[Interrupted]"
+        error_info = classify_api_error(Exception("Interrupted by user"))
+        emit_error(**error_info)
+    except Exception as e:
+        log_exception(log, "run_single failed", e)
+        error_info = classify_api_error(e)
+        emit_error(**error_info)
+        result = f"[Error: {str(e)[:500]}]"
 
     elapsed = time.time() - start_time
     log.info("run_single DONE elapsed=%.1fs result_len=%d", elapsed, len(result or ""))
 
     cost = get_global_tracker().get_summary()
     stats = agent.get_context_stats()
+
+    # ── Structured JSON output ─────────────────────────────────────────
+    emit_json_result(
+        status="completed" if error_info is None else "error",
+        result_text=result or "",
+        files_written=get_files_written(),
+        tokens_used=stats.get("tokens", 0),
+        iterations=getattr(agent, "_last_iteration_count", 0) or 0,
+        wall_ms=int(elapsed * 1000),
+        model=agent.config.model,
+        error=error_info,
+    )
+
+    # Progress: phase ended
+    emit_progress("phase_end", phase="agent_run", duration_ms=int(elapsed * 1000))
+
+    # ── Schema-driven output validation ──────────────────────────────────
+    _schema = getattr(agent, "_output_schema", None)
+    if _schema and not error_info:
+        from harness.output_protocol import validate_against_schema, fill_schema_gaps
+
+        _files = get_files_written()
+        for _f in _files:
+            _fp = Path(_f)
+            if _fp.suffix == ".json" and _fp.exists():
+                try:
+                    _data = json.loads(_fp.read_text(encoding="utf-8"))
+                    _valid, _issues = validate_against_schema(_data, _schema)
+                    if not _valid:
+                        _filled = fill_schema_gaps(_data, _schema)
+                        _fp.write_text(
+                            json.dumps(_filled, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        log.warning(
+                            "Schema validation: %s had %d gaps filled: %s",
+                            _f, len(_issues), ", ".join(_issues[:5]),
+                        )
+                        emit_progress(
+                            "schema_validation",
+                            file=_f,
+                            issues=len(_issues),
+                            filled=True,
+                        )
+                except (json.JSONDecodeError, IOError):
+                    pass
 
     if elapsed < 60:
         elapsed_str = f"{elapsed:.1f}s"
@@ -3101,11 +3172,23 @@ def main():
     )
     parser.add_argument("--api-url", help="API base URL (headless install)")
     parser.add_argument("--api-key", help="API key (headless install)")
-    parser.add_argument("--model", help="Model name (headless install)")
+    parser.add_argument("--model", help="Override model name (also works for regular runs)")
     parser.add_argument(
         "--workspace-config",
         action="store_true",
         help="Save config to workspace instead of global",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Emit structured JSON results on stdout (machine-readable mode)",
+    )
+    parser.add_argument(
+        "--schema",
+        default="",
+        dest="schema_path",
+        help="Path to schema.json for output validation (default: schema.json in workspace)",
     )
     parser.add_argument(
         "--policy-eval",
@@ -3298,6 +3381,12 @@ def main():
         args.new,
     )
 
+    # Build CLI overrides from flags (--model works for regular runs too)
+    _cli_overrides: Dict[str, Any] = {}
+    if args.model and not args.install:
+        _cli_overrides["model"] = args.model
+        log.info("CLI model override: %s", args.model)
+
     # Load providers from global config (~/.z.json)
     providers = load_providers(workspace)
     _mark("load_providers")
@@ -3309,19 +3398,20 @@ def main():
 
     # Determine starting config from the active global config file (~/.z.json).
     # Provider profiles are available via /provider use and /provider setup.
-    config = Config.from_json(workspace=Path(workspace))
+    config = Config.from_json(workspace=Path(workspace), overrides=_cli_overrides or None)
     if (not config.api_url or not config.api_key) and providers:
         first_name = sorted(providers.keys())[0]
         p = providers[first_name]
         config = Config.from_json(
             workspace=Path(workspace),
-            overrides={
-                "api_url": p.get("api_url", ""),
-                "api_key": p.get("api_key", ""),
-                "model": p.get("model", config.model),
-                "max_tokens": p.get("max_tokens", config.max_tokens),
-                "temperature": p.get("temperature", config.temperature),
-            },
+            overrides=_merge_non_empty(
+                {"api_url": p.get("api_url", ""),
+                 "api_key": p.get("api_key", ""),
+                 "model": p.get("model", config.model),
+                 "max_tokens": p.get("max_tokens", config.max_tokens),
+                 "temperature": p.get("temperature", config.temperature)},
+                _cli_overrides,
+            ),
         )
         log.info(
             "No active config found; bootstrapping from provider profile '%s'",
@@ -3370,6 +3460,23 @@ def main():
     )
     _mark("agent_created")
     log.info("Agent created")
+
+    # ── Output protocol initialization ──────────────────────────────────
+    # --json mode: structured JSON on stdout, NDJSON progress on stderr
+    # --schema: output validation against schema.json
+    from harness.output_protocol import init_output_protocol, load_schema
+
+    _schema_path = args.schema_path or os.path.join(workspace, "schema.json")
+    if os.path.exists(_schema_path):
+        agent._output_schema = load_schema(workspace)
+    else:
+        agent._output_schema = None
+    _json_mode = args.json_output
+    init_output_protocol(
+        json_mode=_json_mode,
+        workspace=workspace,
+        model=config.model,
+    )
 
     # Remote input/output manager (Telegram, Slack, etc.)
     remote_manager = None
