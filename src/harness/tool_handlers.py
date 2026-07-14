@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from rich.console import Console
 import psutil
 
+import logging
 from .context_management import truncate_file_content, truncate_output
 from .logger import get_logger, log_exception, truncate as log_truncate
 from .streaming_client import desanitize_think_tokens

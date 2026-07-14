@@ -163,20 +163,39 @@ _DSML_BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Raw XML tool-call tags — when native tool_calls fail, the model sometimes
+# outputs <tool_calls> / <invoke> / <parameter> as plain text instead of
+# using the native tool_calls API.  Strip these so they don't reach the user.
+# Full blocks first (with content), then orphaned opening/closing tags.
+_XML_TOOL_CALLS_BLOCK_RE = re.compile(
+    r"<tool_calls\b[^>]*>.*?</tool_calls>",
+    re.DOTALL,
+)
+_XML_TOOL_CALLS_TAG_RE = re.compile(
+    r"<[ /]*(?:tool_calls|invoke|parameter)\b[^>]*>",
+)
+
 
 def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
     """Check if text contains XML tool call patterns indicating a native
     tool_calls marshalling failure.
 
-    Two patterns are checked:
+    Three patterns are checked:
     1. DSML tags (``<|DSML| |...|>`` / ``</|DSML| |...|>``) — DeepSeek models
        emit these as reasoning markup that sometimes leaks into visible text.
-    2. Orphaned tool closing tags (``</parameter>``, ``</invoke>``,
+    2. Opening tool XML tags (``<tool_calls>``, ``<invoke name="...">``,
+       ``<parameter name="...">``) — when the model writes XML tool calls
+       as plain text instead of using native tool_calls.
+    3. Orphaned tool closing tags (``</parameter>``, ``</invoke>``,
        ``</tool_call>``) — when the model writes XML tool calls as plain text
        and the opening tags get consumed/stripped but closing tags remain.
     """
     if re.search(r'<[^>]*DSML[^>]*>', text, re.IGNORECASE):
         return True
+    # Opening tags: <tool_calls>, <invoke ...>, <parameter ...>
+    if re.search(r'<(?:tool_calls|invoke|parameter)\b[^>]*>', text):
+        return True
+    # Orphaned closing tags
     if re.search(r'</(?:parameter|invoke|tool_call)\b[^>]*>', text):
         return True
     return False
@@ -1375,6 +1394,112 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         after = estimate_messages_tokens(self.messages)
         return before - after
 
+    async def compact_by_llm(self) -> int:
+        """Compact conversation history by asking the model to produce a compressed summary.
+
+        Sends the full conversation to the model with a compaction prompt,
+        then replaces all messages after system message with the model's output.
+
+        Returns: number of tokens removed
+        """
+        before = estimate_messages_tokens(self.messages)
+
+        if len(self.messages) <= 1:
+            return 0
+
+        from .streaming_client import StreamingJSONClient
+
+        # Build compaction prompt
+        compact_prompt = (
+            "You are undergoing context compaction for this session. "
+            "Your task is to produce a comprehensive compacted summary of this conversation "
+            "that preserves EVERYTHING important needed to resume working after compaction.\n\n"
+            "Include:\n"
+            "1. The user's primary goals and what they're trying to accomplish\n"
+            "2. What has been done so far, including key decisions, commands run, and results\n"
+            "3. Current state of work (what's in progress, what's pending)\n"
+            "4. Important context: files read, errors encountered, analysis performed, data gathered\n"
+            "5. Important code snippets, configuration, or findings discovered\n"
+            "6. Active tasks/todos and their status\n"
+            "7. Open questions or issues that need resolution\n"
+            "8. Any assumptions or constraints established\n\n"
+            "IMPORTANT: Output ONLY the compacted session summary - no preamble, "
+            "no explanations about compaction, no meta-commentary. "
+            "Just the compacted content that will serve as the session history going forward. "
+            "Be thorough but concise. This summary will be the ONLY record of what happened "
+            "before this point, so nothing important can be omitted."
+        )
+
+        # Build messages for API call: current messages + compaction prompt
+        compact_messages = list(self.messages)
+        compact_messages.append(StreamingMessage(role="user", content=compact_prompt))
+
+        # Create client with same config
+        client = StreamingJSONClient(
+            api_key=self.config.api_key,
+            base_url=self.config.api_url,
+            model=self.config.model,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+        )
+        client.reasoning_effort = getattr(self.config, "reasoning_effort", "high")
+        await client.__aenter__()
+
+        try:
+            full_content = ""
+            full_reasoning = ""
+
+            def on_chunk(chunk: str):
+                nonlocal full_content
+                full_content += chunk
+
+            def on_reasoning(chunk: str):
+                nonlocal full_reasoning
+                full_reasoning += chunk
+
+            response = await client.chat_stream_raw(
+                messages=compact_messages,
+                on_content=on_chunk,
+                on_reasoning=on_reasoning,
+                check_interrupt=lambda: False,
+            )
+
+            compacted = response.content or full_content
+
+            if not compacted.strip():
+                # Fallback to simple truncation if model returns empty
+                log.warning("compact_by_llm: model returned empty content, falling back to truncation")
+                return self.compact_history("half")
+
+            # Preserve system message and replace everything else
+            system_msg = self.messages[0]
+            self.messages = [
+                system_msg,
+                StreamingMessage(
+                    role="user",
+                    content=f"[Session compacted]\n\n{compacted.strip()}",
+                ),
+            ]
+
+            log.info(
+                "compact_by_llm: replaced %d messages with compacted summary (%d chars)",
+                len(compact_messages) - 1,
+                len(compacted),
+            )
+
+        except Exception as exc:
+            log_exception(log, "compact_by_llm failed", exc)
+            log.warning("compact_by_llm failed: %s, falling back to naive truncation", exc)
+            return self.compact_history("half")
+        finally:
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+        after = estimate_messages_tokens(self.messages)
+        return before - after
+
     async def run_message(
         self,
         user_content: Union[str, List[Dict[str, Any]]],
@@ -2153,25 +2278,41 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         "", _response_visible_text
                     )
                     _response_visible_text = _response_visible_text.strip()
-                    # Also strip from full_content so the returned result is clean
-                    full_content = _response_visible_text
 
+                # ── XML tool text detection (BEFORE stripping tool_calls tags) ──
                 # Detect when native tool_calls failed but the model wrote
                 # XML tool calls as text — this indicates an upstream marshalling
-                # failure.  Nudge the model to retry in that case.
+                # failure.  We check the *pre-stripping* text so the detection
+                # can see the raw XML before we remove it for display.
                 _detected_xml_tool_text = False
-                if not response.tool_calls and _response_visible_text.strip():
+                _pre_strip_text = _response_visible_text.strip()
+                if not response.tool_calls and _pre_strip_text:
                     _tool_names_list = get_tool_names(model=self.config.model)
                     _detected_xml_tool_text = _text_has_xml_tool_patterns(
-                        _response_visible_text, _tool_names_list
+                        _pre_strip_text, _tool_names_list
                     )
                     log.debug(
                         "DSML tag detector: tool_calls=%s visible_len=%d detected=%s preview=%.200s",
                         bool(response.tool_calls),
-                        len(_response_visible_text),
+                        len(_pre_strip_text),
                         _detected_xml_tool_text,
-                        _response_visible_text.replace("\n", " "),
+                        _pre_strip_text.replace("\n", " "),
                     )
+
+                # ── Unconditional tool-call tag strip ──
+                # Strip raw XML tool-call tags (<tool_calls>, <invoke>, <parameter>)
+                # that leak when native tool_calls marshalling fails.  This runs
+                # AFTER detection so the nudge system can see the raw XML first.
+                if _response_visible_text.strip():
+                    _response_visible_text = _XML_TOOL_CALLS_BLOCK_RE.sub(
+                        "", _response_visible_text
+                    )
+                    _response_visible_text = _XML_TOOL_CALLS_TAG_RE.sub(
+                        "", _response_visible_text
+                    )
+                    _response_visible_text = _response_visible_text.strip()
+                    # Also strip from full_content so the returned result is clean
+                    full_content = _response_visible_text
 
                 # Wrap reasoning into full_content so the pipeline can see it.
                 # Only when native reasoning was used — for text-based models

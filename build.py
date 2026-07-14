@@ -105,11 +105,12 @@ EXCLUDES = [
     "sphinx",
     "pytest",
     "pytest_asyncio",
-    # Heavy ML packages - uncomment if not needed
-    # "torch",
-    # "transformers", 
-    # "sentence_transformers",
-    # "numpy",
+    # Heavy ML packages - not needed (keyword/rule based fallbacks used)
+    "torch",
+    "transformers",
+    "sentence_transformers",
+    "numpy",
+    "sklearn",
 ]
 
 

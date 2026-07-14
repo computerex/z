@@ -1,29 +1,21 @@
 """
-Local cross-encoder for memory relevance ranking.
+Keyword-based memory relevance ranking.
 
-Uses sentence-transformers cross-encoder models to rank memory files
-by relevance to a user query. Falls back to simple keyword overlap
-when the model is unavailable.
+Uses simple keyword overlap (TF-weighted Jaccard) to rank memory files
+by relevance to a user query. No ML dependencies needed.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default model — small, fast, good for relevance scoring
-DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-# Fallback model if default is too large
-FALLBACK_MODEL = "cross-encoder/ms-marco-TinyBERT-L-2-v2"
 # Max memories to return
 MAX_MEMORIES = 5
-# Min score to include (0-1, cross-encoder produces logits not normalized)
-# We use a softmin approach instead
 
 
 @dataclass
@@ -36,49 +28,8 @@ class MemoryCandidate:
     score: float = 0.0
 
 
-class CrossEncoderRanker:
-    """Ranks memory files by relevance to a query using a local cross-encoder."""
-
-    def __init__(self, model_name: str = DEFAULT_MODEL):
-        self.model_name = model_name
-        self._model = None
-        self._tokenizer = None
-
-    @property
-    def available(self) -> bool:
-        """Check if the cross-encoder model is available."""
-        if self._model is not None:
-            return True
-        try:
-            self._lazy_load()
-            return self._model is not None
-        except Exception:
-            return False
-
-    def _lazy_load(self):
-        """Lazy-load the cross-encoder model."""
-        if self._model is not None:
-            return
-
-        for candidate in [self.model_name, FALLBACK_MODEL]:
-            try:
-                from sentence_transformers import CrossEncoder
-
-                self._model = CrossEncoder(candidate)
-                self.model_name = candidate
-                logger.debug(
-                    "Loaded cross-encoder model: %s", candidate
-                )
-                return
-            except Exception as e:
-                logger.debug(
-                    "Failed to load cross-encoder %s: %s", candidate, e
-                )
-                continue
-
-        logger.warning(
-            "No cross-encoder model available — will use keyword fallback"
-        )
+class KeywordRanker:
+    """Ranks memory files by relevance to a query using keyword overlap."""
 
     def rank(
         self,
@@ -86,7 +37,7 @@ class CrossEncoderRanker:
         candidates: List[MemoryCandidate],
         top_k: int = MAX_MEMORIES,
     ) -> List[MemoryCandidate]:
-        """Rank memory candidates by relevance to the query.
+        """Rank memory candidates by keyword overlap with the query.
 
         Args:
             query: The user's input text.
@@ -99,47 +50,15 @@ class CrossEncoderRanker:
         if not candidates:
             return []
 
-        self._lazy_load()
+        return self._rank_keyword(query, candidates, top_k)
 
-        if self._model is not None:
-            return self._rank_with_model(query, candidates, top_k)
-        else:
-            return self._rank_keyword(query, candidates, top_k)
-
-    def _rank_with_model(
-        self,
-        query: str,
-        candidates: List[MemoryCandidate],
-        top_k: int,
-    ) -> List[MemoryCandidate]:
-        """Rank using cross-encoder model."""
-        # Build pairs: (query, memory_description + content_preview)
-        pairs = [
-            (query, f"{c.description}: {c.content_preview}"[:512])
-            for c in candidates
-        ]
-
-        try:
-            scores = self._model.predict(pairs, show_progress_bar=False)
-
-            for i, candidate in enumerate(candidates):
-                # scores are logits — normalize via sigmoid-ish scaling
-                candidate.score = float(scores[i])
-
-            candidates.sort(key=lambda c: c.score, reverse=True)
-            return candidates[:top_k]
-
-        except Exception as e:
-            logger.debug("Cross-encoder prediction failed: %s", e)
-            return self._rank_keyword(query, candidates, top_k)
-
+    @staticmethod
     def _rank_keyword(
-        self,
         query: str,
         candidates: List[MemoryCandidate],
         top_k: int,
     ) -> List[MemoryCandidate]:
-        """Fallback ranking using keyword overlap (TF-weighted)."""
+        """Rank using keyword overlap (TF-weighted)."""
         # Tokenize query into lowercase words, filter stopwords
         stopwords = {
             "a", "an", "the", "is", "are", "was", "were", "be", "been",
@@ -184,14 +103,14 @@ class CrossEncoderRanker:
 
 
 # Module-level singleton with lazy init
-_ranker: Optional[CrossEncoderRanker] = None
+_ranker: Optional[KeywordRanker] = None
 
 
-def get_ranker(model_name: str = DEFAULT_MODEL) -> CrossEncoderRanker:
-    """Get or create the global cross-encoder ranker."""
+def get_ranker() -> KeywordRanker:
+    """Get or create the global keyword ranker."""
     global _ranker
     if _ranker is None:
-        _ranker = CrossEncoderRanker(model_name)
+        _ranker = KeywordRanker()
     return _ranker
 
 

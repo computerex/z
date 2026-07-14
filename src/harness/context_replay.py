@@ -12,11 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
-
 from .context_management import estimate_tokens
 from .smart_context import SmartContextManager
 from .todo_manager import TodoManager
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except Exception:
+    np = None  # type: ignore
+    HAS_NUMPY = False
 
 try:
     from sklearn.ensemble import RandomForestClassifier
@@ -191,6 +196,8 @@ def build_training_matrix(
     use_embeddings: bool = True,
     embedding_backend: str = AUTO_BACKEND,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    if not HAS_NUMPY:
+        raise RuntimeError("numpy not installed; cannot build training matrix.")
     x_meta = _metadata_features(nodes)
     backend_used = "none"
     if use_embeddings:
@@ -257,6 +264,8 @@ def train_fast_ensemble(
 ) -> Dict[str, Any]:
     if not HAS_SKLEARN:
         raise RuntimeError("scikit-learn not installed; cannot train classifiers.")
+    if not HAS_NUMPY:
+        raise RuntimeError("numpy not installed; cannot train classifiers.")
     if not nodes:
         raise RuntimeError("No nodes to train on.")
 
@@ -357,7 +366,7 @@ def run_replay(
         per_dump[str(path)] = {
             "nodes": len(ns),
             "guidance_nodes": sum(1 for n in ns if n.msg_type == "guidance_nudge"),
-            "avg_tokens": float(np.mean([n.tokens for n in ns])) if ns else 0.0,
+            "avg_tokens": float(sum(n.tokens for n in ns) / len(ns)) if ns else 0.0,
         }
 
     out: Dict[str, Any] = {

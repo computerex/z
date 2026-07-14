@@ -117,7 +117,6 @@ from harness.cline_agent import ClineAgent
 
 _mark("import_cline_agent")
 from harness.sub_agent_manager import SubAgentManager
-from harness.checkpoint import CheckpointManager
 from harness.cost_tracker import get_global_tracker, reset_global_tracker
 from harness.logger import (
     init_logging,
@@ -2633,8 +2632,6 @@ class HarnessCompleter(Completer):
         "/mcp",
         "/compactthresh",
         "/help",
-        "/undo",
-        "/redo",
         "/-",
         "/exit",
         "/quit",
@@ -2768,16 +2765,8 @@ class HarnessCompleter(Completer):
                             display=sub,
                         )
             elif parts[0] == "/compact":
-                # Complete compact strategies
-                strategies = ["half", "quarter", "last2"]
-                prefix = parts[-1]
-                for strat in strategies:
-                    if strat.startswith(prefix):
-                        yield Completion(
-                            strat,
-                            start_position=-len(prefix),
-                            display=strat,
-                        )
+                # LLM-based compaction — no strategies needed
+                return
             elif parts[0] == "/index":
                 # Complete index subcommands
                 subcommands = ["rebuild", "tree"]
@@ -2840,8 +2829,6 @@ def create_prompt_session(
     on_paste_image_marker: Optional[Callable[[], Optional[str]]] = None,
     on_open_provider_picker: Optional[Callable[[], None]] = None,
     on_open_model_picker: Optional[Callable[[], None]] = None,
-    on_undo: Optional[Callable[[], None]] = None,
-    on_redo: Optional[Callable[[], None]] = None,
     on_toggle_reasoning: Optional[Callable[[], str]] = None,
 ) -> "PromptSession":
     """Create a prompt session with multiline support.
@@ -2851,8 +2838,6 @@ def create_prompt_session(
     - Ctrl+Enter: Insert newline (for multiline input)
     - Paste: Multiline paste works automatically
     - Tab: Accept ghost text suggestion, or complete commands and file paths
-    - Ctrl+Z: Undo last turn (when prompt is empty)
-    - Ctrl+Y: Redo (when prompt is empty)
     - Ctrl+T: Toggle reasoning effort
     """
     if not HAS_PROMPT_TOOLKIT:
@@ -2902,24 +2887,6 @@ def create_prompt_session(
                 pt_run_in_terminal(on_open_model_picker)
             else:
                 on_open_model_picker()
-
-    @bindings.add("c-z")
-    def _(event):
-        """Ctrl+Z: undo last turn (when prompt is empty)."""
-        if event.current_buffer.text.strip() == "" and on_undo:
-            # Submit /undo as the command
-            event.current_buffer.text = "/undo"
-            event.current_buffer.validate_and_handle()
-        else:
-            # Let normal undo work when there's text being edited
-            event.current_buffer.undo()
-
-    @bindings.add("c-y")
-    def _(event):
-        """Ctrl+Y: redo last turn (when prompt is empty)."""
-        if event.current_buffer.text.strip() == "" and on_redo:
-            event.current_buffer.text = "/redo"
-            event.current_buffer.validate_and_handle()
 
     @bindings.add("c-t", eager=True)
     def _(event):
@@ -3442,14 +3409,6 @@ def main():
             )
             sys.exit(1)
 
-    # Checkpoint manager for undo/redo
-    checkpoint_mgr = CheckpointManager(workspace)
-    checkpoint_mgr._workspace_index = agent.workspace_index
-    agent.checkpoint_mgr = checkpoint_mgr
-    if not checkpoint_mgr._check_git():
-        console.print("  [dim]git not found — /undo and /redo disabled[/dim]")
-    _mark("checkpoint_mgr")
-
     # Session management
     current_session = args.session
     session_path = get_session_path(workspace, current_session)
@@ -3589,8 +3548,6 @@ def main():
                 on_paste_image_marker=_prompt_paste_image_marker,
                 on_open_provider_picker=_open_provider_picker_ui,
                 on_open_model_picker=_open_model_picker_ui,
-                on_undo=lambda: True,  # Ctrl+Z submits "/undo" text
-                on_redo=lambda: True,  # Ctrl+Y submits "/redo" text
                 on_toggle_reasoning=_toggle_reasoning_effort,
             )
             if HAS_PROMPT_TOOLKIT
@@ -4080,7 +4037,7 @@ def main():
                         debug_print("/clear: about to continue...")
                         continue
 
-                    elif cmd in ("/pop", "/undo"):
+                    elif cmd == "/pop":
                         count = int(cmd_arg) if cmd_arg and cmd_arg.isdigit() else 1
                         removed = agent.pop_last_messages(count)
                         if removed > 0:
@@ -4335,14 +4292,19 @@ def main():
                         continue
 
                     elif cmd == "/compact":
-                        strategy = cmd_arg.strip() if cmd_arg else "half"
                         before = agent.get_token_count()
-                        removed = agent.compact_history(strategy)
+                        msg_count = len(agent.messages)
+                        console.print("  [dim]Compacting session with LLM...[/dim]")
+                        removed = loop.run_until_complete(agent.compact_by_llm())
                         after = agent.get_token_count()
+                        new_msg_count = len(agent.messages)
+                        _msg_label = "messages" if msg_count != 1 else "message"
+                        _new_label = "messages" if new_msg_count != 1 else "message"
                         console.print(
                             f"  [green]\u2713[/green] Compacted [bold]{before:,}[/bold] \u2192 [bold]{after:,}[/bold] tokens [dim](-{removed:,})[/dim]"
+                            f"\n  [dim]{msg_count} {_msg_label} \u2192 {new_msg_count} {_new_label}[/dim]"
                         )
-                        _echo_remote(f"Compacted: {before:,} → {after:,} tokens (-{removed:,})")
+                        _echo_remote(f"Compacted: {before:,} \u2192 {after:,} tokens (-{removed:,})")
                         continue
 
                     elif cmd == "/todo":
@@ -4918,134 +4880,6 @@ def main():
                             _echo_remote(f"Log: {size_kb:.0f} KB, showing last {n} lines (see terminal)")
                         continue
 
-                    elif cmd == "/undo":
-                        if not checkpoint_mgr.can_undo():
-                            console.print("  [dim]Nothing to undo[/dim]")
-                            continue
-                        result = checkpoint_mgr.undo(agent.messages)
-                        if result is None:
-                            console.print("  [red]Undo failed[/red]")
-                            continue
-                        cp, diff, restored_msgs = result
-                        agent.messages = restored_msgs
-                        # Show summary
-                        n_files = (
-                            len(diff.files_modified)
-                            + len(diff.files_added)
-                            + len(diff.files_deleted)
-                        )
-                        parts = []
-                        if diff.files_modified:
-                            parts.append(f"{len(diff.files_modified)} modified")
-                        if diff.files_added:
-                            parts.append(f"{len(diff.files_added)} added")
-                        if diff.files_deleted:
-                            parts.append(f"{len(diff.files_deleted)} deleted")
-                        file_summary = ", ".join(parts) if parts else "no file changes"
-                        console.print(
-                            f"  [red]\u21b6[/red] [bold]Undone[/bold] \u2014 restored {file_summary}"
-                        )
-                        if n_files > 0:
-                            for f in (
-                                diff.files_modified
-                                + diff.files_added
-                                + diff.files_deleted
-                            )[:8]:
-                                console.print(f"    [dim]{f}[/dim]")
-                            remaining = n_files - 8
-                            if remaining > 0:
-                                console.print(f"    [dim]...and {remaining} more[/dim]")
-                        console.print(f"  [dim]Request was: {cp.user_input}[/dim]")
-                        if checkpoint_mgr.can_redo():
-                            console.print(
-                                "  [dim]Type [white]/redo[/white] to re-apply[/dim]"
-                            )
-                        _echo_remote(f"Undone: restored {file_summary}")
-                        continue
-                        result = checkpoint_mgr.undo(agent.messages)
-                        if result is None:
-                            console.print("  [red]Undo failed[/red]")
-                            continue
-                        cp, diff, restored_msgs = result
-                        agent.messages = restored_msgs
-                        # Show summary
-                        n_files = (
-                            len(diff.files_modified)
-                            + len(diff.files_added)
-                            + len(diff.files_deleted)
-                        )
-                        parts = []
-                        if diff.files_modified:
-                            parts.append(f"{len(diff.files_modified)} modified")
-                        if diff.files_added:
-                            parts.append(f"{len(diff.files_added)} added")
-                        if diff.files_deleted:
-                            parts.append(f"{len(diff.files_deleted)} deleted")
-                        file_summary = ", ".join(parts) if parts else "no file changes"
-                        console.print(
-                            f"  [green]\u21b6[/green] [bold]Undone[/bold] \u2014 reverted {file_summary}"
-                        )
-                        if (
-                            diff.files_modified
-                            or diff.files_added
-                            or diff.files_deleted
-                        ):
-                            for f in (
-                                diff.files_modified
-                                + diff.files_added
-                                + diff.files_deleted
-                            )[:8]:
-                                console.print(f"    [dim]{f}[/dim]")
-                            remaining = n_files - 8
-                            if remaining > 0:
-                                console.print(f"    [dim]...and {remaining} more[/dim]")
-                        console.print(f"  [dim]Request was: {cp.user_input}[/dim]")
-                        if checkpoint_mgr.can_redo():
-                            console.print(
-                                "  [dim]Type [white]/redo[/white] to re-apply[/dim]"
-                            )
-                        continue
-
-                    elif cmd == "/redo":
-                        if not checkpoint_mgr.can_redo():
-                            console.print("  [dim]Nothing to redo[/dim]")
-                            continue
-                        result = checkpoint_mgr.redo(agent.messages)
-                        if result is None:
-                            console.print("  [red]Redo failed[/red]")
-                            continue
-                        cp, diff, restored_msgs = result
-                        agent.messages = restored_msgs
-                        n_files = (
-                            len(diff.files_modified)
-                            + len(diff.files_added)
-                            + len(diff.files_deleted)
-                        )
-                        parts = []
-                        if diff.files_modified:
-                            parts.append(f"{len(diff.files_modified)} modified")
-                        if diff.files_added:
-                            parts.append(f"{len(diff.files_added)} added")
-                        if diff.files_deleted:
-                            parts.append(f"{len(diff.files_deleted)} deleted")
-                        file_summary = ", ".join(parts) if parts else "no file changes"
-                        console.print(
-                            f"  [green]\u21b7[/green] [bold]Redone[/bold] \u2014 restored {file_summary}"
-                        )
-                        if (
-                            diff.files_modified
-                            or diff.files_added
-                            or diff.files_deleted
-                        ):
-                            for f in (
-                                diff.files_modified
-                                + diff.files_added
-                                + diff.files_deleted
-                            )[:8]:
-                                console.print(f"    [dim]{f}[/dim]")
-                        _echo_remote(f"Redo: restored {file_summary}")
-                        continue
-
                     elif cmd in ("/help", "/-"):
                         console.print()
                         console.print("  [bold]Chat[/bold]")
@@ -5056,13 +4890,7 @@ def main():
                             "  [cyan]/clear[/cyan]               [dim]Clear conversation history[/dim]"
                         )
                         console.print(
-                            "  [cyan]/compact[/cyan] [dim][strategy][/dim]   [dim]Compact context (half/quarter/last2)[/dim]"
-                        )
-                        console.print(
-                            "  [cyan]/undo[/cyan]                [dim]Undo last turn (files + conversation)[/dim]"
-                        )
-                        console.print(
-                            "  [cyan]/redo[/cyan]                [dim]Redo undone turn[/dim]"
+                            "  [cyan]/compact[/cyan]              [dim]Compact session via LLM (preserves important context)[/dim]"
                         )
                         console.print(
                             "  [cyan]/pop[/cyan] [dim][n][/dim]             [dim]Remove last n messages (default: 1)[/dim]"
@@ -5194,12 +5022,6 @@ def main():
                                 "  [cyan]Ctrl+V[/cyan]               [dim]Paste clipboard image[/dim]"
                             )
                             console.print(
-                                "  [cyan]Ctrl+Z[/cyan]               [dim]Undo last turn[/dim]"
-                            )
-                            console.print(
-                                "  [cyan]Ctrl+Y[/cyan]               [dim]Redo[/dim]"
-                            )
-                            console.print(
                                 "  [cyan]Ctrl+T[/cyan]               [dim]Toggle reasoning effort[/dim]"
                             )
                         console.print()
@@ -5316,19 +5138,6 @@ def main():
                             )
                 except Exception as e:
                     debug_print(f"Memory recall failed: {e}")
-
-                # Take checkpoint before each agent turn for undo/redo
-                try:
-                    _cp_input = multimodal_label or (
-                        user_input if isinstance(user_input, str) else "[multimodal]"
-                    )
-                    checkpoint_mgr.take_snapshot(
-                        _cp_input,
-                        len(agent.messages),
-                        model=agent.config.model,
-                    )
-                except Exception as _cp_err:
-                    log.warning("Checkpoint snapshot failed: %s", _cp_err)
 
                 # Start watchdog timer to detect hangs
                 import threading

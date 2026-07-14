@@ -202,6 +202,12 @@ def _normalize_model_name(model: str, base_url: str = "") -> str:
       - anthropic/claude-3-5-sonnet-20241022
       - openai/gpt-4o
       - together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo
+
+    Detection order:
+      1. If model already has a known provider prefix (anthropic/...), use it.
+      2. If model name matches a known model family (claude-*, gpt-*, etc.),
+         infer the provider from the name.
+      3. Fall back to base URL detection.
     """
     # If already has provider prefix, return as-is
     if model.count("/") >= 1 and not model.startswith("http"):
@@ -223,6 +229,21 @@ def _normalize_model_name(model: str, base_url: str = "") -> str:
             ]
             if provider.lower() in known_providers:
                 return model
+
+    # ── Model-name-based detection ──────────────────────────────────────
+    # When the model name clearly identifies its provider, use that
+    # regardless of the configured base URL.  This prevents a DeepSeek
+    # base_url from misrouting claude-* models to DeepSeek's
+    # Anthropic-compatible endpoint.
+    model_lower = model.lower()
+    if model_lower.startswith("claude-"):
+        return f"anthropic/{model}"
+    if model_lower.startswith(
+        ("gpt-", "o1-", "o3-", "chatgpt-", "dall-e-")
+    ):
+        return f"openai/{model}"
+    if model_lower.startswith("gemini-"):
+        return f"openai/{model}"
 
     # Detect provider from base_url
     url = (base_url or "").lower()
@@ -440,8 +461,15 @@ class StreamingJSONClient:
         # Strategy: mark the system message (position 0 — the largest and
         # most static payload) and the *last* tool-result message so that
         # subsequent turns benefit from cached prefix computation.
-        # LiteLLM's `drop_params=True` ensures non-Anthropic providers
-        # silently ignore these markers.
+        #
+        # IMPORTANT: cache_control must be placed at the correct nesting
+        # level so LiteLLM's Anthropic provider places it on the final
+        # Anthropic-format content blocks (text / tool_result / etc.).
+        # Setting it at the message level (dict key) lets LiteLLM's
+        # translate_system_message / convert_to_anthropic_tool_result
+        # transfer it to the right Anthropic content block.  Placing it
+        # on a nested inner text block inside a tool_result's content
+        # array causes Anthropic to silently ignore it.
         _litellm_model_lower = self.litellm_model.lower()
         _is_anthropic = _litellm_model_lower.startswith(
             "anthropic/"
@@ -451,15 +479,11 @@ class StreamingJSONClient:
             sys_msg = litellm_messages[0]
             sys_content = sys_msg.get("content", "")
             if isinstance(sys_content, str) and sys_content:
-                sys_msg["content"] = [
-                    {
-                        "type": "text",
-                        "text": sys_content,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
+                # Set at message level — translate_system_message picks it
+                # up and places it on the Anthropic system text block.
+                sys_msg["cache_control"] = {"type": "ephemeral"}
             elif isinstance(sys_content, list) and sys_content:
-                # Already an array of blocks — just tag the last one.
+                # Already an array of blocks — tag the last one in-place.
                 sys_content[-1]["cache_control"] = {"type": "ephemeral"}
 
             # --- last tool-result message (helps cache tool outputs) ---
@@ -467,13 +491,15 @@ class StreamingJSONClient:
                 if litellm_messages[_i].get("role") == "tool":
                     _tc = litellm_messages[_i].get("content", "")
                     if isinstance(_tc, str) and _tc:
-                        litellm_messages[_i]["content"] = [
-                            {
-                                "type": "text",
-                                "text": _tc,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ]
+                        # Set at message level — convert_to_anthropic_tool_result
+                        # picks it up and places it on the tool_result block
+                        # (the correct Anthropic content block for caching).
+                        litellm_messages[_i]["cache_control"] = {
+                            "type": "ephemeral"
+                        }
+                    elif isinstance(_tc, list) and _tc:
+                        # Already list-form content — tag last inner block.
+                        _tc[-1]["cache_control"] = {"type": "ephemeral"}
                     break  # only tag the *last* tool result
 
         # Build request kwargs
@@ -514,11 +540,19 @@ class StreamingJSONClient:
             kwargs["clear_thinking"] = False
 
         # Pass reasoning_effort for providers that support it (e.g. OpenAI o-series).
-        # For Anthropic, LiteLLM translates this to `thinking: {type: "adaptive"}`
-        # (extended thinking mode) which IS valid — but requires temperature=1.
-        # LiteLLM's drop_params=True will strip it for truly unsupported providers.
+        # For Anthropic, LiteLLM 1.83 translates this to `thinking: {type: "enabled"}`
+        # but claude-opus-4-8+ requires `thinking: {type: "adaptive"}` with
+        # `output_config: {effort: ...}`.  Handle Anthropic explicitly here.
         if self.reasoning_effort and self.reasoning_effort != "none":
-            kwargs["reasoning_effort"] = self.reasoning_effort
+            if _is_anthropic:
+                # Map reasoning_effort to Anthropic's adaptive thinking format.
+                # Adaptive mode manages budget automatically based on effort level.
+                _effort_map = {"low": "low", "medium": "medium", "high": "high"}
+                effort = _effort_map.get(self.reasoning_effort, "medium")
+                kwargs["thinking"] = {"type": "adaptive"}
+                kwargs["output_config"] = {"effort": effort}
+            else:
+                kwargs["reasoning_effort"] = self.reasoning_effort
 
         # Add API key
         if self.api_key:
