@@ -580,13 +580,15 @@ class StreamingJSONClient:
             kwargs["tools"] = tools
 
         # Add response_format for grammar-constrained JSON decoding.
-        # When set, LiteLLM translates this for each provider:
-        #   - OpenAI: {"type": "json_object"} or {"type": "json_schema", ...}
-        #   - Anthropic: LiteLLM 1.83+ may translate via tool use (fragile — skip)
+        # LiteLLM translates this for each provider:
+        #   - OpenAI: response_format={"type": "json_object"|"json_schema"}
+        #   - Anthropic: translates to output_format={"type": "json_schema", schema: ...}
+        #     (native grammar-compiled constrained decoding, GA on Sonnet 4.5+)
         #   - Other providers: passed as-is if OpenAI-compatible
-        if self.response_format is not None and not _is_anthropic:
+        if self.response_format is not None:
             kwargs["response_format"] = self.response_format
-            # When json_schema is used, drop temperature (must be 0 in OpenAI)
+            # When json_schema is used, drop temperature (must be 0 in OpenAI;
+            # Anthropic's structured outputs also recommend low temperature)
             if isinstance(self.response_format, dict) and self.response_format.get("type") == "json_schema":
                 kwargs["temperature"] = 0
 
