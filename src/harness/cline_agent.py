@@ -79,6 +79,9 @@ from .cron_tasks import clear_session_tasks
 _agent_t4 = _time_mod_agent.perf_counter()
 
 import logging as _logging_mod
+import io
+from .output_protocol import emit_progress, set_iteration_count
+from .output_protocol import emit_json_result, _json_mode as _z_json_mode
 
 _boot_logger = _logging_mod.getLogger("harness.agent.boot")
 _boot_logger.info(
@@ -91,7 +94,6 @@ _boot_logger.info(
 )
 
 log = get_logger("agent")
-
 
 def _normalize_display_text(text: str) -> str:
     """Decode common escaped sequences for prettier terminal rendering.
@@ -135,7 +137,6 @@ def _normalize_display_text(text: str) -> str:
     out = out.replace("\\t", "\t")
     return out
 
-
 # Regex patterns for stripping text-based reasoning tags from model output.
 # Built at module load using string construction to avoid XML parser confusion.
 _REASON_TAG_OPEN = "<" + "think" + "ing>"
@@ -175,7 +176,6 @@ _XML_TOOL_CALLS_TAG_RE = re.compile(
     r"<[ /]*(?:tool_calls|invoke|parameter)\b[^>]*>",
 )
 
-
 def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
     """Check if text contains XML tool call patterns indicating a native
     tool_calls marshalling failure.
@@ -200,7 +200,6 @@ def _text_has_xml_tool_patterns(text: str, tool_names: List[str]) -> bool:
         return True
     return False
 
-
 def _strip_text_reasoning_tags(text: str) -> str:
     """Strip text-based reasoning tags from model output.
 
@@ -220,7 +219,6 @@ def _strip_text_reasoning_tags(text: str) -> str:
     text = _REASON_ORPHAN_RE.sub("", text)
     text = _DSML_TAG_RE.sub("", text)
     return text.strip()
-
 
 @dataclass
 class ContextItem:
@@ -253,7 +251,6 @@ class ContextItem:
             return f"[{self.id}] search: {self.source} ({lines} matches, {age_str} ago)"
         else:
             return f"[{self.id}] {self.type}: {self.source} ({lines}L, {age_str} ago)"
-
 
 class ContextContainer:
     """Manages the agent's working context."""
@@ -308,7 +305,6 @@ class ContextContainer:
         self._items.clear()
         self._next_id = 1
 
-
 @dataclass
 class ParsedToolCall:
     """Parsed tool call from model response."""
@@ -316,7 +312,6 @@ class ParsedToolCall:
     name: str
     parameters: Dict[str, str]
     tool_call_id: Optional[str] = None
-
 
 class ClineAgent:
     """Agent using native tool calling with streaming via litellm."""
@@ -1605,6 +1600,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         """Main agent loop."""
         # Output stream for captured output (sys.stdout by default)
         _out = self._output_stream
+        import io
+        if _z_json_mode:
+            _out = io.StringIO()  # suppress intermediate stdout in --json mode
+            _real_stdout = sys.stdout
+        else:
+            _real_stdout = None
         # Client is created inside the loop so that reasoning-mode switches
         # (which change self.config) take effect on the very next API call.
         client: Optional[StreamingJSONClient] = None
@@ -1677,7 +1678,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
                 # Progress event: iteration start
                 try:
-                    from .output_protocol import emit_progress, set_iteration_count
+
                     set_iteration_count(iteration + 1)
                     ctx_tokens = estimate_messages_tokens(self.messages)
                     emit_progress(
@@ -1997,6 +1998,8 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             _thinking_line_start = True
                             _thinking_line_has_text = False
                     sys.stdout.flush()
+                if _real_stdout:
+                    _real_stdout.flush()
 
                 # Stream the response - using raw mode (no JSON parsing)
                 # Web search disabled by default to avoid unnecessary searches
@@ -2945,8 +2948,23 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 debug_print(f"PostToolUseFailure hook failed: {e2}")
 
             log_exception(log, f"Tool execution failed: {tool.name}", e)
-            self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
-            return f"Error: {str(e)}"
+            if _z_json_mode:
+                # In --json mode, route error to structured JSON, not stdout
+                import traceback
+                emit_json_result(
+                    status="error",
+                    error={
+                        "error_type": "tool_failure",
+                        "retryable": True,
+                        "retry_after_seconds": 0,
+                        "message": f"Tool {tool.name} failed: {type(e).__name__}",
+                        "detail": traceback.format_exc()[:2000],
+                    },
+                )
+                return f"Tool error (logged): {type(e).__name__}"
+            else:
+                self.console.print(f"[red][X] {tool.name}: {rich_escape(str(e))}[/red]")
+                return f"Error: {str(e)}"
         finally:
             _elapsed = (time.time() - _t0) * 1000
             _result_size = 0

@@ -1466,7 +1466,7 @@ class ToolHandlers:
         from .interrupt import is_interrupted, is_background_requested, reset_background
         
         command = params.get("command", "")
-        background = params.get("background", "").lower() == "true"
+        background = params.get("background", False); background = bool(background) if isinstance(background, (bool, int)) else str(background).lower() == "true"
         timeout_secs = 120  # Auto-background after this many seconds
         if not command.strip():
             return "Error: execute_command requires a non-empty <command> parameter."
@@ -1776,7 +1776,7 @@ class ToolHandlers:
     async def list_files(self, params: Dict[str, str]) -> str:
         """List files in a directory."""
         path = self._resolve_path(params.get("path", "."))
-        recursive = params.get("recursive", "").lower() == "true"
+        recursive = params.get("recursive", False); recursive = bool(recursive) if isinstance(recursive, (bool, int)) else str(recursive).lower() == "true"
         
         if not path.exists():
             return f"Error: Directory not found: {path}"
