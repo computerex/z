@@ -3463,6 +3463,7 @@ def main():
 
     # ── Output protocol initialization ──────────────────────────────────
     # --json mode: structured JSON on stdout, NDJSON progress on stderr
+    #   Also enables grammar-constrained JSON decoding via response_format
     # --schema: output validation against schema.json
     from harness.output_protocol import init_output_protocol, load_schema
 
@@ -3472,6 +3473,28 @@ def main():
     else:
         agent._output_schema = None
     _json_mode = args.json_output
+
+    # ── Grammar-constrained JSON decoding ─────────────────────────────
+    # When --json is active, force the model to output valid JSON via
+    # LiteLLM's response_format parameter (true grammar-constrained
+    # decoding, not just an instruction in the prompt).
+    #   --json alone     → response_format={"type": "json_object"}
+    #   --json + --schema → response_format={"type": "json_schema", ...}
+    if _json_mode:
+        if agent._output_schema is not None:
+            agent._json_response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "schema": agent._output_schema,
+                    "strict": True,
+                },
+            }
+            log.info("Grammar-constrained JSON output enabled (json_schema mode)")
+        else:
+            agent._json_response_format = {"type": "json_object"}
+            log.info("Grammar-constrained JSON output enabled (json_object mode)")
+
     init_output_protocol(
         json_mode=_json_mode,
         workspace=workspace,

@@ -321,6 +321,7 @@ class StreamingJSONClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.reasoning_effort: str = "high"  # Set externally by caller
+        self.response_format: Optional[Dict[str, Any]] = None  # Set externally for --json mode
 
         # Check if using OAuth token
         self._is_oauth = is_oauth_token(api_key)
@@ -577,6 +578,17 @@ class StreamingJSONClient:
         # Add native tool calling
         if tools:
             kwargs["tools"] = tools
+
+        # Add response_format for grammar-constrained JSON decoding.
+        # When set, LiteLLM translates this for each provider:
+        #   - OpenAI: {"type": "json_object"} or {"type": "json_schema", ...}
+        #   - Anthropic: LiteLLM 1.83+ may translate via tool use (fragile — skip)
+        #   - Other providers: passed as-is if OpenAI-compatible
+        if self.response_format is not None and not _is_anthropic:
+            kwargs["response_format"] = self.response_format
+            # When json_schema is used, drop temperature (must be 0 in OpenAI)
+            if isinstance(self.response_format, dict) and self.response_format.get("type") == "json_schema":
+                kwargs["temperature"] = 0
 
         # Debug: log the API call details
         log.debug(

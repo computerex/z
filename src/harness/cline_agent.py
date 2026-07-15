@@ -395,6 +395,7 @@ class ClineAgent:
         # Output protocol tracking
         self._last_iteration_count: int = 0
         self._output_schema: Optional[dict] = None
+        self._json_response_format: Optional[dict] = None
 
         # Tool handlers - delegates all tool execution logic
         self.tool_handlers = ToolHandlers(
@@ -1639,6 +1640,10 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 max_tokens=self.config.max_tokens,
             )
             new_client.reasoning_effort = getattr(self.config, "reasoning_effort", "high")
+            # Grammar-constrained JSON output (--json flag)
+            _rf = getattr(self, "_json_response_format", None)
+            if _rf is not None:
+                new_client.response_format = _rf
             await new_client.__aenter__()
             client = new_client
             self._active_client = client
