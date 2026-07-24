@@ -65,13 +65,5 @@ node_modules/
 .mcp-browsermcp/
 
 # Temporary files
-tmp_*.txt
-tmp_*.json
-*.tmp
-=======
-.forge/
-.harness_output/
-.sessions/
-.z/
-.mcp-browsermcp/
 .claude/*.lock
+.forge/
