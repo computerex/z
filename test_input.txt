@@ -1,2 +1,0 @@
-Explain quicksort vs mergesort
-/exit
