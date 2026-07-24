@@ -1681,6 +1681,8 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
             _EMPTY_NUDGE_MAX = 3  # max consecutive empty-response nudges
             _xml_tool_nudge_count = 0
             _XML_TOOL_NUDGE_MAX = 2  # max consecutive XML-tool-text nudges
+            _incomplete_retry_count = 0
+            _INCOMPLETE_RETRY_MAX = 2  # max consecutive incomplete-response nudges
             for iteration in range(self.max_iterations):
                 self._last_iteration_count = iteration
                 log.info("[WATCHDOG] Starting iteration %d", iteration + 1)
@@ -2437,6 +2439,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 if all_tool_calls:
                     _hidden_only_retry_count = 0
                     _empty_nudge_count = 0
+                    _incomplete_retry_count = 0
                     log.info(
                         "Tools parsed: %d call(s) — %s",
                         len(all_tool_calls),
@@ -2760,7 +2763,53 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             # Continue to next iteration to try again
                             continue
 
-                    # No tool call — final response to user
+                    # No tool call — final response to user.
+                    # First check for incomplete output: model stopped mid-sentence.
+                    _visible_stripped = _response_visible_text.strip()
+                    _incomplete = False
+                    if _visible_stripped and not _response_visible_text.rstrip().endswith((".", "!", "?", ")", "]", "}", '"', "'", "`")):
+                        # Text ends without sentence-terminating punctuation.
+                        # Common cut-off signals: trailing colon, comma, dash, or
+                        # last line is a lone phrase after a colon/newline.
+                        _trailing = _visible_stripped.rstrip()[-20:]
+                        _incomplete = (
+                            _visible_stripped.rstrip().endswith((":", ",", "-", "—"))
+                            or len(_visible_stripped.splitlines()[-1].strip()) < 10
+                        )
+                        if _incomplete:
+                            log.warning(
+                                "Response appears incomplete (trailing=%.40r, retry=%d/%d)",
+                                _trailing,
+                                _incomplete_retry_count,
+                                _INCOMPLETE_RETRY_MAX,
+                            )
+
+                    if _incomplete and _incomplete_retry_count < _INCOMPLETE_RETRY_MAX:
+                        _incomplete_retry_count += 1
+                        self.messages.append(
+                            StreamingMessage(
+                                role="assistant",
+                                content=full_content,
+                                provider_blocks=getattr(
+                                    response, "provider_content_blocks", None
+                                ),
+                            )
+                        )
+                        self.messages.append(
+                            StreamingMessage(
+                                role="user",
+                                content=(
+                                    "Your response was cut off mid-sentence. "
+                                    "Please continue from where you left off "
+                                    "and complete your thought."
+                                ),
+                            )
+                        )
+                        self.console.print(
+                            "\n  [dim]→ Response appears incomplete. Nudging to continue...[/dim]\n"
+                        )
+                        continue
+
                     self.messages.append(
                         StreamingMessage(
                             role="assistant",

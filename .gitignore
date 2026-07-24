@@ -69,3 +69,9 @@ tmp_*.txt
 tmp_*.json
 *.tmp
 =======
+.forge/
+.harness_output/
+.sessions/
+.z/
+.mcp-browsermcp/
+.claude/*.lock
