@@ -439,28 +439,27 @@ def find_relevant_memories(
     memory_dir: str,
     top_k: int = 5,
 ) -> List[str]:
-    """Find memory files relevant to a query using cross-encoder ranking.
+    """Find memory files relevant to a query using keyword matching.
 
     Returns absolute file paths of the most relevant memories (up to top_k).
-    Falls back to keyword matching if the cross-encoder is unavailable.
     """
     memories = scan_memory_files(memory_dir)
     if not memories:
         return []
 
-    from harness.cross_encoder import MemoryCandidate, rank_memories
+    # Simple keyword matching: score by how many query terms appear
+    query_terms = set(query.lower().split())
+    if not query_terms:
+        return [m.file_path for m in memories[:top_k]]
 
-    candidates = [
-        MemoryCandidate(
-            filepath=m.file_path,
-            description=m.description or "",
-            content_preview=_read_content_preview(m.file_path),
-        )
-        for m in memories
-    ]
+    def _score(memory) -> float:
+        text = (memory.description or "") + " " + _read_content_preview(memory.file_path)
+        text_lower = text.lower()
+        return sum(1 for term in query_terms if term in text_lower)
 
-    ranked = rank_memories(query, candidates, top_k)
-    return [c.filepath for c in ranked if c.score > 0]
+    scored = [(_score(m), m.file_path) for m in memories]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [path for score, path in scored[:top_k] if score > 0]
 
 
 def _read_content_preview(filepath: str, max_chars: int = 300) -> str:

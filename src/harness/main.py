@@ -2576,7 +2576,6 @@ class HarnessCompleter(Completer):
         "/todo",
         "/smart",
         "/dump",
-        "/policyeval",
         "/config",
         "/providers",
         "/model",
@@ -3146,26 +3145,6 @@ def main():
         help="Path to schema.json for output validation (default: schema.json in workspace)",
     )
     parser.add_argument(
-        "--policy-eval",
-        action="append",
-        help="Run context policy replay on dump JSON path (repeatable)",
-    )
-    parser.add_argument(
-        "--policy-eval-out",
-        default="",
-        help="Write policy replay JSON report to this path",
-    )
-    parser.add_argument(
-        "--policy-no-train",
-        action="store_true",
-        help="Policy replay: skip classifier training",
-    )
-    parser.add_argument(
-        "--policy-embed-backend",
-        default="auto",
-        help="Policy replay embedding backend: auto | semantic_scorer | hash | hf:<model-id>",
-    )
-    parser.add_argument(
         "--debug",
         "-d",
         action="store_true",
@@ -3280,28 +3259,6 @@ if __name__ == '__main__':
             model=args.model,
             global_config=not args.workspace_config,
         )
-        return
-
-    if args.policy_eval:
-        from .context import run_replay
-
-        con = Console()
-        dump_paths = [Path(p).expanduser().resolve() for p in args.policy_eval]
-        result = run_replay(
-            dump_paths,
-            train=not args.policy_no_train,
-            embedding_backend=args.policy_embed_backend,
-        )
-        text = json.dumps(result, indent=2)
-        if args.policy_eval_out:
-            out_path = Path(args.policy_eval_out).expanduser().resolve()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(text, encoding="utf-8")
-            con.print(
-                f"  [green]\u2713[/green] Policy replay report: [cyan]{rich_escape(str(out_path))}[/cyan]"
-            )
-        else:
-            con.print(text)
         return
 
     # Resolve workspace
@@ -4556,78 +4513,6 @@ if __name__ == '__main__':
                         )
                         continue
 
-                    elif cmd == "/policyeval":
-                        from .context import run_replay
-
-                        arg = cmd_arg.strip()
-                        if not arg:
-                            console.print(
-                                "  [dim]Usage: /policyeval <dump.json> [--no-train] "
-                                "[--out <report.json>] [--embed-backend <auto|hash|semantic_scorer|hf:model>][/dim]"
-                            )
-                            continue
-                        try:
-                            parts = shlex.split(arg)
-                        except ValueError as e:
-                            console.print(
-                                f"  [red]\u2717 Invalid arguments:[/red] {rich_escape(str(e))}"
-                            )
-                            continue
-                        no_train = "--no-train" in parts
-                        out_path = ""
-                        embed_backend = "auto"
-                        if "--out" in parts:
-                            oi = parts.index("--out")
-                            if oi + 1 < len(parts):
-                                out_path = parts[oi + 1]
-                        if "--embed-backend" in parts:
-                            bi = parts.index("--embed-backend")
-                            if bi + 1 < len(parts):
-                                embed_backend = parts[bi + 1]
-                        skip_vals = {
-                            "--no-train",
-                            "--out",
-                            out_path,
-                            "--embed-backend",
-                            embed_backend,
-                        }
-                        dump_tokens = [
-                            p
-                            for p in parts
-                            if p not in skip_vals and not p.startswith("--")
-                        ]
-                        if not dump_tokens:
-                            console.print("  [red]\u2717 Missing dump path.[/red]")
-                            continue
-                        dump_path = Path(dump_tokens[0]).expanduser()
-                        if not dump_path.is_absolute():
-                            dump_path = (Path(workspace) / dump_path).resolve()
-                        if not dump_path.exists():
-                            console.print(
-                                f"  [red]\u2717 Dump not found:[/red] {rich_escape(str(dump_path))}"
-                            )
-                            continue
-                        result = run_replay(
-                            [dump_path],
-                            train=not no_train,
-                            embedding_backend=embed_backend,
-                        )
-                        report = json.dumps(result, indent=2)
-                        if out_path:
-                            op = Path(out_path).expanduser()
-                            if not op.is_absolute():
-                                op = (Path(workspace) / op).resolve()
-                            op.parent.mkdir(parents=True, exist_ok=True)
-                            op.write_text(report, encoding="utf-8")
-                            console.print(
-                                f"  [green]\u2713[/green] Policy replay report: [cyan]{rich_escape(str(op))}[/cyan]"
-                            )
-                            _echo_remote(f"Policy replay report saved to {op.name}")
-                        else:
-                            console.print(report)
-                            _echo_remote(f"Policy replay complete (see terminal for report)")
-                        continue
-
                     elif cmd == "/config":
                         subparts = cmd_arg.split()
                         if subparts and subparts[0].lower() == "setup":
@@ -5079,9 +4964,6 @@ if __name__ == '__main__':
                         )
                         console.print(
                             "  [cyan]/dump[/cyan]                [dim]Dump full context to JSON[/dim]"
-                        )
-                        console.print(
-                            "  [cyan]/policyeval[/cyan] [dim]<dump.json> [--embed-backend <...>][/dim] [dim]Replay + classifier eval on a context dump[/dim]"
                         )
                         console.print(
                             "  [cyan]/index[/cyan] [dim][rebuild|tree][/dim] [dim]Project file index[/dim]"
