@@ -172,7 +172,6 @@ class TelegramProvider(RemoteProvider):
         self._token: str = config["token"]
         self._allowed_chat_ids: set[str] = set()
         self._allowed_username: Optional[str] = None
-        self._http_sync: httpx.Client | None = None
 
         # Parse allowed users from config
         raw_allowed = config.get("allowed_chat_ids", "")
@@ -379,31 +378,6 @@ class TelegramProvider(RemoteProvider):
     def authorize_chat(self, chat_id: str) -> None:
         """Add a chat to the allowed list (after manual approval)."""
         self._allowed_chat_ids.add(chat_id)
-
-    async def send_auth_request(self, chat_id: str) -> bool:
-        """Send an authentication request and wait for approval."""
-        self._sync_api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=(
-                "⚠️ *Unauthorized*\n\n"
-                "This bot requires authorization. "
-                "Run this command in the harness terminal to approve:\n\n"
-                f"`/telegram-auth {chat_id}`"
-            ),
-            parse_mode="Markdown",
-        )
-        # Wait for approval (up to 5 minutes)
-        event = threading.Event()
-        self._pending_auth[chat_id] = event
-        try:
-            # Wait in a thread so we don't block the event loop
-            import asyncio
-            return await asyncio.get_event_loop().run_in_executor(
-                None, lambda: event.wait(timeout=300)
-            )
-        finally:
-            self._pending_auth.pop(chat_id, None)
 
     def approve_pending(self, chat_id: str) -> bool:
         """Approve a pending authorization request from /telegram-auth."""

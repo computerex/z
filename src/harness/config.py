@@ -1,4 +1,4 @@
-"""Configuration management for the harness."""
+"""Configuration management — loads provider settings from ~/.z.json."""
 
 import json
 from pathlib import Path
@@ -11,6 +11,11 @@ def get_global_config_path() -> Path:
     return Path.home() / ".z.json"
 
 
+def get_workspace_config_path(workspace: Optional[Path] = None) -> Path:
+    """Get path to workspace config. Present for backward compatibility only."""
+    return (workspace or Path.cwd()) / ".z.json"
+
+
 def load_json_config(path: Path) -> dict:
     """Load config from JSON file if it exists."""
     if path.exists():
@@ -19,6 +24,13 @@ def load_json_config(path: Path) -> dict:
         except (json.JSONDecodeError, IOError):
             pass
     return {}
+
+
+def save_json_config(path: Path, data: dict) -> Path:
+    """Save config dict to JSON file. Returns the path written."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
 
 
 def _is_empty_override(value) -> bool:
@@ -50,8 +62,6 @@ class Config:
     max_tokens: int = 128000
     temperature: float = 0.7
     workspace_path: Path = field(default_factory=lambda: Path.cwd())
-    max_context_tokens: int = 32000
-    embedding_model: str = "all-MiniLM-L6-v2"
     compaction_threshold: float = 0.85  # Start compaction at 85% of max_tokens
     reasoning_effort: str = "high"  # Reasoning effort: high, medium, low, none
     plugins: list = field(default_factory=list)         # Extra plugin paths
@@ -86,7 +96,6 @@ class Config:
             max_tokens=int(config_data.get("max_tokens", 128000)),
             temperature=float(config_data.get("temperature", 0.7)),
             workspace_path=workspace or Path.cwd(),
-            max_context_tokens=int(config_data.get("max_context_tokens", 32000)),
             compaction_threshold=float(config_data.get("compaction_threshold", 0.85)),
             reasoning_effort=str(config_data.get("reasoning_effort", "high")),
             plugins=list(config_data.get("plugins", [])),

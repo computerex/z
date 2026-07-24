@@ -1,16 +1,4 @@
-"""Unified streaming client - uses LiteLLM for all providers.
-
-This replaces all provider-specific code with LiteLLM's unified API.
-Supports 100+ providers: Bedrock, Anthropic, OpenAI, Together, OpenRouter, etc.
-
-Special handling for OAuth tokens (ChatGPT Plus/Pro subscriptions):
-- Detects OAuth tokens (starts with "oauth:")
-- Uses custom CodexOAuthClient instead of LiteLLM
-- Handles token refresh automatically
-
-Debug mode:
-- Set HARNESS_LITELLM_DEBUG=1 to enable LiteLLM debug output
-"""
+"""Unified streaming LLM client — uses LiteLLM for all providers (OpenAI, Anthropic, Bedrock, etc.)."""
 
 import os
 import asyncio
@@ -27,7 +15,6 @@ log = get_logger("streaming_client")
 if os.environ.get("HARNESS_LITELLM_DEBUG") == "1":
     try:
         import litellm
-        litellm.set_verbose = True
     except Exception:
         pass
 
@@ -325,7 +312,6 @@ class StreamingJSONClient:
 
         # Check if using OAuth token
         self._is_oauth = is_oauth_token(api_key)
-        self._oauth_provider: Optional[str] = None
         self._codex_client: Optional[CodexOAuthClient] = None
         self._copilot_client: Optional["CopilotOAuthClient"] = None  # type: ignore
         self._copilot_reasoning_opaque: Optional[str] = None  # Store reasoning context
@@ -344,7 +330,6 @@ class StreamingJSONClient:
 
                 if is_copilot_url:
                     # GitHub Copilot
-                    self._oauth_provider = "github-copilot"
                     oauth_token = oauth_manager.get_token("github-copilot")
                     if oauth_token:
                         from .copilot_oauth_client import CopilotOAuthClient
@@ -364,7 +349,6 @@ class StreamingJSONClient:
                         )
                 else:
                     # OpenAI Codex
-                    self._oauth_provider = "openai"
                     oauth_token = oauth_manager.get_token("openai")
                     if oauth_token:
                         self._codex_client = CodexOAuthClient(
@@ -419,9 +403,6 @@ class StreamingJSONClient:
             _litellm, _ = _import_litellm()
             if _litellm:
                 _litellm.set_verbose = False  # Set True for debugging
-                _litellm.drop_params = True  # Drop unsupported params
-                _litellm.success_callback = []  # Disable callbacks
-                _litellm.failure_callback = []
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -894,7 +875,6 @@ class StreamingJSONClient:
         on_content: Optional[Callable[[str], None]] = None,
         on_reasoning: Optional[Callable[[str], None]] = None,
         check_interrupt: Optional[Callable[[], bool]] = None,
-        enable_web_search: bool = False,
         status_line: Optional[Any] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> StreamingChatResponse:
@@ -907,7 +887,6 @@ class StreamingJSONClient:
             on_content: Callback for content chunks (real-time display)
             on_reasoning: Callback for reasoning/thinking content
             check_interrupt: Callback to check if operation should be interrupted
-            enable_web_search: Enable web search (ignored for compatibility)
             status_line: Status line object (ignored for compatibility)
 
         Returns:

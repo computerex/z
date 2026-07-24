@@ -362,7 +362,7 @@ def test_greeter_class():
         
         # Add some context items
         item1_id = self.agent.context.add("file", "test.py", "print('hello')")
-        item2_id = self.agent.context.add("command_output", "ls -la", "total 8\n-rw-r--r-- 1 user user 13 test.py")
+        self.agent.context.add("command_output", "ls -la", "total 8\n-rw-r--r-- 1 user user 13 test.py")
         
         if self.agent.context.total_size() == 0:
             self.test_result("Context add", False, "No content added")

@@ -565,18 +565,17 @@ class WorkspaceIndex:
     # Queries
     # ------------------------------------------------------------------
 
+    def get_dir(self, path: str) -> List[FileInfo]:
+        """Return files within a specific directory path."""
+        target = path.rstrip("/").rstrip("\\")
+        if not target.endswith("/"):
+            target += "/"
+        return [f for f in self.files if f.rel_path.startswith(target)]
+
     def search(self, pattern: str) -> List[FileInfo]:
         """Search file paths by substring (case-insensitive)."""
         pattern_lower = pattern.lower()
         return [f for f in self.files if pattern_lower in f.rel_path.lower()]
-
-    def get_dir(self, directory: str) -> List[FileInfo]:
-        """Get files in a specific directory."""
-        norm = directory.replace('\\', '/').strip('/')
-        if norm == '' or norm == '.':
-            # Root-level files only
-            return self._by_dir.get('.', [])
-        return self._by_dir.get(norm, [])
 
     def get_languages(self) -> Dict[str, int]:
         """Get a count of files per language."""

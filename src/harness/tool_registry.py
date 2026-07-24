@@ -1,11 +1,4 @@
-﻿"""Single source of truth for all tool definitions.
-
-Every tool known to the harness is defined ONCE here.  The parser,
-the unclosed-tag detector, the system prompt, and the dispatch table
-all derive their tool lists from this module.
-
-Adding a new tool?  Add it here and it automatically propagates everywhere.
-"""
+"""Tool registry — manages tool definitions, metrics, and OpenAI-format tool schemas."""
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Any
@@ -364,11 +357,11 @@ def tool_defs_to_openai_tools(
 class ToolCallRecord:
     """A single tool invocation record."""
     tool_name: str
-    started_at: float
     elapsed_ms: float
     success: bool
     error: Optional[str] = None
     result_size: int = 0
+    started_at: float = 0.0
 
 
 class ToolMetrics:

@@ -273,9 +273,6 @@ class SubAgentManager:
             if inst.tee:
                 inst.tee.active = True
 
-    def get_focused(self) -> Optional[str]:
-        return self._focused_name
-
     def check_completed(self) -> Optional[str]:
         """Return the name of a sub-agent that just completed and hasn't been
         notified about yet. Returns None if nothing new."""
@@ -350,8 +347,4 @@ class SubAgentManager:
         except Exception as e:
             log.debug("Failed to save sub-agent session '%s': %s", instance.name, e)
 
-    def _append_output(self, instance: SubAgentInstance) -> None:
-        """Update instance.output from the tee buffer."""
-        if instance.tee:
-            instance.output = instance.tee.getvalue()
 

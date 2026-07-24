@@ -91,59 +91,6 @@ class PluginAPI:
     def workspace_path(self) -> str:
         return self._manager.workspace_path
 
-    def add_tool(
-        self,
-        name: str,
-        description: str,
-        params: Optional[Dict[str, dict]] = None,
-        handler: Optional[ToolHandler] = None,
-        category: str = "plugin",
-        complex_content: bool = False,
-        console_label: Optional[str] = None,
-    ) -> None:
-        """Register a new tool.
-
-        Args:
-            name: Tool name (must be unique across builtins and plugins).
-            description: What the tool does (shown to the LLM).
-            params: {param_name: {"required": bool, "description": str}}.
-            handler: Callable(params_dict) -> str. Can be sync or async.
-            category: Tool category for grouping.
-            complex_content: True if tool content may contain nested XML.
-            console_label: Rich markup for console display, e.g. "[cyan]Greet[/cyan]".
-        """
-        if handler is None:
-            raise ValueError(f"Plugin '{self._plugin_name}': tool '{name}' needs a handler")
-        tool = PluginToolDef(
-            name=name,
-            description=description,
-            params=params or {},
-            handler=handler,
-            category=category,
-            complex_content=complex_content,
-            console_label=console_label,
-        )
-        self._manager._register_tool(tool, self._plugin_name)
-
-    def on(self, hook_name: str, fn: HookFn) -> None:
-        """Subscribe to a lifecycle hook.
-
-        Valid hooks: pre_tool, post_tool, pre_turn, post_turn,
-                     on_compact, system_prompt.
-        """
-        if hook_name not in VALID_HOOKS:
-            log.warning(
-                "Plugin '%s' registered unknown hook '%s' (ignored). Valid: %s",
-                self._plugin_name, hook_name, ", ".join(sorted(VALID_HOOKS)),
-            )
-            return
-        self._manager._register_hook(hook_name, fn, self._plugin_name)
-
-    def get_config(self) -> dict:
-        """Return any per-plugin config from ~/.z.json  plugin_config.<name>."""
-        return self._manager.plugin_configs.get(self._plugin_name, {})
-
-
 # ── PluginManager ────────────────────────────────────────────────
 
 class PluginManager:

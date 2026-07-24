@@ -1,9 +1,4 @@
-"""OAuth authentication support for harness providers.
-
-Implements OpenAI OAuth exactly like opencode:
-1. Browser-based (PKCE Authorization Code Flow)
-2. Device Code Flow (Headless)
-"""
+"""OAuth token management — local HTTP callback server, token refresh, persistence."""
 
 import json
 import time

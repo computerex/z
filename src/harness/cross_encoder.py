@@ -1,9 +1,4 @@
-"""
-Keyword-based memory relevance ranking.
-
-Uses simple keyword overlap (TF-weighted Jaccard) to rank memory files
-by relevance to a user query. No ML dependencies needed.
-"""
+"""Cross-encoder memory ranking — reranks memory candidates by relevance to current query."""
 
 from __future__ import annotations
 

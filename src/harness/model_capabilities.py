@@ -1,12 +1,4 @@
-"""Model capability detection (vision, etc.).
-
-Uses two sources, in order of preference:
-1. LiteLLM's model info (``litellm.get_model_info``)
-2. models.dev/api.json remote metadata
-
-If neither source can determine the capability, the function returns False
-(conservative default). No name-based heuristics are used.
-"""
+"""Per-model capability detection — vision support, token limits, reasoning effort."""
 
 from typing import Optional
 import logging

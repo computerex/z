@@ -1,18 +1,4 @@
-"""CLAUDE.md inheritance loader — mirrors Claude Code's memory hierarchy.
-
-Resolution order (loaded bottom-up, more specific wins):
-1. User-level:   ~/.claude/CLAUDE.md, ~/.claude/rules/*.md
-2. Ancestor dirs: walk from filesystem root → cwd, at each level:
-      <dir>/CLAUDE.md  or  <dir>/.claude/CLAUDE.md
-3. Project rules: <workspace>/.claude/rules/*.md  (recursive)
-4. agent.md:      <workspace>/agent.md  (harness-specific extension)
-
-Features:
-- @path imports (max depth 5, relative to the referencing file)
-- HTML block-comment stripping (<!-- … -->)
-- On-demand subdirectory loading (called when agent reads files in a subdir)
-- Per-file 32 KB cap, total 128 KB cap
-"""
+"""Instruction hierarchy loader — loads CLAUDE.md files from root down to working directory."""
 
 from __future__ import annotations
 

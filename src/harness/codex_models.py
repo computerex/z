@@ -1,8 +1,4 @@
-"""Codex models constants - separate module to avoid importing LiteLLM.
-
-This module provides hardcoded Codex model lists without importing
-heavy dependencies like LiteLLM.
-"""
+"""Model registry for Codex/OAuth-based providers."""
 
 from typing import List
 

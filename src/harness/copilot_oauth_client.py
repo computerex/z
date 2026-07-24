@@ -1,14 +1,4 @@
-"""GitHub Copilot API client for OAuth tokens.
-
-This client handles OAuth tokens for GitHub Copilot subscriptions.
-Unlike standard API keys, Copilot OAuth tokens access GitHub's API directly.
-
-Based on opencode's implementation:
-- Uses https://api.githubcopilot.com or enterprise endpoints
-- Requires special headers (x-initiator, Copilot-Vision-Request)
-- Supports streaming responses with reasoning/thinking tokens
-- Properly handles reasoning_opaque for multi-turn conversations
-"""
+"""OAuth client for GitHub Copilot API access."""
 
 import json
 import asyncio

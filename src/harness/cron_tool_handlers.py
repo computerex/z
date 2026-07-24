@@ -1,9 +1,4 @@
-"""Tool handler implementations for scheduled tasks (CronCreate / CronDelete / CronList).
-
-These functions are designed to be mixed into ``ToolHandlers`` — the caller
-passes ``self`` (the ToolHandlers instance) as the first argument so they
-can access ``workspace_path`` and other dependencies.
-"""
+"""Cron tool implementations — CronCreate, CronDelete, CronList tool handlers."""
 
 import time
 from typing import Any, Dict, List, Optional

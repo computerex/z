@@ -1,14 +1,4 @@
-"""OpenAI Codex OAuth API client.
-
-This client handles OAuth tokens for ChatGPT Plus/Pro subscriptions.
-Unlike standard OpenAI API keys, OAuth tokens access the ChatGPT web backend directly.
-
-Based on opencode's implementation:
-- Uses https://chatgpt.com/backend-api/codex/responses endpoint
-- Requires special headers (ChatGPT-Account-Id, originator)
-- Handles token refresh automatically
-- Supports streaming responses
-"""
+"""OAuth client for Codex/ChatGPT Plus subscription API access."""
 
 import json
 import time

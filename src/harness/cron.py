@@ -1,16 +1,5 @@
-"""Minimal cron expression parsing and next-run calculation.
+"""Cron expression parser — 5-field cron (minute hour dom month dow), next-fire calculation."""
 
-Supports the standard 5-field cron subset:
-  minute hour day-of-month month day-of-week
-
-Field syntax: wildcard (``*``), plain N, step (``*/N``), range (``N-M``),
-range with step (``N-M/S``), and comma-lists (``N,M,O``).
-
-No L, W, ?, or name aliases. All times are interpreted in the process's
-local timezone — "0 9 * * *" means 9am wherever the harness is running.
-"""
-
-import calendar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional, Sequence

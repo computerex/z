@@ -182,23 +182,20 @@ class TodoManager:
             if item.status != TodoStatus.COMPLETED
         ]
 
-    def list_in_progress(self) -> List[TodoItem]:
-        """List todos currently being worked on."""
+    def list_in_progress(self) -> List["TodoItem"]:
+        """Return items currently in progress."""
         return [
             item for item in self.list_all()
             if item.status == TodoStatus.IN_PROGRESS
         ]
 
     def get_active_context_refs(self) -> List[str]:
-        """Get all context references from active (non-completed) todos.
-        
-        Used by the smart context manager to determine which context
-        items are relevant to current work.
-        """
-        refs = []
-        for item in self.list_active():
-            refs.extend(item.context_refs)
-        return refs
+        """Return deduplicated context refs from active (non-completed) items."""
+        refs: List[str] = []
+        for item in self.list_all():
+            if item.status != TodoStatus.COMPLETED and item.context_refs:
+                refs.extend(item.context_refs)
+        return sorted(set(refs))
 
     def get_progress_summary(self) -> str:
         """Get a concise progress summary for context injection."""

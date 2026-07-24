@@ -203,7 +203,6 @@ class RemoteProvider(ABC):
         Override this when ``thread_based=False`` (default).
         """
         raise NotImplementedError("_poll() not implemented")
-        yield  # make this an async generator
 
     def _poll_thread(self):
         """Synchronous generator yielding RemoteMessage objects.
@@ -211,7 +210,6 @@ class RemoteProvider(ABC):
         Override this when ``thread_based=True``.
         """
         raise NotImplementedError("_poll_thread() not implemented")
-        yield  # make this a generator
 
     @abstractmethod
     async def send_message(self, chat_id: str, text: str) -> None:

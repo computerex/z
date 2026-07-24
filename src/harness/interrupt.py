@@ -1,4 +1,4 @@
-"""Keyboard interrupt handling for streaming operations."""
+"""Interrupt handling — Ctrl+C detection, background request flag, monitoring thread."""
 
 import sys
 import threading

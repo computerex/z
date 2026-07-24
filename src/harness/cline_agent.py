@@ -1,4 +1,4 @@
-"""Streaming agent with native tool calling via litellm."""
+"""Streaming agent — the core REPL loop: receives prompts, streams LLM responses, dispatches tool calls."""
 
 import asyncio
 import sys
@@ -17,7 +17,11 @@ from rich.panel import Panel
 
 import time as _time_mod_agent
 
-_agent_import_t0 = _time_mod_agent.perf_counter()
+# Boot timing (only active when HARNESS_TIMING=1)
+if os.environ.get("HARNESS_TIMING") == "1":
+    _agent_import_t0 = _time_mod_agent.perf_counter()
+else:
+    _agent_import_t0 = 0.0
 
 from .streaming_client import StreamingJSONClient, StreamingMessage
 from .config import Config
@@ -51,16 +55,19 @@ from .context_management import (
     DuplicateDetector,
 )
 
-_agent_t1 = _time_mod_agent.perf_counter()
+if os.environ.get("HARNESS_TIMING") == "1":
+    _agent_t1 = _time_mod_agent.perf_counter()
 
 from .tool_handlers import ToolHandlers
 
-_agent_t2 = _time_mod_agent.perf_counter()
+if os.environ.get("HARNESS_TIMING") == "1":
+    _agent_t2 = _time_mod_agent.perf_counter()
 
 from .todo_manager import TodoManager, TodoStatus
 from .smart_context import SmartContextManager
 
-_agent_t3 = _time_mod_agent.perf_counter()
+if os.environ.get("HARNESS_TIMING") == "1":
+    _agent_t3 = _time_mod_agent.perf_counter()
 
 from .status_line import StatusLine
 from .workspace_index import WorkspaceIndex
@@ -76,22 +83,24 @@ from .logger import get_logger, log_exception, truncate as log_truncate
 from .cron_scheduler import CronScheduler, CronSchedulerOptions
 from .cron_tasks import clear_session_tasks
 
-_agent_t4 = _time_mod_agent.perf_counter()
+if os.environ.get("HARNESS_TIMING") == "1":
+    _agent_t4 = _time_mod_agent.perf_counter()
 
 import logging as _logging_mod
 import io
 from .output_protocol import emit_progress, set_iteration_count
 from .output_protocol import emit_json_result, _json_mode as _z_json_mode
 
-_boot_logger = _logging_mod.getLogger("harness.agent.boot")
-_boot_logger.info(
-    "cline_agent import breakdown: core=%.0fms tool_handlers=%.0fms smart_context=%.0fms rest=%.0fms total=%.0fms",
-    (_agent_t1 - _agent_import_t0) * 1000,
-    (_agent_t2 - _agent_t1) * 1000,
-    (_agent_t3 - _agent_t2) * 1000,
-    (_agent_t4 - _agent_t3) * 1000,
-    (_agent_t4 - _agent_import_t0) * 1000,
-)
+if os.environ.get("HARNESS_TIMING") == "1":
+    _boot_logger = _logging_mod.getLogger("harness.agent.boot")
+    _boot_logger.info(
+        "cline_agent import breakdown: core=%.0fms tool_handlers=%.0fms smart_context=%.0fms rest=%.0fms total=%.0fms",
+        (_agent_t1 - _agent_import_t0) * 1000,
+        (_agent_t2 - _agent_t1) * 1000,
+        (_agent_t3 - _agent_t2) * 1000,
+        (_agent_t4 - _agent_t3) * 1000,
+        (_agent_t4 - _agent_import_t0) * 1000,
+    )
 
 log = get_logger("agent")
 
@@ -2069,7 +2078,6 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                                 on_content=on_chunk,
                                 on_reasoning=on_reasoning,
                                 check_interrupt=is_interrupted,
-                                enable_web_search=False,
                                 status_line=self.status,
                                 tools=native_tools,
                             )

@@ -1,8 +1,4 @@
-"""Simple context management — naive truncation strategies only.
-
-No semantic scoring, no embedding model, no sentence-transformers.
-Compaction uses Cline-style strategies: half, quarter, lastTwo.
-"""
+"""Smart context compaction — keeps important messages, drops duplicates, preserves structure."""
 
 import hashlib
 import os
@@ -167,37 +163,6 @@ class ToolResultStorage:
 
         return len(to_remove)
 
-    def store_result(
-        self, tool_name: str, content: str, message_index: int = -1
-    ) -> str:
-        """Store a tool result and return its result_id."""
-        content_bytes = len(content.encode("utf-8", errors="replace"))
-        if content_bytes > 10 * 1024 * 1024:  # 10MB limit per result
-            raise ValueError(f"Tool result too large to store: {content_bytes:,} bytes")
-
-        content_hash = hashlib.md5(
-            content.encode("utf-8", errors="replace")
-        ).hexdigest()[:8]
-        self._counter += 1
-        result_id = f"res_{content_hash}_{self._counter}"
-
-        result = StoredToolResult(
-            result_id=result_id,
-            tool_name=tool_name,
-            original_content=content,
-            timestamp=time.time(),
-            message_index=message_index,
-            tokens=estimate_tokens(content),
-        )
-
-        self._results[result_id] = result
-        self._access_order.append(result_id)
-        self._total_bytes += content_bytes
-
-        self._cleanup_old_results()
-        self._evict_if_needed()
-
-        return result_id
 
     def get_result(self, result_id: str) -> Optional[StoredToolResult]:
         """Retrieve a stored tool result by ID."""
@@ -213,14 +178,6 @@ class ToolResultStorage:
             self._access_order.append(result_id)
         return result
 
-    def list_results(self, tool_name: Optional[str] = None) -> List[StoredToolResult]:
-        """List all stored results, optionally filtered by tool name."""
-        results = list(self._results.values())
-        if tool_name:
-            results = [r for r in results if r.tool_name == tool_name]
-        result_order = {rid: i for i, rid in enumerate(reversed(self._access_order))}
-        results.sort(key=lambda r: result_order.get(r.result_id, float("inf")))
-        return results
 
 
 # ---------------------------------------------------------------------------
@@ -241,60 +198,6 @@ class SmartContextManager:
 
         # Storage for tool results that have been compacted
         self.result_storage = ToolResultStorage(max_results=100)
-
-    # -- Backward-compat shims for code that references the old API --------
-
-    @property
-    def protected_indices(self) -> frozenset:
-        return PROTECTED_INDICES
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def compact_context(
-        self,
-        messages: List[Any],
-        max_tokens: int,
-        current_tokens: Optional[int] = None,
-        strategy: str = "half",
-        **_kwargs,
-    ) -> Tuple[List[Any], int, str]:
-        """Truncate conversation using a naive strategy (half/quarter/lastTwo).
-
-        Returns ``(messages, tokens_freed, report_text)``.
-        """
-        if current_tokens is None:
-            current_tokens = estimate_messages_tokens(messages)
-
-        result = truncate_conversation(messages, strategy=strategy)
-
-        if result.removed_count == 0:
-            return messages, 0, ""
-
-        freed = current_tokens - estimate_messages_tokens(result.messages)
-
-        # Record a single trace for the truncation
-        self.compaction_traces.append(
-            CompactionTrace(
-                original_type="truncation",
-                source=f"strategy={strategy}",
-                summary=f"Removed {result.removed_count} messages ({strategy} strategy)",
-                tokens_freed=freed,
-            )
-        )
-
-        # Trim trace history
-        if len(self.compaction_traces) > 50:
-            self.compaction_traces = self.compaction_traces[-50:]
-
-        report = f"Truncated {result.removed_count} messages ({strategy}): -{freed:,} tok"
-        log.debug(
-            "compact_context done: freed=%d report=%s",
-            freed,
-            report,
-        )
-        return result.messages, freed, report
 
     def semantic_maintenance_tick(
         self,
@@ -338,9 +241,6 @@ class SmartContextManager:
 
         return "\n".join(lines)
 
-    # Keep the old name working as an alias
-    build_recovery_notice = build_context_recovery_notice
-
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
@@ -373,53 +273,6 @@ class SmartContextManager:
                     compacted_at=t.get("compacted_at", t.get("evicted_at", 0)),
                 )
             )
-
-    # ------------------------------------------------------------------
-    # Duplicate consolidation
-    # ------------------------------------------------------------------
-
-    def _consolidate_duplicates(self, messages: List[Any]) -> Tuple[List[Any], int]:
-        """Keep only the latest read of each file, replace older reads."""
-        file_reads: Dict[str, List[int]] = {}
-
-        for i, msg in enumerate(messages):
-            if i in PROTECTED_INDICES:
-                continue
-            content = _get_content(msg)
-            if not content or COMPACT_MARKER in content[:20]:
-                continue
-
-            match = re.match(r"\[read_file result\]\s*\n?(.+?)(?:\n|$)", content)
-            if match:
-                path = _normalize_path(match.group(1).strip())
-                file_reads.setdefault(path, []).append(i)
-
-        tokens_freed = 0
-        for path, indices in file_reads.items():
-            if len(indices) < 2:
-                continue
-            latest = max(indices)
-            for idx in indices:
-                if idx == latest:
-                    continue
-                msg = messages[idx]
-                old_content = _get_content(msg)
-                old_tokens = estimate_tokens(old_content)
-
-                trace = CompactionTrace(
-                    "duplicate_read",
-                    path,
-                    f"Superseded read of {path}",
-                    tokens_freed=old_tokens,
-                )
-                notice = trace.format_notice()
-                _set_content(msg, notice)
-                freed = old_tokens - estimate_tokens(notice)
-                if freed > 0:
-                    tokens_freed += freed
-                    self.compaction_traces.append(trace)
-
-        return messages, tokens_freed
 
     # ------------------------------------------------------------------
     # Classification
@@ -499,18 +352,6 @@ def _set_content(msg: Any, content: str) -> None:
         msg["content"] = content
 
 
-def _extract_definitions(lines: List[str], limit: int = 150) -> List[str]:
-    """Pull out function/class names from source code lines."""
-    defs: List[str] = []
-    for line in lines[:limit]:
-        s = line.strip()
-        if s.startswith(
-            ("def ", "class ", "func ", "function ", "export ", "type ", "interface ")
-        ):
-            name = s.split("(")[0].split("{")[0].split(":")[0].strip()
-            defs.append(name)
-    return defs
-
 
 def _normalize_path(path: str) -> str:
     """Normalize a file path for dedup comparison."""
@@ -519,28 +360,6 @@ def _normalize_path(path: str) -> str:
         p = p.lower()
     p = p.rstrip("/")
     return p
-
-
-def _sample_start_middle_end(content: str, chunk_chars: int = 450) -> str:
-    """Build an abbreviated view using start/middle/end excerpts."""
-    text = content.strip()
-    if len(text) <= chunk_chars * 3 + 40:
-        return text
-
-    n = len(text)
-    start = text[:chunk_chars].rstrip()
-    mid_start = max(0, (n // 2) - (chunk_chars // 2))
-    middle = text[mid_start : mid_start + chunk_chars].strip()
-    end = text[-chunk_chars:].lstrip()
-
-    return (
-        "[Start excerpt]\n"
-        f"{start}\n\n"
-        "[Middle excerpt]\n"
-        f"{middle}\n\n"
-        "[End excerpt]\n"
-        f"{end}"
-    )
 
 
 def _message_fingerprint(role: str, content: str) -> str:

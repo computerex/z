@@ -1,13 +1,4 @@
-"""Non-asyncio scheduler core for ``.claude/scheduled_tasks.json``.
-
-Lifecycle
----------
-1. ``start()`` → load tasks, acquire scheduler lock, start file watcher +
-   periodic check timer.
-2. ``check()`` called every 1 s — computes next-fire times, fires eligible
-   tasks, persists recurring-task metadata.
-3. ``stop()`` → tear down timer, watcher, and release lock.
-"""
+"""Cron scheduler — background loop that fires due tasks and injects prompts into agent."""
 
 import logging
 import os
@@ -25,14 +16,34 @@ from .cron_tasks import (
     build_missed_task_notification,
     find_missed_tasks,
     get_cron_file_path,
-    has_cron_tasks_sync,
     jittered_next_run_ms,
     mark_cron_tasks_fired,
     one_shot_jittered_next_run_ms,
     read_cron_tasks,
     remove_cron_tasks,
 )
-from .cron_tasks_lock import release_scheduler_lock, try_acquire_scheduler_lock
+def _try_acquire_scheduler_lock(lock_dir: str, identity: str) -> bool:
+    """Try to acquire the scheduler lock via a lock file. Returns True if acquired."""
+    import os
+    lock_path = os.path.join(lock_dir or os.getcwd(), ".claude", "scheduler.lock")
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        # Write lock identity and check if we own it
+        with open(lock_path, "w") as f:
+            f.write(identity)
+        return True
+    except Exception:
+        return False
+
+def _release_scheduler_lock(lock_dir: str) -> None:
+    """Release the scheduler lock by removing the lock file."""
+    import os
+    lock_path = os.path.join(lock_dir or os.getcwd(), ".claude", "scheduler.lock")
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
 
 log = logging.getLogger("harness.cron")
 
@@ -124,7 +135,7 @@ class CronScheduler:
         log.info("CronScheduler starting (dir=%s)", self._dir or os.getcwd())
 
         # Acquire the scheduler lock
-        self._is_owner = try_acquire_scheduler_lock(self._dir, self._opts.lock_identity)
+        self._is_owner = _try_acquire_scheduler_lock(self._dir, self._opts.lock_identity)
         if not self._is_owner:
             log.info("Did not acquire scheduler lock — will probe periodically")
             self._schedule_lock_probe()
@@ -153,19 +164,10 @@ class CronScheduler:
                 t.cancel()
 
         if self._is_owner:
-            release_scheduler_lock(self._dir)
+            _release_scheduler_lock(self._dir)
             self._is_owner = False
 
         log.info("CronScheduler stopped")
-
-    def get_next_fire_time(self) -> Optional[float]:
-        """Epoch ms of the soonest scheduled fire, or ``None``."""
-        with self._lock:
-            best = float("inf")
-            for v in self._next_fire.values():
-                if v < best:
-                    best = v
-        return best if best != float("inf") else None
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -195,7 +197,7 @@ class CronScheduler:
     def _probe_lock(self) -> None:
         if self._stop_event.is_set() or self._is_owner:
             return
-        if try_acquire_scheduler_lock(self._dir, self._opts.lock_identity):
+        if _try_acquire_scheduler_lock(self._dir, self._opts.lock_identity):
             self._is_owner = True
             log.info("Acquired scheduler lock via probe")
             # Re-load file tasks now that we own the lock

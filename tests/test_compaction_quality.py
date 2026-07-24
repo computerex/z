@@ -18,7 +18,6 @@ import pytest
 from harness.todo_manager import TodoManager, TodoStatus
 from harness.smart_context import (
     SmartContextManager,
-    SemanticScorer,
     CompactionTrace,
     PROTECTED_INDICES,
     COMPACT_MARKER,

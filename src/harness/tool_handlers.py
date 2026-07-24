@@ -1,4 +1,4 @@
-"""Tool handlers for ClineAgent - manages all tool execution logic."""
+"""Tool implementations — file ops, shell execution, search, MCP, sub-agents, cron, images, web search."""
 
 import asyncio
 import base64
@@ -895,15 +895,6 @@ class ToolHandlers:
         result = []
         for bg_id, info in self._background_procs.items():
             proc = info["proc"]
-            # Poll the process to update returncode if it has finished
-            if proc.returncode is None:
-                try:
-                    # asyncio.subprocess.Process doesn't have poll(), but
-                    # checking the underlying transport can update returncode
-                    if proc._transport is not None and proc._transport.get_returncode() is not None:
-                        proc._returncode = proc._transport.get_returncode()
-                except Exception:
-                    pass
             elapsed = time.time() - info["started"]
             status = "running" if proc.returncode is None else f"exited ({proc.returncode})"
             result.append({
@@ -1919,13 +1910,6 @@ class ToolHandlers:
         info = self._background_procs[bg_id]
         proc = info["proc"]
         elapsed = time.time() - info["started"]
-        # Poll to get updated returncode
-        if proc.returncode is None:
-            try:
-                if proc._transport is not None and proc._transport.get_returncode() is not None:
-                    proc._returncode = proc._transport.get_returncode()
-            except Exception:
-                pass
         status = "running" if proc.returncode is None else f"exited (code {proc.returncode})"
         logs = info.get("logs", [])
         

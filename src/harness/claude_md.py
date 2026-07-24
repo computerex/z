@@ -1,15 +1,4 @@
-"""
-CLAUDE.md loading, inheritance, and context injection.
-
-Mirrors Claude Code's claudemd.ts — discovers, loads, and formats
-CLAUDE.md files for injection into the agent's system prompt.
-
-Priority (later = higher priority when injected):
-  1. User memory  (~/.claude/CLAUDE.md) — private global
-  2. Project      (CLAUDE.md, .claude/CLAUDE.md in directories up to root)
-  3. Local        (CLAUDE.local.md in directories up to root)
-  4. Rules        (.claude/rules/*.md — unconditional + conditional via paths: frontmatter)
-"""
+"""CLAUDE.md loader — hierarchical project instructions, memory file attachment, path-scoped rules."""
 
 from __future__ import annotations
 
@@ -20,7 +9,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +36,6 @@ class MemoryFileInfo:
     content: str
     globs: Optional[List[str]] = None  # Conditional rule glob patterns
     parent: Optional[str] = None  # Path of file that @included this one
-    # True when processed content differs from disk bytes
-    content_differs_from_disk: bool = False
     raw_content: Optional[str] = None
 
 
@@ -159,8 +145,6 @@ def parse_frontmatter_paths(raw_content: str) -> Tuple[str, Optional[List[str]]]
 # ---------------------------------------------------------------------------
 # HTML comment stripping
 # ---------------------------------------------------------------------------
-
-HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->", re.MULTILINE)
 
 
 def strip_html_comments(content: str) -> Tuple[str, bool]:
@@ -322,16 +306,11 @@ def parse_memory_file_content(
     # Strip HTML comments
     stripped_content, _ = strip_html_comments(content_without_fm)
 
-    # Track if content differed from disk
-    content_differs = stripped_content != raw_content
-
     info = MemoryFileInfo(
         path=filepath,
         type=mem_type,
         content=stripped_content,
         globs=paths,
-        content_differs_from_disk=content_differs,
-        raw_content=raw_content if content_differs else None,
     )
 
     # Extract @include paths
@@ -527,93 +506,6 @@ def _get_user_rules_dir() -> Path:
     return _get_user_claude_dir() / "rules"
 
 
-def clear_memory_file_cache():
-    """Clear the get_memory_files cache without firing hooks."""
-    global _GET_MEMORY_FILES_CACHE
-    _GET_MEMORY_FILES_CACHE = None
-
-
-def reset_memory_file_cache(reason: str = "session_start"):
-    """Reset cache and arm the InstructionsLoaded hook."""
-    global _GET_MEMORY_FILES_CACHE, _NEXT_EAGER_LOAD_REASON, _SHOULD_FIRE_HOOK
-    _GET_MEMORY_FILES_CACHE = None
-    _NEXT_EAGER_LOAD_REASON = reason
-    _SHOULD_FIRE_HOOK = True
-
-
-async def get_memory_files(
-    force_include_external: bool = False,
-) -> List[MemoryFileInfo]:
-    """Main entry point: discover and load all memory/instruction files.
-
-    Order (loaded in reverse priority):
-    1. User memory (~/.claude/CLAUDE.md + ~/.claude/rules/*.md)
-    2. Project files (CLAUDE.md, .claude/CLAUDE.md, .claude/rules/) up to root
-    3. Local files (CLAUDE.local.md) up to root
-
-    Returns list of MemoryFileInfo sorted from lowest to highest priority.
-    """
-    global _GET_MEMORY_FILES_CACHE, _SHOULD_FIRE_HOOK
-
-    if _GET_MEMORY_FILES_CACHE is not None and not force_include_external:
-        return _GET_MEMORY_FILES_CACHE
-
-    result: List[MemoryFileInfo] = []
-    processed_paths: Set[str] = set()
-
-    # ---- User memory ----
-    user_md = str(_get_user_memory_path())
-    result.extend(
-        await process_memory_file(user_md, MemoryType.User, processed_paths, True)
-    )
-    user_rules = str(_get_user_rules_dir())
-    result.extend(
-        await process_md_rules(user_rules, MemoryType.User, processed_paths, True, False)
-    )
-
-    # ---- Project + Local: walk CWD up to root ----
-    dirs: List[str] = []
-    current = Path.cwd().resolve()
-    while True:
-        dirs.append(str(current))
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-
-    # Process from root downward to CWD (so deepest wins in final list)
-    for d in reversed(dirs):
-        d_path = Path(d)
-
-        # Project files
-        for name in ("CLAUDE.md", ".claude/CLAUDE.md"):
-            p = d_path / name
-            if p.exists():
-                result.extend(
-                    await process_memory_file(str(p), MemoryType.Project, processed_paths, False)
-                )
-
-        # .claude/rules/*.md — unconditional rules
-        rules_dir = d_path / ".claude" / "rules"
-        if rules_dir.exists():
-            result.extend(
-                await process_md_rules(str(rules_dir), MemoryType.Project, processed_paths, False, False)
-            )
-
-        # Local files
-        local_path = d_path / "CLAUDE.local.md"
-        if local_path.exists():
-            result.extend(
-                await process_memory_file(str(local_path), MemoryType.Local, processed_paths, False)
-            )
-
-    # Cache it
-    if not force_include_external:
-        _GET_MEMORY_FILES_CACHE = result
-
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Nested / lazy loading
 # ---------------------------------------------------------------------------
@@ -683,80 +575,9 @@ async def get_memory_files_for_nested_directory(
     return result
 
 
-async def get_nested_memory_attachments(
-    file_path: str,
-    loaded_paths: Set[str],
-) -> List[MemoryFileInfo]:
-    """Load nested memory files for a given file path.
-
-    Called when the model touches a file outside CWD.
-
-    1. User conditional rules matching target path
-    2. Nested directories (CWD → target): CLAUDE.md + all rules
-    """
-    result: List[MemoryFileInfo] = []
-    processed = set()
-
-    # Phase 1: User conditional rules
-    user_rules = await get_managed_and_user_conditional_rules(file_path, processed)
-    for f in user_rules:
-        if f.path not in loaded_paths:
-            result.append(f)
-            loaded_paths.add(f.path)
-
-    # Phase 2: Walk CWD → target directory
-    cwd = Path.cwd().resolve()
-    target = Path(file_path).resolve().parent
-
-    nested_dirs = []
-    current = target
-    while current != cwd and str(current) != str(current.parent):
-        if str(current).startswith(str(cwd)):
-            nested_dirs.append(str(current))
-        current = current.parent
-
-    nested_dirs.reverse()  # CWD → target order
-
-    for d in nested_dirs:
-        files = await get_memory_files_for_nested_directory(d, file_path, processed)
-        for f in files:
-            if f.path not in loaded_paths:
-                result.append(f)
-                loaded_paths.add(f.path)
-
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Formatting for context injection
 # ---------------------------------------------------------------------------
-
-
-def get_claude_mds(memory_files: List[MemoryFileInfo]) -> str:
-    """Format memory files as a context string for system prompt injection."""
-    if not memory_files:
-        return ""
-
-    descriptions = {
-        MemoryType.Project: " (project instructions, checked into the codebase)",
-        MemoryType.Local: " (user's private project instructions, not checked in)",
-        MemoryType.User: " (user's private global instructions for all projects)",
-        MemoryType.AutoMem: " (auto-memory, persists across conversations)",
-    }
-
-    parts = []
-    for file in memory_files:
-        if not file.content.strip():
-            continue
-        desc = descriptions.get(file.type, "")
-        parts.append(
-            f"Contents of {file.path}{desc}:\n\n{file.content.strip()}"
-        )
-
-    if not parts:
-        return ""
-
-    return f"{MEMORY_INSTRUCTION_PROMPT}\n\n" + "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -764,21 +585,4 @@ def get_claude_mds(memory_files: List[MemoryFileInfo]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def is_memory_file_path(filepath: str) -> bool:
-    """Check if a file path is a memory file."""
-    name = os.path.basename(filepath)
-    if name in ("CLAUDE.md", "CLAUDE.local.md"):
-        return True
-    if name.endswith(".md") and ".claude" + os.sep + "rules" + os.sep in filepath:
-        return True
-    return False
 
-
-def is_instructions_memory_type(mem_type: MemoryType) -> bool:
-    """Check if a memory type represents 'instructions' (vs auto/team memory)."""
-    return mem_type in (MemoryType.User, MemoryType.Project, MemoryType.Local)
-
-
-def get_large_memory_files(files: List[MemoryFileInfo]) -> List[MemoryFileInfo]:
-    """Get files exceeding the recommended character count."""
-    return [f for f in files if len(f.content) > MAX_MEMORY_CHAR_COUNT]

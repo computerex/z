@@ -3,24 +3,13 @@
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import pytest
 from unittest.mock import patch, MagicMock
 import json
 
-
-# Import from harness.py directly (it's at root level, not in src/harness/)
-import importlib.util
-
-spec = importlib.util.spec_from_file_location(
-    "harness",
-    os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "harness.py"
-    ),
-)
-harness_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(harness_module)
+from harness import main as harness_module
 
 
 class TestFetchModelsFromProviderApi:

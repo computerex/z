@@ -1,19 +1,4 @@
-"""
-Memory system (memdir) — file-based persistent memory for Claude Code.
-
-Mirrors Claude Code's memdir subsystem:
-- File-based storage at ~/.claude/projects/<slug>/memory/
-- MEMORY.md index + topic files pattern
-- 4-type closed taxonomy (user, feedback, project, reference)
-- Cross-encoder based relevance ranking for memory recall
-
-Memory directory structure:
-  ~/.claude/projects/<project-slug>/memory/
-  ├── MEMORY.md              # Always-loaded index file
-  ├── user_role.md           # Topic files with frontmatter
-  ├── feedback_testing.md
-  └── ...
-"""
+"""Memory directory — persistent file-based memory with relevance ranking (user, feedback, project, reference)."""
 
 from __future__ import annotations
 
@@ -91,11 +76,6 @@ def _compute_project_slug(cwd: Optional[str] = None) -> str:
 def get_memory_dir(cwd: Optional[str] = None) -> Path:
     """Get the memory directory path for the current project."""
     return get_projects_dir() / _compute_project_slug(cwd) / "memory"
-
-
-def get_memory_entrypoint(cwd: Optional[str] = None) -> Path:
-    """Get the MEMORY.md path."""
-    return get_memory_dir(cwd) / ENTRYPOINT_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -440,19 +420,6 @@ def _parse_simple_frontmatter(content: str) -> dict:
             key, _, val = line.partition(":")
             result[key.strip()] = val.strip().strip("\"'")
     return result
-
-
-def format_memory_manifest(headers: List[MemoryHeader]) -> str:
-    """Format memory headers as a text manifest for the ranking query."""
-    lines = []
-    for m in headers:
-        tag = f"[{m.mem_type}] " if m.mem_type else ""
-        ts = _format_timestamp(m.mtime_ms)
-        if m.description:
-            lines.append(f"- {tag}{m.filename} ({ts}): {m.description}")
-        else:
-            lines.append(f"- {tag}{m.filename} ({ts})")
-    return "n".join(lines)
 
 
 def _format_timestamp(mtime_ms: float) -> str:

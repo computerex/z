@@ -1,4 +1,4 @@
-"""Context management utilities - Cline-style truncation and optimization."""
+"""Token estimation, conversation truncation, duplicate detection for context window management."""
 
 import json
 from typing import List, Tuple, Optional, Union, Any

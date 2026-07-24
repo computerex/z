@@ -1,8 +1,4 @@
-"""Offline replay and classifier training for semantic context management.
-
-This module turns harness context dumps into structured samples, builds
-embedding + metadata features, and trains fast classifier ensembles.
-"""
+"""Context policy replay — evaluate context retention quality from session dumps (--policy-eval)."""
 
 from __future__ import annotations
 

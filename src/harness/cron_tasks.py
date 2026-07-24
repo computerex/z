@@ -1,20 +1,9 @@
-"""Scheduled prompts, stored in ``<project>/.claude/scheduled_tasks.json``.
-
-Tasks come in two flavours:
-
-- **One-shot** (``recurring=False``) — fire once, then auto-delete.
-- **Recurring** (``recurring=True``) — fire on schedule, reschedule from now,
-  persist until explicitly deleted or auto-expired.
-
-File format::
-
-    {"tasks": [{"id": "...", "cron": "...", "prompt": "...", "createdAt": ..., ...}]}
-"""
+"""Cron task store — persistent task definitions with auto-expiry, durable/transient modes."""
 
 import json
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -120,23 +109,6 @@ def read_cron_tasks(project_dir: Optional[str] = None) -> List[CronTask]:
             permanent=bool(t.get("permanent", False)),
         ))
     return out
-
-
-def has_cron_tasks_sync(project_dir: Optional[str] = None) -> bool:
-    """Fast sync check — does the cron file have any tasks?"""
-    path = get_cron_file_path(project_dir)
-    if not path.exists():
-        return False
-    try:
-        raw = path.read_text("utf-8")
-    except Exception:
-        return False
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return False
-    tasks = data.get("tasks") if isinstance(data, dict) else None
-    return isinstance(tasks, list) and len(tasks) > 0
 
 
 def write_cron_tasks(tasks: List[CronTask], project_dir: Optional[str] = None) -> None:

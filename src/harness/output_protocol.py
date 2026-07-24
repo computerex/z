@@ -17,7 +17,7 @@ import signal
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 
 from .logger import get_logger
 
@@ -65,7 +65,9 @@ def init_output_protocol(
 # ── Progress events (stderr NDJSON) ─────────────────────────────────────
 
 def _emit_event(data: dict) -> None:
-    """Write a single NDJSON event line to stderr."""
+    """Write a single NDJSON event line to stderr (only in --json mode)."""
+    if not _json_mode:
+        return
     try:
         line = json.dumps(data, ensure_ascii=False, default=str)
         sys.stderr.write(line + "\n")
@@ -115,22 +117,7 @@ def set_iteration_count(n: int) -> None:
     _iteration_count = n
 
 
-def get_iteration_count() -> int:
-    """Get the current iteration count."""
-    return _iteration_count
-
-
 # ── Structured JSON output ──────────────────────────────────────────────
-
-@dataclass
-class TurnResult:
-    """Result of a single agent turn."""
-    status: str  # "completed", "partial", "error"
-    files_written: List[str] = field(default_factory=list)
-    result: Optional[Dict[str, Any]] = None
-    meta: Dict[str, Any] = field(default_factory=dict)
-    error: Optional[Dict[str, Any]] = None
-
 
 def emit_json_result(
     status: str,
@@ -400,15 +387,6 @@ def _install_signal_handlers() -> None:
     atexit.register(_atexit_handler)
 
 
-def is_sigterm_received() -> bool:
-    """Check if SIGTERM/SIGINT was received."""
-    return _sigterm_received
-
-
-def get_partial_state() -> Optional[Dict[str, Any]]:
-    """Get the partial state if a timeout occurred."""
-    return _partial_state
-
 
 # ── Schema validation ───────────────────────────────────────────────────
 
@@ -470,7 +448,7 @@ def validate_against_schema(
         prop_type = prop_schema.get("type", "")
 
         if prop_type == "object" and isinstance(value, dict):
-            sub_valid, sub_issues = validate_against_schema(
+            sub_issues = validate_against_schema(
                 value,
                 prop_schema,
                 schema_path=f"{schema_path}.{prop_name}" if schema_path else prop_name,
@@ -481,7 +459,7 @@ def validate_against_schema(
             if items_schema.get("type") == "object":
                 for i, item in enumerate(value):
                     if isinstance(item, dict):
-                        sub_valid, sub_issues = validate_against_schema(
+                        sub_issues = validate_against_schema(
                             item,
                             items_schema,
                             schema_path=f"{schema_path}.{prop_name}[{i}]"

@@ -1,34 +1,4 @@
-"""
-Hooks system — user-defined shell commands, HTTP calls, or LLM prompts
-that execute at various points in the agent's lifecycle.
-
-Mirrors Claude Code's hooks system (utils/hooks.ts).
-
-Hook events supported:
-  PreToolUse, PostToolUse, PostToolUseFailure — tool lifecycle
-  Stop, SessionStart, SessionEnd — session lifecycle
-  UserPromptSubmit — pre-processing user input
-  Notification — notifications
-  InstructionsLoaded — audit/observability (fire-and-forget)
-
-Configuration sources:
-  1. ~/.claude/settings.json (user)
-  2. .claude/settings.json (project, from CWD upward)
-
-Config format:
-  {
-    "hooks": {
-      "PostToolUse": [
-        {
-          "matcher": "Read",
-          "hooks": [
-            { "type": "command", "command": "echo '$ARGUMENTS'", "shell": "bash" }
-          ]
-        }
-      ]
-    }
-  }
-"""
+"""Hook system — PreToolUse, PostToolUse, SessionStart, SessionEnd, and other lifecycle events."""
 
 from __future__ import annotations
 
@@ -58,17 +28,10 @@ class HookEvent(str, Enum):
     PreToolUse = "PreToolUse"
     PostToolUse = "PostToolUse"
     PostToolUseFailure = "PostToolUseFailure"
-    Stop = "Stop"
     SessionStart = "SessionStart"
     SessionEnd = "SessionEnd"
     UserPromptSubmit = "UserPromptSubmit"
-    Notification = "Notification"
     InstructionsLoaded = "InstructionsLoaded"
-    PermissionRequest = "PermissionRequest"
-
-    @classmethod
-    def all_events(cls) -> List[str]:
-        return [e.value for e in cls]
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +68,6 @@ class HookCommand:
     # Common fields
     shell: Optional[str] = None  # "bash" or "powershell"
     timeout: Optional[int] = None  # seconds
-    status_message: Optional[str] = None
-    once: Optional[bool] = None
     async_: Optional[bool] = None  # "async" is a Python keyword
     async_rewake: Optional[bool] = None
     if_: Optional[str] = None  # Permission rule syntax for filtering
@@ -117,10 +78,6 @@ class HookCommand:
     def __post_init__(self):
         if self.shell is None and self.type == HookCommandType.command:
             self.shell = "bash"
-
-    @property
-    def is_async(self) -> bool:
-        return self.async_ is True or self.async_rewake is True
 
 
 @dataclass
@@ -230,8 +187,6 @@ def _parse_hook_command(data: dict) -> Optional[HookCommand]:
         "type": ht,
         "shell": data.get("shell"),
         "timeout": data.get("timeout"),
-        "status_message": data.get("statusMessage"),
-        "once": data.get("once"),
         "async_": data.get("async"),
         "async_rewake": data.get("asyncRewake"),
         "if_": data.get("if"),
@@ -360,7 +315,6 @@ def has_hook_for_event(event: HookEvent) -> bool:
 # ---------------------------------------------------------------------------
 
 DEFAULT_HOOK_TIMEOUT_MS = 10 * 60 * 1000  # 10 minutes
-DEFAULT_HTTP_HOOK_TIMEOUT_MS = 30_000  # 30 seconds
 
 
 async def execute_hooks(
@@ -526,49 +480,7 @@ async def _exec_command_hook(
         )
 
 
-async def _exec_async_hook(
-    hook: HookCommand,
-    json_input: str,
-    event: HookEvent,
-) -> HookResult:
-    """Execute a hook in background (async / asyncRewake)."""
-    if not hook.command:
-        return HookResult(command="", succeeded=False, output="No command specified", blocked=False)
 
-    try:
-        args = _prepare_command(hook.command, json_input, hook.shell or "bash")
-
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        if hook.async_rewake:
-            # Track it so we can inject notification on exit code 2
-            _track_rewake_hook(proc, hook, event)
-
-        # Fire-and-forget: don't await
-        return HookResult(
-            command=hook.command,
-            succeeded=True,
-            output="Hook started in background",
-            blocked=False,
-        )
-
-    except Exception as e:
-        return HookResult(
-            command=hook.command,
-            succeeded=False,
-            output=str(e),
-            blocked=False,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Async rewake tracking
-# ---------------------------------------------------------------------------
 
 _rewake_hooks: List[Dict[str, Any]] = []
 
@@ -609,30 +521,6 @@ def _track_rewake_hook(
                     break
 
     asyncio.ensure_future(_check())
-
-
-def check_rewake_hooks() -> List[str]:
-    """Check if any asyncRewake hooks have exited with code 2.
-
-    Returns list of notification messages.
-    """
-    messages = []
-    to_remove = []
-
-    for i, entry in enumerate(_rewake_hooks):
-        proc = entry["proc"]
-        if proc.returncode is not None:
-            if proc.returncode == 2:
-                messages.append(
-                    f"Stop hook blocking error from command \"{entry['hook'].command}\""
-                )
-            to_remove.append(i)
-
-    # Remove in reverse
-    for i in reversed(to_remove):
-        _rewake_hooks.pop(i)
-
-    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -888,36 +776,3 @@ async def execute_user_prompt_submit_hooks(user_input: str) -> List[HookResult]:
         },
     )
 
-
-async def execute_instructions_loaded_hooks(
-    file_path: str,
-    mem_type: str,
-    load_reason: str,
-    globs: Optional[List[str]] = None,
-    trigger_file_path: Optional[str] = None,
-    parent_file_path: Optional[str] = None,
-) -> List[HookResult]:
-    """Execute InstructionsLoaded hooks (fire-and-forget, audit only)."""
-    return await execute_hooks(
-        HookEvent.InstructionsLoaded,
-        hook_input={
-            "hook_event_name": "InstructionsLoaded",
-            "file_path": file_path,
-            "memory_type": mem_type,
-            "load_reason": load_reason,
-            "globs": globs,
-            "trigger_file_path": trigger_file_path,
-            "parent_file_path": parent_file_path,
-        },
-        match_query=load_reason,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Public check functions
-# ---------------------------------------------------------------------------
-
-
-def has_instructions_loaded_hook() -> bool:
-    """Check if any InstructionsLoaded hooks are configured."""
-    return has_hook_for_event(HookEvent.InstructionsLoaded)

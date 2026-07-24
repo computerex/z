@@ -111,11 +111,6 @@ class RemoteInputManager:
         """Get a provider by name."""
         return self._providers.get(name)
 
-    @property
-    def active_providers(self) -> list[str]:
-        """Return names of all registered providers."""
-        return list(self._providers.keys())
-
     def has_providers(self) -> bool:
         """Check if any providers are registered."""
         return len(self._providers) > 0

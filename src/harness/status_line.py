@@ -1,10 +1,4 @@
-"""Persistent bottom status line for the harness terminal UI.
-
-Renders a single overwritable line at the bottom of the terminal showing
-the current activity state: waiting for LLM, streaming, executing tool,
-retrying, idle, etc.  Uses simple \\r + ANSI clear-line to avoid complex
-terminal manipulation (no curses / rich Live needed).
-"""
+"""Terminal status line — spinner, retry count, tool execution progress display."""
 
 import sys
 import time
@@ -31,7 +25,6 @@ class StatusLine:
     STREAMING = "streaming"
     TOOL_EXEC = "tool_exec"
     RETRYING = "retrying"
-    COMPACTING = "compacting"
     WAITING = "waiting"
 
     _SPINNER = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
@@ -51,10 +44,6 @@ class StatusLine:
         self._max_iterations = 0
         # Turn-level timer (persists across clear() calls within a turn)
         self._turn_start: Optional[float] = None
-        # Retry info
-        self._retry_attempt = 0
-        self._retry_max = 0
-        self._retry_wait = 0
         # Background ticker for spinner animation and elapsed time
         self._tick_stop = threading.Event()
         self._ticker_thread: Optional[threading.Thread] = None
@@ -96,9 +85,6 @@ class StatusLine:
         if not self._enabled:
             return
         with self._lock:
-            self._retry_attempt = attempt
-            self._retry_max = max_retries
-            self._retry_wait = wait_secs
             reason_part = f" ({reason})" if reason else ""
             self._text = f"Retry {attempt}/{max_retries}{reason_part} — waiting {wait_secs:.0f}s"
             self._state = self.RETRYING
@@ -261,9 +247,5 @@ class StatusLine:
             
             def print(status_self, *args, **kwargs):
                 status_self._status.print_safe(status_self._console, *args, **kwargs)
-            
-            def __getattr__(status_self, name):
-                # Delegate all other attributes to the real console
-                return getattr(status_self._console, name)
         
         return StatusAwareConsole(self, console)

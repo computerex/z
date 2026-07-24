@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from harness.todo_manager import TodoManager, TodoItem, TodoStatus
 from harness.smart_context import (
     SmartContextManager,
-    SemanticScorer,
     CompactionTrace,
     PROTECTED_INDICES,
     COMPACT_MARKER,
@@ -659,37 +658,6 @@ class TestSmartContextManager:
 
         # The auth-related content should be more relevant to \"Fix auth\" todo
         assert rel_score > irr_score
-
-    def test_semantic_scorer_fallback(self):
-        """SemanticScorer falls back to keyword matching when model unavailable."""
-        scorer = SemanticScorer()
-        scorer._load_failed = True  # Force fallback
-
-        score = scorer.score_relevance(
-            "def authenticate_user(): jwt.decode(token)",
-            "Fix authentication bug | src/auth.py",
-        )
-        assert 0.0 <= score <= 1.0
-        assert score > 0.0  # Should find keyword overlap
-
-    def test_semantic_scorer_fallback_no_query(self):
-        """SemanticScorer returns neutral score when query is empty."""
-        scorer = SemanticScorer()
-        scorer._load_failed = True
-        score = scorer.score_relevance("some content", "")
-        assert score == 0.4  # neutral
-
-    def test_semantic_scorer_batch(self):
-        """score_batch should return one score per content."""
-        scorer = SemanticScorer()
-        scorer._load_failed = True  # Force fallback for test speed
-
-        contents = ["auth login code", "database pooling", "readme hello world"]
-        scores = scorer.score_batch(contents, "Fix authentication login")
-        assert len(scores) == 3
-        assert all(0.0 <= s <= 1.0 for s in scores)
-        # "auth login code" should be most relevant
-        assert scores[0] > scores[2]
 
     def test_trace_history_bounded(self):
         """Compaction traces should be bounded to _max_traces."""
