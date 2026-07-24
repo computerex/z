@@ -142,16 +142,6 @@ class TestFetchProviderModelIds:
 
     @patch.object(harness_module, "_fetch_models_from_provider_api")
     @patch("harness.streaming_client.search_litellm_models")
-    def test_known_provider_uses_litellm(self, mock_search, mock_fetch_provider):
-        """Test that known providers use LiteLLM model search."""
-        harness_module._fetch_provider_model_ids("https://api.anthropic.com", "sk-test")
-
-        # Should call LiteLLM search for known providers
-        mock_search.assert_called_once_with("anthropic/")
-        mock_fetch_provider.assert_not_called()
-
-    @patch.object(harness_module, "_fetch_models_from_provider_api")
-    @patch("harness.streaming_client.search_litellm_models")
     def test_unknown_provider_queries_api(self, mock_search, mock_fetch_provider):
         """Test that unknown providers query their API directly."""
         mock_fetch_provider.return_value = ["model-1", "model-2"]

@@ -26,7 +26,7 @@ from harness.tool_registry import (
 def _schema_by_name() -> dict[str, dict]:
     """Return {tool_name: function_schema} from the generated OpenAI tools."""
     schema: dict[str, dict] = {}
-    for entry in tool_defs_to_openai_tools():
+    for entry in tool_defs_to_openai_tools(model="glm-4.7"):
         func = entry["function"]
         schema[func["name"]] = func
     return schema
