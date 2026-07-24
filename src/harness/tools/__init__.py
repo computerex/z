@@ -29,6 +29,7 @@ class ToolHandlers:
     LARGE_WRITE_FEEDBACK_THRESHOLD = 256 * 1024
     LARGE_WRITE_CHUNK_SIZE = 128 * 1024
     MAX_FULL_READ_LINES = 2000
+    _MAX_LIVE_DISPLAY = 10
 
     def __init__(
         self,

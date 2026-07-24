@@ -1,5 +1,7 @@
 """Tool implementations — see tools/__init__.py for the ToolHandlers class."""
 import asyncio
+import base64
+import logging
 import os
 import re
 import time
@@ -10,6 +12,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import subprocess
 import signal
 import platform
+
+from ..context import truncate_output
+from ..logger import get_logger, log_exception, truncate as log_truncate
+from ._base import (
+    _decode_clixml_in_text,
+    _decode_powershell_clixml,
+    _detect_log_file_encoding,
+    kill_process_tree,
+    sanitize_terminal_output,
+)
+from .mcp import _get_bg_log_path, _get_cmd_log_path
+
+log = get_logger("tools")
 
 async def execute_command(self, params: Dict[str, str]) -> str:
     """Execute a shell command with live output display and interrupt support.
@@ -37,7 +52,7 @@ async def execute_command(self, params: Dict[str, str]) -> str:
         return await self._run_background_command(command)
 
     # ── Launch with file redirect ──────────────────────────────────
-    cmd_log_path = self._get_cmd_log_path()
+    cmd_log_path = _get_cmd_log_path(self)
 
     # Truncate the log file before launching so the tail loop never
     # reads stale content from a previous session (the cmd_id counter
@@ -282,7 +297,7 @@ async def _run_background_command(self, command: str) -> str:
 
     proc_id = self._next_bg_id
     self._next_bg_id += 1
-    log_path = self._get_bg_log_path(proc_id)
+    log_path = _get_bg_log_path(self, proc_id)
 
     # Truncate before launch to avoid stale content from previous sessions
     Path(log_path).write_text("", encoding="utf-8")

@@ -7,6 +7,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..logger import get_logger
+
+log = get_logger("tools")
+
 async def retrieve_tool_result(self, params: Dict[str, str]) -> str:
     """Retrieve the full content of a previously compacted tool result.
 

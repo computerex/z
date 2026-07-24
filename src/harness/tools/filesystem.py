@@ -13,7 +13,8 @@ log = get_logger("tools")
 
 async def list_files(self, params: Dict[str, str]) -> str:
     """List files in a directory."""
-    path = self._resolve_path(params.get("path", "."))
+    from .mcp import _resolve_path
+    path = _resolve_path(self, params.get("path", "."))
     recursive = params.get("recursive", False); recursive = bool(recursive) if isinstance(recursive, (bool, int)) else str(recursive).lower() == "true"
 
     if not path.exists():
@@ -68,7 +69,8 @@ async def list_files(self, params: Dict[str, str]) -> str:
 
 async def search_files(self, params: Dict[str, str]) -> str:
     """Search for patterns in files."""
-    path = self._resolve_path(params.get("path", "."))
+    from .mcp import _resolve_path
+    path = _resolve_path(self, params.get("path", "."))
     regex = params.get("regex", "")
     file_pattern = params.get("file_pattern", "*")
     log.debug("search_files: path=%s regex=%s file_pattern=%s", path, regex, file_pattern)

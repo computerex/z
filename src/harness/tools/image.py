@@ -26,7 +26,8 @@ async def analyze_image(self, params: Dict[str, str]) -> str:
         "Describe this image in detail. Note any text, UI elements, errors, or important visual details.",
     )
 
-    path = self._resolve_path(path_str)
+    from .mcp import _resolve_path
+    path = _resolve_path(self, path_str)
     if not path.exists():
         return f"Error: Image not found: {path}"
     if not is_image_file(path):

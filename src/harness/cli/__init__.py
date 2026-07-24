@@ -1,9 +1,9 @@
 """CLI subpackage — install wizard, provider management, sessions."""
-from ..main import main
 
 
 def run():
     """Entry point for the 'z' console script (backward compat)."""
+    from ..main import main  # lazy import to avoid circular import
     return main() or 0
 
 

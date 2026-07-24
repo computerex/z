@@ -134,7 +134,15 @@ from .context import find_relevant_memories, get_memory_dir
 
 # Re-exports from cli/ subpackage
 from .cli.install import run_install
-from .cli.providers import load_providers
+from .cli.providers import (
+    load_providers,
+    _infer_active_provider_profile,
+    _save_active_config_fields,
+    _save_provider_profile_fields,
+    run_in_app_config_wizard,
+    run_model_switch_wizard,
+    run_provider_manager,
+)
 from .cli.sessions import get_sessions_dir, get_session_path, list_sessions
 
 _mark("import_harness_core")

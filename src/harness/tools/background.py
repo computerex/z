@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 from ._base import kill_process_tree, _detect_log_file_encoding
+from .mcp import _close_mcp_session
 
 async def _background_log_tailer(self, bg_id: int, proc: asyncio.subprocess.Process,
                                   log_path: str):
@@ -92,7 +93,7 @@ async def cleanup_background_procs_async(self) -> None:
     # Close persistent MCP sessions on shutdown.
     for sname in list(self._mcp_sessions.keys()):
         try:
-            await self._close_mcp_session(sname)
+            await _close_mcp_session(self, sname)
         except Exception:
             pass
     self._background_procs.clear()

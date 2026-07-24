@@ -1,7 +1,10 @@
 """Provider management — loading, switching, model picker, provider hub."""
+import concurrent.futures
 import json, os, hashlib, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+from ..config import get_global_config_path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -9,6 +12,10 @@ from rich.text import Text
 from rich.markup import escape as rich_escape
 from rich import box
 import httpx
+
+def _get_legacy_global_models_path() -> Path:
+    return Path.home() / ".z" / "models.json"
+
 
 def load_providers(workspace: str) -> Dict[str, dict]:
     """Load provider configs from ~/.z.json (single-file config)."""
@@ -324,7 +331,7 @@ def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
 def _fetch_bedrock_models(api_url: str, api_key: str) -> List[str]:
     """Fetch model IDs from AWS Bedrock.  Uses Bedrock's custom API."""
     from ..streaming_client import search_litellm_models
-    from .providers import list_bedrock_models
+    from ..providers.bedrock_provider import list_bedrock_models
 
     url = (api_url or "").lower()
     region = "us-east-1"
@@ -364,9 +371,9 @@ def _fetch_oauth_models(api_url: str) -> List[str]:
     """Fetch model IDs for OAuth-based providers (GitHub Copilot, OpenAI Codex)."""
     url_lower = (api_url or "").lower()
     if "githubcopilot" in url_lower or "copilot" in url_lower:
-        from .providers import get_copilot_models
+        from ..providers.copilot_oauth_client import get_copilot_models
         return get_copilot_models()
-    from .providers import get_codex_models
+    from ..providers.codex_models import get_codex_models
     return get_codex_models()
 
 
@@ -1051,7 +1058,7 @@ def run_in_app_config_wizard(
 
         # Import OAuth manager
         try:
-            from .providers import get_oauth_manager
+            from ..providers.oauth import get_oauth_manager
 
             oauth_manager = get_oauth_manager()
 
@@ -1115,10 +1122,10 @@ def run_in_app_config_wizard(
 
     # Skip model fetching for OAuth providers (OAuth tokens are for ChatGPT web, not standard API)
     if is_oauth:
-        from .providers import get_codex_models
+        from ..providers.codex_models import get_codex_models
 
         if "GitHub Copilot" in label:
-            from .providers import get_copilot_models
+            from ..providers.copilot_oauth_client import get_copilot_models
 
             console.print(
                 "  [dim]Note: GitHub Copilot OAuth tokens access Copilot models directly.[/dim]"
