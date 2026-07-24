@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from harness.context_replay import extract_nodes_from_dump, build_training_matrix, run_replay
+from harness.context.context_replay import extract_nodes_from_dump, build_training_matrix, run_replay
 
 
 def test_extract_nodes_from_dump(tmp_path: Path):

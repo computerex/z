@@ -19,14 +19,14 @@ if os.environ.get("HARNESS_LITELLM_DEBUG") == "1":
         pass
 
 # Import OAuth client
-from .codex_oauth_client import (
+from .providers import (
     CodexOAuthClient,
     CodexMessage,
     is_oauth_token,
     extract_oauth_token,
+    get_codex_models,
+    get_oauth_manager,
 )
-from .codex_models import get_codex_models
-from .oauth import get_oauth_manager
 
 # Think-token sanitization (for tool_handlers compatibility)
 _THINK_ZWS = "\u200b"
@@ -332,7 +332,7 @@ class StreamingJSONClient:
                     # GitHub Copilot
                     oauth_token = oauth_manager.get_token("github-copilot")
                     if oauth_token:
-                        from .copilot_oauth_client import CopilotOAuthClient
+                        from .providers import CopilotOAuthClient
 
                         self._copilot_client = CopilotOAuthClient(
                             oauth_token=oauth_token,
@@ -378,7 +378,7 @@ class StreamingJSONClient:
             if self._is_bedrock:
                 # Use custom Bedrock provider for bearer token auth
                 try:
-                    from .bedrock_provider import BedrockClient
+                    from .providers import BedrockClient
 
                     # Bedrock models typically have 32K context, leave room for input
                     bedrock_max_tokens = min(max_tokens, 16000)  # Conservative default
@@ -713,7 +713,7 @@ class StreamingJSONClient:
     ) -> StreamingChatResponse:
         """Stream using custom Bedrock provider for bearer token auth."""
         import concurrent.futures
-        from .bedrock_provider import BedrockMessage
+        from .providers import BedrockMessage
 
         # Convert StreamingMessage to BedrockMessage
         bedrock_messages = [
@@ -814,7 +814,7 @@ class StreamingJSONClient:
         if not self._copilot_client:
             raise RuntimeError("Copilot OAuth client not initialized")
 
-        from .copilot_oauth_client import CopilotMessage
+        from .providers import CopilotMessage
 
         # Convert StreamingMessage to CopilotMessage with reasoning context
         copilot_messages = []

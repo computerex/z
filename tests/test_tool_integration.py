@@ -26,7 +26,7 @@ from harness.cline_agent import (
 )
 from harness.config import Config
 from harness.todo_manager import TodoManager, TodoStatus
-from harness.smart_context import SmartContextManager
+from harness.context import SmartContextManager
 from harness.streaming_client import StreamingChatResponse
 
 
@@ -400,7 +400,7 @@ class TestContextCompactionIntegration:
         """clear_history resets todos and smart context."""
         agent = self._make_agent()
         agent.todo_manager.add("Task")
-        from harness.smart_context import CompactionTrace
+        from harness.context import CompactionTrace
 
         agent.smart_context.compaction_traces.append(
             CompactionTrace("file_read", "test.py", "test", tokens_freed=100)
@@ -413,7 +413,7 @@ class TestContextCompactionIntegration:
     def test_eviction_count_in_stats(self):
         """Eviction count shows in context stats."""
         agent = self._make_agent()
-        from harness.smart_context import CompactionTrace
+        from harness.context import CompactionTrace
 
         agent.smart_context.compaction_traces.append(
             CompactionTrace("file_read", "old.py", "Old file", tokens_freed=500)

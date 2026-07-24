@@ -39,7 +39,7 @@ def _remote_model_has_vision(model: str, api_url: str = "") -> Optional[bool]:
     otherwise None.
     """
     try:
-        from .context_management import get_remote_model_data
+        from .context import get_remote_model_data
 
         data = get_remote_model_data(model, api_url=api_url)
         if not isinstance(data, dict):

@@ -233,3 +233,45 @@ class BedrockClient:
         }
 
 
+
+def list_bedrock_models(api_key: str, region: str = "us-east-1") -> List[str]:
+    """List available foundation models from AWS Bedrock.
+
+    Queries the actual AWS Bedrock API to get all models available
+    in the user's account/region.
+    """
+    if not BOTO3_AVAILABLE:
+        return []
+
+    try:
+        if api_key:
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = api_key
+
+        client = boto3.client(
+            "bedrock",
+            region_name=region,
+            config=Config(retries={"max_attempts": 3}),
+        )
+
+        models = []
+        response = client.list_foundation_models()
+
+        for model in response.get("modelSummaries", []):
+            model_id = model.get("modelId", "")
+            if model_id:
+                models.append(model_id)
+
+        try:
+            profile_resp = client.list_inference_profiles(maxResults=1000)
+            for p in profile_resp.get("inferenceProfileSummaries", []):
+                pid = p.get("inferenceProfileId", "")
+                if pid and p.get("status") == "ACTIVE":
+                    models.append(pid)
+        except Exception:
+            pass
+
+        return sorted(set(models))
+    except Exception as e:
+        import sys
+        print(f"[DEBUG] Bedrock model list error: {e}", file=sys.stderr)
+        return []

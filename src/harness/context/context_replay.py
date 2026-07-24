@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .context_management import estimate_tokens
 from .smart_context import SmartContextManager
-from .todo_manager import TodoManager
+from ..todo_manager import TodoManager
 
 try:
     import numpy as np

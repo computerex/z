@@ -62,7 +62,7 @@ def _get_remote_pricing(model: str, api_url: str = "") -> Optional[Dict[str, flo
     Returns per-1M-token rates as {input, output[, cache_read]} or None.
     """
     try:
-        from .context_management import get_remote_model_data
+        from .context import get_remote_model_data
 
         raw = get_remote_model_data(model, api_url)
         if not raw or not isinstance(raw, dict):

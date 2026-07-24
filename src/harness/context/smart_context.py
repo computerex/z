@@ -8,11 +8,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Any, TYPE_CHECKING
 
 from .context_management import estimate_tokens, estimate_messages_tokens, truncate_conversation
-from .logger import get_logger
+from ..logger import get_logger
 
 
 if TYPE_CHECKING:
-    from .todo_manager import TodoManager
+    from ..todo_manager import TodoManager
 
 log = get_logger("smart_context")
 

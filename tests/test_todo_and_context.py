@@ -10,12 +10,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from harness.todo_manager import TodoManager, TodoItem, TodoStatus
-from harness.smart_context import (
-    SmartContextManager,
-    CompactionTrace,
-    PROTECTED_INDICES,
-    COMPACT_MARKER,
-)
+from harness.context.context_management import DuplicateDetector
+from harness.context.smart_context import SmartContextManager, CompactionTrace, COMPACT_MARKER
 
 
 # ============================================================

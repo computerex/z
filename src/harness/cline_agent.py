@@ -35,8 +35,6 @@ from .hooks import (
     execute_post_tool_use_hooks,
     execute_post_tool_use_failure_hooks,
 )
-from .memdir import load_memory_prompt, find_relevant_memories, get_memory_dir
-
 from .interrupt import (
     is_interrupted,
     is_background_requested,
@@ -45,7 +43,10 @@ from .interrupt import (
     start_monitoring,
     stop_monitoring,
 )
-from .context_management import (
+from .context import (
+    load_memory_prompt,
+    find_relevant_memories,
+    get_memory_dir,
     estimate_tokens,
     estimate_messages_tokens,
     get_model_limits,
@@ -53,6 +54,7 @@ from .context_management import (
     truncate_output,
     truncate_file_content,
     DuplicateDetector,
+    SmartContextManager,
 )
 
 if os.environ.get("HARNESS_TIMING") == "1":
@@ -64,7 +66,6 @@ if os.environ.get("HARNESS_TIMING") == "1":
     _agent_t2 = _time_mod_agent.perf_counter()
 
 from .todo_manager import TodoManager, TodoStatus
-from .smart_context import SmartContextManager
 
 if os.environ.get("HARNESS_TIMING") == "1":
     _agent_t3 = _time_mod_agent.perf_counter()
@@ -80,8 +81,7 @@ from .tool_registry import (
 from .logger import get_logger, log_exception, truncate as log_truncate
 
 # Scheduled tasks (cron) scheduler
-from .cron_scheduler import CronScheduler, CronSchedulerOptions
-from .cron_tasks import clear_session_tasks
+from .cron import CronScheduler, CronSchedulerOptions, clear_session_tasks
 
 if os.environ.get("HARNESS_TIMING") == "1":
     _agent_t4 = _time_mod_agent.perf_counter()
@@ -1174,7 +1174,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
         # Sanitize tool_calls groups — popping can break assistant(tool_calls)/tool
         # message pairs, which causes providers like DeepSeek to reject with 400.
-        from .context_management import sanitize_tool_call_groups
+        from .context import sanitize_tool_call_groups
 
         sanitized = sanitize_tool_call_groups(self.messages, log)
         if sanitized:
@@ -1773,7 +1773,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     log.error("Token estimation timed out - context may be corrupt")
                     self.console.print("[red]Error: Token estimation timed out[/red]")
                     # Fallback: truncate aggressively
-                    from .context_management import truncate_conversation
+                    from .context import truncate_conversation
 
                     result = truncate_conversation(self.messages, strategy="lastTwo")
                     self.messages = result.messages
@@ -2065,7 +2065,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         # before sending to the API.  This catches edge cases
                         # where compaction or /pop didn't fully repair the
                         # message history.
-                        from .context_management import sanitize_tool_call_groups
+                        from .context import sanitize_tool_call_groups
 
                         sanitized = sanitize_tool_call_groups(self.messages, log)
                         if sanitized:

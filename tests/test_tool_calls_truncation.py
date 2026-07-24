@@ -6,7 +6,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from dataclasses import dataclass
-from harness.context_management import truncate_conversation, _is_tool, _has_tool_calls, _tc_count
+from harness.context.context_management import truncate_conversation, _is_tool, _has_tool_calls, _tc_count
 
 
 @dataclass

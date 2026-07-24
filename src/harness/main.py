@@ -4,6 +4,10 @@
 import sys
 import os
 import time as _time_mod
+import warnings
+
+# requests/urllib3 version mismatch is a known packaging issue — harmless noise
+warnings.filterwarnings("ignore", message=r"urllib3.*doesn't match a supported version")
 
 # Boot timing (only active when HARNESS_TIMING=1)
 if os.environ.get("HARNESS_TIMING") == "1":
@@ -130,7 +134,7 @@ from .hooks import (
     execute_session_end_hooks,
     execute_user_prompt_submit_hooks,
 )
-from .memdir import find_relevant_memories, get_memory_dir
+from .context import find_relevant_memories, get_memory_dir
 
 _mark("import_harness_core")
 from rich.console import Console
@@ -435,7 +439,7 @@ def run_install(
 
         # Import OAuth manager
         try:
-            from .oauth import get_oauth_manager
+            from .providers import get_oauth_manager
 
             oauth_manager = get_oauth_manager()
 
@@ -495,8 +499,8 @@ def run_install(
 
     # Model
     if is_oauth:
-        from .codex_models import get_codex_models
-        from .copilot_oauth_client import get_copilot_models
+        from .providers import get_codex_models
+        from .providers import get_copilot_models
 
         if "GitHub Copilot" in provider:
             print(
@@ -1073,7 +1077,7 @@ def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
 def _fetch_bedrock_models(api_url: str, api_key: str) -> List[str]:
     """Fetch model IDs from AWS Bedrock.  Uses Bedrock's custom API."""
     from .streaming_client import search_litellm_models
-    from .bedrock_provider import list_bedrock_models
+    from .providers import list_bedrock_models
 
     url = (api_url or "").lower()
     region = "us-east-1"
@@ -1113,9 +1117,9 @@ def _fetch_oauth_models(api_url: str) -> List[str]:
     """Fetch model IDs for OAuth-based providers (GitHub Copilot, OpenAI Codex)."""
     url_lower = (api_url or "").lower()
     if "githubcopilot" in url_lower or "copilot" in url_lower:
-        from .copilot_oauth_client import get_copilot_models
+        from .providers import get_copilot_models
         return get_copilot_models()
-    from .codex_models import get_codex_models
+    from .providers import get_codex_models
     return get_codex_models()
 
 
@@ -1800,7 +1804,7 @@ def run_in_app_config_wizard(
 
         # Import OAuth manager
         try:
-            from .oauth import get_oauth_manager
+            from .providers import get_oauth_manager
 
             oauth_manager = get_oauth_manager()
 
@@ -1864,10 +1868,10 @@ def run_in_app_config_wizard(
 
     # Skip model fetching for OAuth providers (OAuth tokens are for ChatGPT web, not standard API)
     if is_oauth:
-        from .codex_models import get_codex_models
+        from .providers import get_codex_models
 
         if "GitHub Copilot" in label:
-            from .copilot_oauth_client import get_copilot_models
+            from .providers import get_copilot_models
 
             console.print(
                 "  [dim]Note: GitHub Copilot OAuth tokens access Copilot models directly.[/dim]"
@@ -3283,7 +3287,7 @@ if __name__ == '__main__':
         return
 
     if args.policy_eval:
-        from .context_replay import run_replay
+        from .context import run_replay
 
         con = Console()
         dump_paths = [Path(p).expanduser().resolve() for p in args.policy_eval]
@@ -4450,7 +4454,7 @@ if __name__ == '__main__':
                         continue
 
                     elif cmd == "/smart":
-                        from .context_management import (
+                        from .context import (
                             get_model_limits as _gml,
                             estimate_messages_tokens as _emt,
                         )
@@ -4557,7 +4561,7 @@ if __name__ == '__main__':
                         continue
 
                     elif cmd == "/policyeval":
-                        from .context_replay import run_replay
+                        from .context import run_replay
 
                         arg = cmd_arg.strip()
                         if not arg:
