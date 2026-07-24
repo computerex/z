@@ -9,7 +9,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 import json
 
-from harness import main as harness_module
+from harness.cli import providers as harness_module
 
 
 class TestFetchModelsFromProviderApi:

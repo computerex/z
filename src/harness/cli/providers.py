@@ -2,6 +2,12 @@
 import json, os, hashlib, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.markup import escape as rich_escape
+from rich import box
 import httpx
 
 def load_providers(workspace: str) -> Dict[str, dict]:
@@ -264,7 +270,7 @@ def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
     if api_key and api_key.startswith("oauth:"):
         return _fetch_oauth_models(api_url)
 
-    from .streaming_client import search_litellm_models
+    from ..streaming_client import search_litellm_models
     url = (api_url or "").lower()
 
     # ── Look up URL in routing table ────────────────────────────────
@@ -317,7 +323,7 @@ def _fetch_provider_model_ids(api_url: str, api_key: str) -> List[str]:
 
 def _fetch_bedrock_models(api_url: str, api_key: str) -> List[str]:
     """Fetch model IDs from AWS Bedrock.  Uses Bedrock's custom API."""
-    from .streaming_client import search_litellm_models
+    from ..streaming_client import search_litellm_models
     from .providers import list_bedrock_models
 
     url = (api_url or "").lower()

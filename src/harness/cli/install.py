@@ -1,5 +1,6 @@
 """Install wizard — interactive and headless provider setup."""
-from pathlib import Path\nfrom typing import Optional
+from pathlib import Path
+from typing import Optional
 import json
 
 def run_install(
@@ -16,7 +17,6 @@ def run_install(
         model: Model name (headless mode)
         global_config: Deprecated; config is always saved to ~/.z.json
     """
-    from pathlib import Path\nfrom typing import Optional
     import json
 
     # Headless mode - all params provided
