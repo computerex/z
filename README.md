@@ -12,8 +12,6 @@ I use my own API keys. GLM 4.7, GLM 5.2, DeepSeek V4 Flash, DeepSeek V4 Pro — 
 
 **Context survives compaction.** Half, quarter, lastTwo strategies with breadcrumbs. Todos persist. Tool results are cached for retrieval. If z already read it, it doesn't re-read it.
 
-**Undo/redo for AI turns.** Git snapshots before every agent action. `/undo` reverts files *and* conversation. `/redo` replays.
-
 **26 providers, one `z`.** Z.AI, DeepSeek, Anthropic, OpenAI, Ollama, Bedrock, Copilot OAuth — all through LiteLLM. Normalizes model names automatically.
 
 ## Quick start
@@ -41,7 +39,6 @@ z --telegram <bot-token> --telegram-username your_username
 | Command | What |
 |---|---|
 | `/providers use <name>` | Switch models mid-session |
-| `/undo`, `/redo` | Undo/redo AI turns |
 | `/compact` | Force context compaction |
 | `/cost` | Token usage and spend |
 | `/todo` | Todo panel |
