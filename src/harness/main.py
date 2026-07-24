@@ -4,10 +4,6 @@
 import sys
 import os
 import time as _time_mod
-import warnings
-
-# requests/urllib3 version mismatch is a known packaging issue — harmless noise
-warnings.filterwarnings("ignore", message=r"urllib3.*doesn't match a supported version")
 
 # Boot timing (only active when HARNESS_TIMING=1)
 if os.environ.get("HARNESS_TIMING") == "1":
