@@ -30,6 +30,7 @@ class ToolDef:
     category: str = "general"         # file, shell, search, context, meta, agent
     params: List[ToolParam] = field(default_factory=list)
     description: str = ""
+    complex_content: bool = False     # if True, tool result may contain structured/multi-modal content
 
 
 

@@ -509,6 +509,11 @@ class ClineAgent:
         if plugin_docs:
             result += "\n\n====\n\nPLUGIN TOOLS\n\n" + plugin_docs
 
+        # Append plugin system_prompt hook contributions
+        plugin_prompt_additions = self.plugin_manager.get_system_prompt_additions()
+        if plugin_prompt_additions:
+            result += "\n\n====\n\nPLUGIN INSTRUCTIONS\n\n" + plugin_prompt_additions
+
         # Append workspace instruction files (CLAUDE.md, agent.md)
         instructions = self._load_instruction_files()
         if instructions:
@@ -1401,7 +1406,21 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         self.messages = result.messages
 
         after = estimate_messages_tokens(self.messages)
-        return before - after
+        freed = before - after
+
+        # ── Plugin on_compact hooks ──
+        try:
+            asyncio.ensure_future(
+                self.plugin_manager.execute_hooks("on_compact", freed, {
+                    "strategy": strategy,
+                    "before_tokens": before,
+                    "after_tokens": after,
+                })
+            )
+        except Exception as e:
+            debug_print(f"Plugin on_compact hook failed: {e}")
+
+        return freed
 
     async def compact_by_llm(self) -> int:
         """Compact conversation history by asking the model to produce a compressed summary.
@@ -1507,7 +1526,21 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 pass
 
         after = estimate_messages_tokens(self.messages)
-        return before - after
+        freed = before - after
+
+        # ── Plugin on_compact hooks ──
+        try:
+            asyncio.ensure_future(
+                self.plugin_manager.execute_hooks("on_compact", freed, {
+                    "strategy": "llm",
+                    "before_tokens": before,
+                    "after_tokens": after,
+                })
+            )
+        except Exception as e:
+            debug_print(f"Plugin on_compact hook failed: {e}")
+
+        return freed
 
     async def run_message(
         self,
@@ -2074,6 +2107,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                                 sanitized,
                             )
 
+                        # ── Plugin pre_turn hooks ──
+                        try:
+                            await self.plugin_manager.execute_hooks("pre_turn", self.messages)
+                        except Exception as e:
+                            debug_print(f"Plugin pre_turn hook failed: {e}")
+
                         api_task = asyncio.ensure_future(
                             client.chat_stream_raw(
                                 messages=self.messages,
@@ -2095,6 +2134,13 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             response = await api_task
                         finally:
                             watcher.cancel()
+
+                        # ── Plugin post_turn hooks ──
+                        try:
+                            await self.plugin_manager.execute_hooks("post_turn", self.messages, response)
+                        except Exception as e:
+                            debug_print(f"Plugin post_turn hook failed: {e}")
+
                         break  # Success — exit retry loop
 
                     except asyncio.CancelledError:
@@ -2979,6 +3025,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         except Exception as e:
             debug_print(f"PreToolUse hook failed: {e}")
 
+        # ── Plugin pre_tool hooks ──
+        try:
+            await self.plugin_manager.execute_hooks("pre_tool", tool.name, tool.parameters)
+        except Exception as e:
+            debug_print(f"Plugin pre_tool hook failed: {e}")
+
         try:
             result = await self._dispatch_tool(tool)
 
@@ -2989,6 +3041,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 )
             except Exception as e:
                 debug_print(f"PostToolUse hook failed: {e}")
+
+            # ── Plugin post_tool hooks ──
+            try:
+                await self.plugin_manager.execute_hooks("post_tool", tool.name, tool.parameters, result)
+            except Exception as e:
+                debug_print(f"Plugin post_tool hook failed: {e}")
 
             return result
 
@@ -3003,6 +3061,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 )
             except Exception as e2:
                 debug_print(f"PostToolUseFailure hook failed: {e2}")
+
+            # ── Plugin post_tool hooks (failure) ──
+            try:
+                await self.plugin_manager.execute_hooks("post_tool", tool.name, tool.parameters, f"Error: {e}")
+            except Exception as e2:
+                debug_print(f"Plugin post_tool hook (failure) failed: {e2}")
 
             log_exception(log, f"Tool execution failed: {tool.name}", e)
             if _z_json_mode:
@@ -3034,6 +3098,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
     async def _dispatch_tool(self, tool: ParsedToolCall) -> str:
         """Dispatch a parsed tool call to its handler. Returns result string."""
+        from .tools.mcp import _resolve_path
         try:
             if tool.name == "read_file":
                 path = tool.parameters.get("path", "")
@@ -3054,7 +3119,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 path = tool.parameters.get("path", "")
                 content = tool.parameters.get("content", "")
                 # Capture old content for diff (if file exists)
-                resolved = self.tool_handlers._resolve_path(path)
+                resolved = _resolve_path(self.tool_handlers, path)
                 old_content = None
                 if resolved.exists():
                     try:
@@ -3103,7 +3168,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     self._render_udiff(old_text, new_text)
 
                 # Thrash detection: track consecutive failures
-                norm_path = str(self.tool_handlers._resolve_path(path))
+                norm_path = str(_resolve_path(self.tool_handlers, path))
                 if result.startswith("Error:"):
                     entry = self._edit_failures.setdefault(
                         norm_path, {"failures": 0, "last_error": ""}
@@ -3142,7 +3207,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     tool.parameters
                 )
                 if not result.startswith("Error:"):
-                    norm_path = str(self.tool_handlers._resolve_path(path))
+                    norm_path = str(_resolve_path(self.tool_handlers, path))
                     self._edit_failures.pop(norm_path, None)
 
             elif tool.name == "execute_command":

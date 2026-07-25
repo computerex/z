@@ -66,7 +66,7 @@ from . import mcp as _mcp
 for _name in dir(_mcp):
     if _name in ("cleanup_background_procs", "cleanup_background_procs_async", "list_background_procs"):
         continue  # defined in background.py
-    if not _name.startswith("_") or _name == "__init__":
+    if not _name.startswith("__"):
         setattr(ToolHandlers, _name, getattr(_mcp, _name))
 
 from . import file_ops as _fo

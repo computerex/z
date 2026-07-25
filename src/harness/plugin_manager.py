@@ -25,7 +25,7 @@ import inspect
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 from .logger import get_logger
 from .tool_registry import ToolDef, ToolParam
@@ -90,6 +90,68 @@ class PluginAPI:
     @property
     def workspace_path(self) -> str:
         return self._manager.workspace_path
+
+    def add_tool(
+        self,
+        name: str,
+        description: str,
+        params: Dict[str, dict],
+        handler: ToolHandler,
+        category: str = "plugin",
+        complex_content: bool = False,
+        console_label: Optional[str] = None,
+    ) -> None:
+        """Register a tool that the LLM can invoke.
+
+        Args:
+            name: Unique tool name (must not collide with built-in or other plugin tools).
+            description: Natural-language description shown to the model.
+            params: Dict of {param_name: {"required": bool, "description": str}}.
+            handler: Sync or async callable(params: dict) -> str.
+            category: Tool category (default: "plugin").
+            complex_content: If True, the tool result may contain structured/multi-modal content.
+            console_label: Optional rich markup label shown in the console (e.g. "[cyan]MyTool[/cyan]").
+        """
+        tool = PluginToolDef(
+            name=name,
+            description=description,
+            params=params,
+            handler=handler,
+            category=category,
+            complex_content=complex_content,
+            console_label=console_label,
+        )
+        self._manager._register_tool(tool, self._plugin_name)
+
+    def get_config(self) -> dict:
+        """Return the per-plugin config dict from ~/.z.json → plugin_config.<name>.
+
+        Returns an empty dict if no config is set for this plugin.
+        """
+        return self._manager.plugin_configs.get(self._plugin_name, {})
+
+    def on(self, hook_name: str, fn: HookFn) -> None:
+        """Subscribe to a lifecycle hook.
+
+        Valid hook names:
+            pre_tool      — (tool_name: str, params: dict) -> optional modified params
+            post_tool     — (tool_name: str, params: dict, result: str) -> optional modified result
+            pre_turn      — (messages: list) -> None
+            post_turn     — (messages: list, response: dict) -> None
+            on_compact    — (freed_tokens: int, report: dict) -> None
+            system_prompt — () -> str (appended to the system prompt)
+
+        Args:
+            hook_name: One of the valid hook names above.
+            fn: Sync or async callable matching the hook's signature.
+        """
+        if hook_name not in VALID_HOOKS:
+            log.warning(
+                "Plugin '%s' tried to register unknown hook '%s' — skipped",
+                self._plugin_name, hook_name,
+            )
+            return
+        self._manager._register_hook(hook_name, fn, self._plugin_name)
 
 # ── PluginManager ────────────────────────────────────────────────
 
@@ -230,6 +292,50 @@ class PluginManager:
             log.error("Failed to load plugin '%s': %s", path, e, exc_info=True)
 
     # ── Hook execution ───────────────────────────────────────────
+
+    async def execute_hooks(self, hook_name: str, *args: Any) -> List[Any]:
+        """Execute all registered hooks for the given hook name.
+
+        Args:
+            hook_name: One of VALID_HOOKS.
+            *args: Positional arguments passed to each hook function.
+
+        Returns:
+            List of return values from each hook (None for hooks that return nothing).
+            Exceptions are logged and swallowed — one hook failure won't break others.
+        """
+        results: List[Any] = []
+        for fn, plugin_name in self.hooks.get(hook_name, []):
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    result = await fn(*args)
+                else:
+                    result = fn(*args)
+                results.append(result)
+            except Exception:
+                log.exception(
+                    "Plugin hook '%s' from '%s' raised an exception",
+                    hook_name, plugin_name,
+                )
+        return results
+
+    def get_system_prompt_additions(self) -> str:
+        """Collect system_prompt hook results and join them.
+
+        System prompt hooks are synchronous (no await), so this is not async.
+        """
+        parts: List[str] = []
+        for fn, plugin_name in self.hooks.get(HOOK_SYSTEM_PROMPT, []):
+            try:
+                result = fn()
+                if result and isinstance(result, str):
+                    parts.append(result)
+            except Exception:
+                log.exception(
+                    "System prompt hook from '%s' raised an exception",
+                    plugin_name,
+                )
+        return "\n\n".join(parts)
 
     # ── Tool dispatch ────────────────────────────────────────────
 
