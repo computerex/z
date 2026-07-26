@@ -134,6 +134,7 @@ from .context import find_relevant_memories, get_memory_dir
 
 # Re-exports from cli/ subpackage
 from .cli.install import run_install
+from .cli.mcp import run_mcp_manager
 from .cli.providers import (
     load_providers,
     _infer_active_provider_profile,
@@ -2368,7 +2369,7 @@ if __name__ == '__main__':
                     elif cmd in ("/provider", "/providers"):
                         try:
                             if cmd == "/providers":
-                                result_text = run_providers_hub(
+                                result_text = run_provider_manager(
                                     workspace, console, agent, providers, cmd_arg
                                 )
                             else:

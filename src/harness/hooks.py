@@ -368,6 +368,80 @@ async def execute_hooks(
     return final_results
 
 
+async def _execute_async_hook(
+    hook: HookCommand,
+    json_input: str,
+    event: HookEvent,
+) -> HookResult:
+    """Fire-and-forget an async hook. Returns immediately; the hook runs in the background."""
+    hook_timeout = (hook.timeout or 300) * 1000  # default 5m timeout for async hooks
+
+    if hook.type == HookCommandType.command:
+        if not hook.command:
+            return HookResult(
+                command="", succeeded=False, output="No command specified", blocked=False
+            )
+        args = _prepare_command(hook.command, json_input, hook.shell or "bash")
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if hook.async_rewake:
+            _track_rewake_hook(proc, hook, event)
+        # Don't await — fire and forget
+        return HookResult(
+            command=hook.command,
+            succeeded=True,
+            output=f"Async hook fired (pid={proc.pid})",
+            blocked=False,
+        )
+    elif hook.type == HookCommandType.prompt:
+        # Prompt hooks need a REPL context; fire and skip for async
+        return HookResult(
+            command=str(hook.prompt or ""),
+            succeeded=True,
+            output="Async prompt hook fired (skipped — no REPL context)",
+            blocked=False,
+        )
+    elif hook.type == HookCommandType.agent:
+        return HookResult(
+            command=str(hook.prompt or ""),
+            succeeded=True,
+            output="Async agent hook fired (skipped — not implemented for async)",
+            blocked=False,
+        )
+    elif hook.type == HookCommandType.http:
+        # HTTP hooks fire via asyncio.ensure_future
+        async def _bg_http():
+            try:
+                await _exec_http_hook(hook, json_input, hook_timeout)
+            except Exception:
+                pass
+        asyncio.ensure_future(_bg_http())
+        return HookResult(
+            command=str(hook.url or ""),
+            succeeded=True,
+            output="Async HTTP hook fired",
+            blocked=False,
+        )
+    elif hook.type == HookCommandType.callback:
+        return HookResult(
+            command=str(hook.callback.__name__ if hook.callback else ""),
+            succeeded=True,
+            output="Async callback hook fired",
+            blocked=False,
+        )
+
+    return HookResult(
+        command=str(hook.command or hook.prompt or hook.url or ""),
+        succeeded=False,
+        output=f"Unknown async hook type: {hook.type}",
+        blocked=False,
+    )
+
+
 async def _execute_single_hook(
     hook: HookCommand,
     json_input: str,

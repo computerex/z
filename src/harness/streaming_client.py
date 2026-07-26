@@ -494,21 +494,61 @@ class StreamingJSONClient:
             "stream_options": {"include_usage": True},  # Get usage in stream
         }
 
-        # Enable LiteLLM's thinking/reasoning stream extraction.
-        # NOTE: Do NOT set kwargs["reasoning"] here — it is not a standard
-        # OpenAI parameter and LiteLLM passes it through verbatim for
-        # unknown providers, causing deserialization errors (e.g. Ollama's
-        # Go backend expects an object, not a boolean).  Models that
-        # support reasoning will emit thinking tokens regardless; LiteLLM's
-        # ``enable_thinking`` flag makes it surface them in the stream.
-        # NOTE: For Anthropic, enable_thinking is NOT a valid API parameter
-        # and LiteLLM 1.83 doesn't strip it before sending, causing a
-        # BadRequestError.  Skip it for Anthropic here.
-        _is_anthropic = self.litellm_model.lower().startswith(
-            "anthropic/"
-        ) or "/anthropic/" in self.litellm_model.lower()
-        if not _is_anthropic:
-            kwargs["enable_thinking"] = True
+        # ── Reasoning / thinking parameter dispatch ──────────────────────────
+        # Three categories of providers, each needs different treatment:
+        #
+        # 1. Anthropic: native ``thinking`` / ``output_config`` blocks.
+        #    ``enable_thinking`` is NOT a valid Anthropic API param and LiteLLM
+        #    leaks it through → skip it.  reasoning_effort mapped to adaptive
+        #    thinking format below.
+        #
+        # 2. Native OpenAI: supports ``enable_thinking`` (client-side stream
+        #    extraction) and ``reasoning_effort`` (o-series models).  Safe to
+        #    set both.
+        #
+        # 3. OpenAI-compatible proxies (Fireworks, Together, DeepSeek native,
+        #    Groq, Ollama): LiteLLM treats them as ``openai/`` provider and
+        #    validates params against the standard OpenAI allowlist.
+        #    ``reasoning_effort`` is NOT in that allowlist for non-o-series
+        #    models → LiteLLM raises UnsupportedParamsError.  Fix: pass
+        #    ``allowed_openai_params`` so LiteLLM forwards it instead of
+        #    rejecting.  ``enable_thinking`` may also leak through and get
+        #    rejected by the upstream → skip it for these providers.
+        #
+        #    Fireworks specifically does support reasoning on DeepSeek models,
+        #    so the param should be forwarded, not dropped.
+
+        _is_native_openai = (
+            not _is_anthropic
+            and _litellm_model_lower.startswith("openai/")
+            and not self.base_url
+        )
+
+        # Providers where ``enable_thinking`` is known to leak through
+        # LiteLLM and get rejected by the upstream API.
+        _skip_enable_thinking = (
+            _is_anthropic
+            or _litellm_model_lower.startswith("deepseek/")
+            or _litellm_model_lower.startswith("groq/")
+            or _litellm_model_lower.startswith("ollama/")
+            or self.base_url
+            and any(
+                d in self.base_url.lower()
+                for d in ("fireworks.ai", "api.deepseek.com", "api.groq.com")
+            )
+        )
+
+        # Providers that need ``allowed_openai_params`` so LiteLLM forwards
+        # ``reasoning_effort`` instead of raising UnsupportedParamsError.
+        _needs_allowed_reasoning_params = (
+            self.base_url
+            and any(
+                d in self.base_url.lower()
+                for d in ("fireworks.ai",)
+            )
+        )
+
+        _reasoning_enabled = self.reasoning_effort and self.reasoning_effort != "none"
 
         # ZAI native reasoning stream (Claude/Cursor-like visible thinking).
         # Safe no-op for providers that ignore unknown fields.
@@ -521,20 +561,19 @@ class StreamingJSONClient:
             kwargs["tool_stream"] = True
             kwargs["clear_thinking"] = False
 
-        # Pass reasoning_effort for providers that support it (e.g. OpenAI o-series).
-        # For Anthropic, LiteLLM 1.83 translates this to `thinking: {type: "enabled"}`
-        # but claude-opus-4-8+ requires `thinking: {type: "adaptive"}` with
-        # `output_config: {effort: ...}`.  Handle Anthropic explicitly here.
-        if self.reasoning_effort and self.reasoning_effort != "none":
+        if _reasoning_enabled:
             if _is_anthropic:
                 # Map reasoning_effort to Anthropic's adaptive thinking format.
-                # Adaptive mode manages budget automatically based on effort level.
                 _effort_map = {"low": "low", "medium": "medium", "high": "high"}
                 effort = _effort_map.get(self.reasoning_effort, "medium")
                 kwargs["thinking"] = {"type": "adaptive"}
                 kwargs["output_config"] = {"effort": effort}
             else:
                 kwargs["reasoning_effort"] = self.reasoning_effort
+                if _needs_allowed_reasoning_params:
+                    kwargs["allowed_openai_params"] = ["reasoning_effort"]
+                if not _skip_enable_thinking:
+                    kwargs["enable_thinking"] = True
 
         # Add API key
         if self.api_key:
