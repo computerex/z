@@ -752,6 +752,65 @@ def _parse_token_limit_input(raw: str) -> Optional[int]:
     return val if val > 0 else None
 
 
+async def _final_json_format_call(
+    agent: ClineAgent, raw_result: str
+) -> str:
+    """Make one final API call with response_format=json_object.
+
+    After the agent loop completes (tools used freely on every intermediate
+    turn), this makes a single grammar-constrained call so the provider
+    guarantees valid JSON output.  The model sees the full conversation
+    context and is instructed to produce a structured JSON summary.
+
+    On any failure the exception is raised so the caller can fall back
+    to the raw ``attempt_completion`` text.
+    """
+    from .streaming_client import StreamingJSONClient
+    from .streaming_client import StreamingMessage
+
+    client = StreamingJSONClient(
+        api_key=agent.config.api_key,
+        base_url=agent.config.api_url,
+        model=agent.config.model,
+        temperature=0,               # deterministic for final formatting
+        max_tokens=agent.config.max_tokens,
+    )
+    client.response_format = {"type": "json_object"}
+
+    # Build messages: full conversation history + final JSON instruction.
+    # We do NOT pass tools so the model cannot attempt further tool calls.
+    messages = list(agent.messages)
+    messages.append(
+        StreamingMessage(
+            role="user",
+            content=(
+                "You have completed your work.  Now produce a final "
+                "structured JSON response summarising what you accomplished.  "
+                "The JSON object MUST contain at minimum:\n"
+                '  "status"   — "completed" or "error"\n'
+                '  "result"   — a concise summary of what was done\n'
+                '  "files_written" — array of filenames you wrote to\n'
+                "Include any other fields that are relevant (warnings, "
+                "confidence, domain counts, etc.).  Output ONLY valid JSON — "
+                "no markdown fences, no surrounding text."
+            ),
+        )
+    )
+
+    # Accumulate the full response text (no streaming callbacks needed).
+    response_text = ""
+    async with client:
+        resp = await client.chat_stream_raw(messages=messages, tools=None)
+        response_text = (resp.content or "").strip()
+
+    # Validate: must be parseable JSON
+    parsed = json.loads(response_text)
+    # Preserve the original agent result under a predictable key
+    if "raw_result" not in parsed and raw_result:
+        parsed["raw_result"] = raw_result[:500]
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 async def run_single(
     agent: ClineAgent,
     user_input: Union[str, List[Dict[str, Any]]],
@@ -763,6 +822,7 @@ async def run_single(
         emit_progress, emit_json_result, emit_error,
         reset_files_written, set_iteration_count,
         classify_api_error, get_files_written, track_file_written,
+        _json_mode,
     )
 
     start_time = time.time()
@@ -813,6 +873,21 @@ async def run_single(
 
     elapsed = time.time() - start_time
     log.info("run_single DONE elapsed=%.1fs result_len=%d", elapsed, len(result or ""))
+
+    # ── Final JSON-constrained output (--json mode only) ─────────────────
+    # After the agent loop completes (all intermediate turns ran without
+    # response_format so tool calls worked freely), make ONE final call
+    # with response_format={"type": "json_object"} so the provider does
+    # true grammar-constrained decoding.  This guarantees that the stdout
+    # output is parseable JSON while keeping the agent loop unconstrained.
+    if _json_mode and result and not error_info:
+        try:
+            result = await _final_json_format_call(agent, result)
+        except Exception as _json_err:
+            log.warning(
+                "Final JSON format call failed: %s — falling back to raw result",
+                _json_err,
+            )
 
     cost = get_global_tracker().get_summary()
     stats = agent.get_context_stats()
@@ -1166,20 +1241,16 @@ if __name__ == '__main__':
     # ── Schema-driven output validation ─────────────────────────────────
     # --json mode: structured JSON on stdout, NDJSON progress on stderr.
     # --schema:  post-hoc output validation against schema.json.
-    # 
-    # IMPORTANT: We deliberately do NOT use LiteLLM's response_format parameter
-    # (grammar-constrained decoding) because it applies to EVERY API turn,
-    # including intermediate tool-calling turns. This breaks agentic workflows
-    # where the model needs to use tools (read_file, write_to_file) before
-    # producing the final structured output.
     #
-    # Instead, schema validation runs AFTER the agent loop completes (see
-    # run_single → schema-driven output validation below). The schema.json
-    # is still loaded so the agent prompt can reference it, and the validation
-    # code fills any gaps in the output files.
+    # Two-phase JSON strategy:
+    #   1. AGENT LOOP (intermediate turns): NO response_format — the model
+    #      uses tools (read_file, write_to_file, etc.) freely.
+    #   2. FINAL CALL: after agent.run() completes, run_single() makes ONE
+    #      additional API call with response_format={"type": "json_object"}
+    #      so the provider does true grammar-constrained decoding.  This
+    #      guarantees parseable JSON on stdout without breaking tool calls.
     #
-    # If you need grammar-constrained decoding for a non-agentic single-turn
-    # workflow, use --json-output-only flag (future) or call the API directly.
+    # Schema validation (on json output files) runs post-hoc.
     from .output_protocol import init_output_protocol, load_schema
 
     _schema_path = args.schema_path or os.path.join(workspace, "schema.json")
@@ -1190,8 +1261,10 @@ if __name__ == '__main__':
         agent._output_schema = None
     _json_mode = args.json_output
 
-    # Deliberately NOT setting agent._json_response_format.
-    # Schema validation happens post-hoc in run_single() after agent.run() completes.
+    # Deliberately NOT setting agent._json_response_format on the agent.
+    # The agent loop runs without response_format so tool calls work freely.
+    # Grammar-constrained JSON decoding is applied only on the FINAL call
+    # inside run_single() via _final_json_format_call() after agent.run() completes.
 
     init_output_protocol(
         json_mode=_json_mode,
