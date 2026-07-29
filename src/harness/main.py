@@ -356,7 +356,6 @@ class HarnessCompleter(Completer):
         "/tokens",
         "/compact",
         "/cost",
-        "/usage",
         "/maxctx",
         "/todo",
         "/smart",
@@ -1164,39 +1163,35 @@ if __name__ == '__main__':
     _mark("agent_created")
     log.info("Agent created")
 
-    # ── Output protocol initialization ──────────────────────────────────
-    # --json mode: structured JSON on stdout, NDJSON progress on stderr
-    #   Also enables grammar-constrained JSON decoding via response_format
-    # --schema: output validation against schema.json
+    # ── Schema-driven output validation ─────────────────────────────────
+    # --json mode: structured JSON on stdout, NDJSON progress on stderr.
+    # --schema:  post-hoc output validation against schema.json.
+    # 
+    # IMPORTANT: We deliberately do NOT use LiteLLM's response_format parameter
+    # (grammar-constrained decoding) because it applies to EVERY API turn,
+    # including intermediate tool-calling turns. This breaks agentic workflows
+    # where the model needs to use tools (read_file, write_to_file) before
+    # producing the final structured output.
+    #
+    # Instead, schema validation runs AFTER the agent loop completes (see
+    # run_single → schema-driven output validation below). The schema.json
+    # is still loaded so the agent prompt can reference it, and the validation
+    # code fills any gaps in the output files.
+    #
+    # If you need grammar-constrained decoding for a non-agentic single-turn
+    # workflow, use --json-output-only flag (future) or call the API directly.
     from .output_protocol import init_output_protocol, load_schema
 
     _schema_path = args.schema_path or os.path.join(workspace, "schema.json")
     if os.path.exists(_schema_path):
         agent._output_schema = load_schema(workspace)
+        log.info("Output schema loaded for post-hoc validation: %s", _schema_path)
     else:
         agent._output_schema = None
     _json_mode = args.json_output
 
-    # ── Grammar-constrained JSON decoding ─────────────────────────────
-    # When --json is active, force the model to output valid JSON via
-    # LiteLLM's response_format parameter (true grammar-constrained
-    # decoding, not just an instruction in the prompt).
-    #   --json alone     → response_format={"type": "json_object"}
-    #   --json + --schema → response_format={"type": "json_schema", ...}
-    if _json_mode:
-        if agent._output_schema is not None:
-            agent._json_response_format = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "response",
-                    "schema": agent._output_schema,
-                    "strict": True,
-                },
-            }
-            log.info("Grammar-constrained JSON output enabled (json_schema mode)")
-        else:
-            agent._json_response_format = {"type": "json_object"}
-            log.info("Grammar-constrained JSON output enabled (json_object mode)")
+    # Deliberately NOT setting agent._json_response_format.
+    # Schema validation happens post-hoc in run_single() after agent.run() completes.
 
     init_output_protocol(
         json_mode=_json_mode,
@@ -1993,19 +1988,6 @@ if __name__ == '__main__':
                         _echo_remote("Cost report displayed in terminal")
                         continue
 
-                    elif cmd == "/usage":
-                        from .usage_report import open_usage_report
-                        from .cost_tracker import get_global_tracker
-                        prov_name = _infer_active_provider_profile(agent, providers) or ""
-                        open_usage_report(
-                            get_global_tracker(),
-                            provider_name=prov_name,
-                            session_name=current_session,
-                        )
-                        console.print(f"  [dim]Opened usage report in browser[/dim]")
-                        _echo_remote("Usage report opened in browser")
-                        continue
-
                     elif cmd == "/bg":
                         procs = agent.list_background_procs()
                         if not procs:
@@ -2740,9 +2722,6 @@ if __name__ == '__main__':
                         )
                         console.print(
                             "  [cyan]/cost[/cyan]                [dim]API usage and cost totals[/dim]"
-                        )
-                        console.print(
-                            "  [cyan]/usage[/cyan]               [dim]Open HTML usage report in browser[/dim]"
                         )
                         console.print(
                             "  [cyan]/smart[/cyan]               [dim]Smart context analysis[/dim]"
