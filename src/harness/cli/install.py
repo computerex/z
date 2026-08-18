@@ -3,6 +3,10 @@ from pathlib import Path
 from typing import Optional
 import json
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
 def run_install(
     api_url: str = None,
     api_key: str = None,
@@ -341,7 +345,7 @@ def run_install(
                 "  [dim]Note: OAuth tokens access ChatGPT Codex models directly.[/dim]"
             )
 
-            # Show available Codex models (hardcoded for instant display)
+            # Show available Codex/OpenAI models (fetched from models.dev)
             codex_models = get_codex_models()
             print(f"\n  Available Codex models:")
             for i, m in enumerate(codex_models, 1):

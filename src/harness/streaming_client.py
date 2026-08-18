@@ -809,8 +809,18 @@ class StreamingJSONClient:
                 sys_text = m.content if isinstance(m.content, str) else str(m.content)
                 system_parts.append(sys_text)
             else:
-                # Preserve multimodal content (list of text/image blocks) as-is
-                chat_messages.append(CodexMessage(role=m.role, content=m.content))
+                # Preserve multimodal content (list of text/image blocks) as-is,
+                # plus native tool-call fields for Chat Completions → Responses
+                # API translation in CodexMessage.to_input_items.
+                chat_messages.append(
+                    CodexMessage(
+                        role=m.role,
+                        content=m.content,
+                        tool_calls=m.tool_calls,
+                        tool_call_id=m.tool_call_id,
+                        name=m.name,
+                    )
+                )
 
         system_prompt = "\n\n".join(system_parts) if system_parts else ""
 
@@ -839,6 +849,7 @@ class StreamingJSONClient:
             finish_reason=response.finish_reason,
             interrupted=response.interrupted,
             is_truncated=response.finish_reason == "length",
+            tool_calls=response.tool_calls,
         )
 
     async def _chat_stream_copilot(

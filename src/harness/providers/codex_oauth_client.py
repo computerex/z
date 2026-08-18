@@ -20,12 +20,16 @@ CODEX_API_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 
 @dataclass
 class CodexMessage:
-    """Message for Codex API."""
+    """Message for Codex API (OpenAI Responses API input)."""
 
     role: str
     content: Union[str, List[Dict[str, Any]]]
+    tool_calls: Optional[List[Dict[str, Any]]] = None  # For assistant messages
+    tool_call_id: Optional[str] = None  # For tool result messages
+    name: Optional[str] = None  # Tool name for tool result messages
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert a plain (non-tool) message to a Responses API message."""
         if isinstance(self.content, str):
             return {"role": self.role, "content": self.content}
         # Convert multimodal content from Chat Completions format to
@@ -46,6 +50,73 @@ class CodexMessage:
                 converted.append(block)
         return {"role": self.role, "content": converted}
 
+    def to_input_items(self) -> List[Dict[str, Any]]:
+        """Convert to one or more Responses API input items.
+
+        Translates the Chat Completions tool-call convention into the
+        Responses API format:
+
+        - ``role="tool"`` → top-level ``function_call_output`` item
+        - ``role="assistant"`` with ``tool_calls`` → a plain assistant
+          message (text, if any) followed by top-level ``function_call``
+          items
+        - everything else → a plain message
+
+        ``function_call`` / ``function_call_output`` are top-level items in
+        the Responses API — they are NOT valid message content part types.
+        """
+        # Tool result → top-level function_call_output item (no role field).
+        if self.role == "tool":
+            output = self.content if isinstance(self.content, str) else str(self.content)
+            return [
+                {
+                    "type": "function_call_output",
+                    "call_id": self.tool_call_id or "",
+                    "output": output,
+                }
+            ]
+
+        # Assistant message that requested tool calls → emit any text as a
+        # plain assistant message, then one top-level function_call item per
+        # tool call.
+        if self.role == "assistant" and self.tool_calls:
+            items: List[Dict[str, Any]] = []
+
+            msg_content = None
+            if isinstance(self.content, str):
+                if self.content:
+                    msg_content = self.content
+            elif isinstance(self.content, list):
+                parts: List[Dict[str, Any]] = []
+                for block in self.content:
+                    btype = block.get("type", "")
+                    if btype == "text":
+                        parts.append(
+                            {"type": "output_text", "text": block.get("text", "")}
+                        )
+                    else:
+                        parts.append(block)
+                if parts:
+                    msg_content = parts
+            if msg_content is not None:
+                items.append({"role": "assistant", "content": msg_content})
+
+            for tc in self.tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "arguments": fn.get("arguments", ""),
+                    }
+                )
+            return items
+
+        return [self.to_dict()]
+
 
 @dataclass
 class CodexResponse:
@@ -56,6 +127,35 @@ class CodexResponse:
     usage: Optional[Dict[str, int]] = None
     finish_reason: str = "stop"
     interrupted: bool = False
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+
+
+def _to_responses_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a Chat Completions tool schema to a Responses API tool schema.
+
+    Chat Completions uses ``{"type": "function", "function": {...}}`` while
+    the Responses API expects a flat ``{"type": "function", "name": ...,
+    "description": ..., "parameters": ...}``.  Pass through anything already
+    in flat form.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    fn = tool.get("function")
+    if not isinstance(fn, dict):
+        return tool  # already flat (or unknown) — leave as-is
+    out: Dict[str, Any] = {"type": tool.get("type", "function")}
+    name = fn.get("name")
+    if name:
+        out["name"] = name
+    desc = fn.get("description")
+    if desc:
+        out["description"] = desc
+    params = fn.get("parameters")
+    if isinstance(params, dict):
+        out["parameters"] = params
+    else:
+        out["parameters"] = {"type": "object", "properties": {}}
+    return out
 
 
 class CodexOAuthClient:
@@ -173,13 +273,15 @@ class CodexOAuthClient:
         Returns:
             Request body dict
         """
-        # Convert messages to input format (Responses API uses 'input' not 'messages')
-        input_messages = []
+        # Convert messages to Responses API input items.  System messages go
+        # in 'instructions', not 'input'.  Tool-call messages are translated
+        # from Chat Completions format into function_call/function_call_output
+        # items (see CodexMessage.to_input_items).
+        input_messages: List[Dict[str, Any]] = []
         for msg in messages:
-            if (
-                msg.role != "system"
-            ):  # System messages go in 'instructions', not 'input'
-                input_messages.append(msg.to_dict())
+            if msg.role == "system":
+                continue
+            input_messages.extend(msg.to_input_items())
 
         # Ensure we have at least one message - Codex API requires non-empty input
         if not input_messages:
@@ -206,9 +308,11 @@ class CodexOAuthClient:
         # Note: Codex models don't support temperature or max_tokens parameters
         # They use fixed settings optimized for coding tasks
 
-        # Native tool calling
+        # Native tool calling — the harness passes Chat Completions-style
+        # tool schemas ({type, function: {...}}); the Responses API expects
+        # a flat schema ({type, name, description, parameters}).
         if tools:
-            body["tools"] = tools
+            body["tools"] = [_to_responses_tool(t) for t in tools]
 
         return body
 
@@ -246,6 +350,9 @@ class CodexOAuthClient:
         usage = {}
         finish_reason = "stop"
         interrupted = False
+        # Accumulate native tool calls keyed by output_index — the Responses
+        # API streams function_call arguments across multiple events.
+        _tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
 
         try:
             async with self._session.post(
@@ -309,6 +416,36 @@ class CodexOAuthClient:
                             if on_reasoning:
                                 on_reasoning(delta)
 
+                    elif event_type == "response.output_item.added":
+                        # A new output item appeared.  Capture function_call
+                        # items so we can assemble Chat Completions-style
+                        # tool_calls for the harness.
+                        item = event.get("item") or {}
+                        if isinstance(item, dict) and item.get("type") == "function_call":
+                            idx = event.get("output_index", 0)
+                            _tool_calls_by_index[idx] = {
+                                "id": item.get("call_id") or item.get("id") or "",
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                },
+                            }
+
+                    elif event_type == "response.function_call_arguments.delta":
+                        delta = event.get("delta", "")
+                        idx = event.get("output_index", 0)
+                        tc = _tool_calls_by_index.get(idx)
+                        if tc and delta:
+                            tc["function"]["arguments"] += delta
+
+                    elif event_type == "response.function_call_arguments.done":
+                        arguments = event.get("arguments", "")
+                        idx = event.get("output_index", 0)
+                        tc = _tool_calls_by_index.get(idx)
+                        if tc and arguments:
+                            tc["function"]["arguments"] = arguments
+
                     elif event_type == "response.completed":
                         # Response completed
                         output = event.get("output", [])
@@ -355,12 +492,17 @@ class CodexOAuthClient:
         except Exception as e:
             raise RuntimeError(f"Codex streaming error: {e}")
 
+        tool_calls = (
+            [_tool_calls_by_index[i] for i in sorted(_tool_calls_by_index)] or None
+        )
+
         return CodexResponse(
             content=full_content,
             thinking=full_reasoning or None,
             usage=usage if usage else None,
             finish_reason=finish_reason,
             interrupted=interrupted,
+            tool_calls=tool_calls,
         )
 
 

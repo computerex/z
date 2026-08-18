@@ -186,9 +186,18 @@ def _wrap_shell_command(self, command: str, log_path: str) -> str:
     On Windows, default to PowerShell execution for deterministic behavior
     with PowerShell syntax (the system prompt advertises PowerShell).
     Set HARNESS_WINDOWS_SHELL=cmd to force legacy cmd.exe behavior.
+
+    Auto-detects bash chaining operators (||, &&) and routes those commands
+    through cmd.exe instead, since PowerShell 5.1 does not support them.
     """
     if platform.system() == "Windows":
         win_shell = os.environ.get("HARNESS_WINDOWS_SHELL", "powershell").strip().lower()
+        # Auto-detect bash-isms that PowerShell 5.1 chokes on.
+        # || and && are statement separators only in PowerShell 7+;
+        # Windows 11 ships with PowerShell 5.1 where they are syntax errors.
+        if win_shell != "cmd" and _has_bash_chaining(command):
+            log.info("Detected bash chaining (|| / &&), routing through cmd.exe")
+            win_shell = "cmd"
         if win_shell != "cmd":
             # Use EncodedCommand to avoid quote/escape issues through cmd.exe.
             # Force UTF-8 output to avoid UTF-16LE encoding issues in log files
@@ -208,7 +217,32 @@ def _wrap_shell_command(self, command: str, log_path: str) -> str:
                 f"-EncodedCommand {encoded}"
             )
             return f'{launcher} > "{log_path}" 2>&1'
+        else:
+            # cmd.exe route — supports || and && natively.
+            # Double all percent signs so cmd.exe doesn't try to expand them.
+            cmd_escaped = command.replace("%", "%%")
+            return f'cmd /c "{cmd_escaped}" > "{log_path}" 2>&1'
     return f'{command} > "{log_path}" 2>&1'
+
+
+def _has_bash_chaining(command: str) -> bool:
+    """Return True if *command* contains || or && outside of quoted strings.
+
+    These are bash/cmd.exe operators that PowerShell 5.1 does not support.
+    """
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(command):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "&" and i + 1 < len(command) and command[i + 1] == "&":
+                return True
+            if ch == "|" and i + 1 < len(command) and command[i + 1] == "|":
+                return True
+    return False
 
 
 def _tail_log_file(self, log_path: str, file_pos: int, output_lines: List[str]) -> int:

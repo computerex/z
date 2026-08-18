@@ -1155,7 +1155,7 @@ def run_in_app_config_wizard(
                 "  [dim]Note: OAuth tokens access ChatGPT Codex models directly.[/dim]"
             )
 
-            # Show available Codex models
+            # Show available Codex/OpenAI models (fetched from models.dev)
             codex_models = get_codex_models()
             console.print(f"\n  [bold]Available Codex models:[/bold]")
             for i, m in enumerate(codex_models, 1):
@@ -1384,4 +1384,40 @@ def run_provider_manager(
             return f"Multiple providers match '{cmd_arg.strip()}': {match_list}. Be more specific."
 
     return "Usage: /providers [list|current|setup <name>|use <name|#>|remove <name>]"
+
+
+def _render_providers_table(
+    console: Console,
+    providers: Dict[str, dict],
+    active_name: Optional[str],
+    show_numbers: bool = True,
+) -> None:
+    """Render a clear providers table showing profile name, detected provider, model, and URL."""
+    if not providers:
+        console.print("\n  [dim]No providers configured yet.[/dim]")
+        return
+    tbl = Table(show_header=True, box=None, padding=(0, 2), pad_edge=False)
+    tbl.add_column("", width=2)
+    if show_numbers:
+        tbl.add_column("#", style="dim", width=3)
+    tbl.add_column("Profile", style="bold", min_width=10)
+    tbl.add_column("Provider", min_width=12)
+    tbl.add_column("Model", style="cyan")
+    tbl.add_column("URL", style="dim")
+    names = sorted(providers.keys())
+    for i, name in enumerate(names, 1):
+        p = providers[name]
+        marker = "[cyan]●[/cyan]" if name == active_name else " "
+        detected = _detect_provider_label(p.get("api_url", ""))
+        model = p.get("model", "")
+        url = p.get("api_url", "")
+        row = [marker]
+        if show_numbers:
+            row.append(f"[{i}]")
+        row.extend([name, detected, model, url])
+        tbl.add_row(*row)
+    console.print()
+    console.print(
+        Panel(tbl, title="[bold]Providers[/bold]", border_style="dim", padding=(1, 2))
+    )
 
