@@ -550,6 +550,15 @@ class StreamingJSONClient:
 
         _reasoning_enabled = self.reasoning_effort and self.reasoning_effort != "none"
 
+        # Whether the model accepts a reasoning_effort parameter.  Toggle-only
+        # reasoning models (DeepSeek V4 Flash on DeepInfra, etc.) reject it and
+        # LiteLLM raises UnsupportedParamsError, so skip it for those.
+        from .model_capabilities import supports_reasoning_effort
+
+        _supports_effort = _reasoning_enabled and supports_reasoning_effort(
+            self.litellm_model, api_url=self.base_url or ""
+        )
+
         # ZAI native reasoning stream (Claude/Cursor-like visible thinking).
         # Safe no-op for providers that ignore unknown fields.
         if (
@@ -569,9 +578,10 @@ class StreamingJSONClient:
                 kwargs["thinking"] = {"type": "adaptive"}
                 kwargs["output_config"] = {"effort": effort}
             else:
-                kwargs["reasoning_effort"] = self.reasoning_effort
-                if _needs_allowed_reasoning_params:
-                    kwargs["allowed_openai_params"] = ["reasoning_effort"]
+                if _supports_effort:
+                    kwargs["reasoning_effort"] = self.reasoning_effort
+                    if _needs_allowed_reasoning_params:
+                        kwargs["allowed_openai_params"] = ["reasoning_effort"]
                 if not _skip_enable_thinking:
                     kwargs["enable_thinking"] = True
 

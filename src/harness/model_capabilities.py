@@ -90,3 +90,41 @@ def supports_vision(model: str, api_url: str = "") -> bool:
 
     # Unknown model — conservative default.
     return False
+
+
+def supports_reasoning_effort(model: str, api_url: str = "") -> bool:
+    """Return True if the model accepts a ``reasoning_effort`` parameter.
+
+    ``reasoning_effort`` is only meaningful for models exposing *effort-style*
+    reasoning (OpenAI o-series / gpt-5.x and a few OpenAI-compatible models).
+    Toggle-only reasoning models (e.g. DeepSeek V4 Flash on DeepInfra) reject
+    it, and LiteLLM raises UnsupportedParamsError.  Uses models.dev metadata
+    (``reasoning_options`` containing ``type="effort"``), falling back to a
+    conservative heuristic when metadata is unavailable.
+    """
+    if not model:
+        return False
+
+    # 1. models.dev metadata (authoritative when present)
+    try:
+        from .context import get_remote_model_data
+
+        data = get_remote_model_data(model, api_url=api_url)
+        if isinstance(data, dict):
+            ro = data.get("reasoning_options")
+            if isinstance(ro, list):
+                return any(
+                    isinstance(o, dict) and o.get("type") == "effort" for o in ro
+                )
+    except Exception as exc:
+        log.debug("Failed to read remote reasoning capability: %s", exc)
+
+    # 2. Fallback heuristic (metadata unavailable) — only the providers we
+    #    know support effort-style reasoning.
+    m = model.lower()
+    if m.startswith("openai/") and any(t in m for t in ("o1", "o3", "o4", "gpt-5")):
+        return True
+    if api_url and "fireworks.ai" in api_url.lower():
+        return True
+
+    return False
