@@ -105,6 +105,15 @@ def supports_reasoning_effort(model: str, api_url: str = "") -> bool:
     if not model:
         return False
 
+    m = model.lower()
+
+    # DeepSeek V4 models implement their reasoning toggle via
+    # ``reasoning_effort`` (none/low/medium/high/max), even when models.dev
+    # labels the option type as ``toggle`` for some hosted snapshots (e.g.
+    # DeepInfra's DeepSeek-V4-Flash-0731).  Treat them as effort-capable.
+    if "deepseek-v4" in m:
+        return True
+
     # 1. models.dev metadata (authoritative when present)
     try:
         from .context import get_remote_model_data
@@ -121,7 +130,6 @@ def supports_reasoning_effort(model: str, api_url: str = "") -> bool:
 
     # 2. Fallback heuristic (metadata unavailable) — only the providers we
     #    know support effort-style reasoning.
-    m = model.lower()
     if m.startswith("openai/") and any(t in m for t in ("o1", "o3", "o4", "gpt-5")):
         return True
     if api_url and "fireworks.ai" in api_url.lower():

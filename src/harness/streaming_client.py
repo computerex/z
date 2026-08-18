@@ -544,7 +544,7 @@ class StreamingJSONClient:
             self.base_url
             and any(
                 d in self.base_url.lower()
-                for d in ("fireworks.ai",)
+                for d in ("fireworks.ai", "api.deepinfra.com")
             )
         )
 
