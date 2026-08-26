@@ -13,6 +13,10 @@ def _get_litellm_model_info(model: str) -> Optional[dict]:
         import io
         import sys
 
+        # Suppress LiteLLM's "Provider List: ..." stdout banners for unknown
+        # models (belt-and-braces alongside the stream redirect below).
+        litellm.suppress_debug_info = True
+
         # Redirect stdout/stderr to suppress LiteLLM's provider list messages
         old_stdout = sys.stdout
         old_stderr = sys.stderr

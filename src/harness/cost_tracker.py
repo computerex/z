@@ -17,6 +17,10 @@ def _get_litellm_pricing(model: str) -> Optional[Dict[str, float]]:
     """
     try:
         import litellm
+
+        # Suppress LiteLLM's "Provider List: ..." stdout banners.
+        litellm.suppress_debug_info = True
+
         model_lower = model.lower()
 
         # Direct match

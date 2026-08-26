@@ -15,6 +15,10 @@ log = get_logger("streaming_client")
 if os.environ.get("HARNESS_LITELLM_DEBUG") == "1":
     try:
         import litellm
+
+        # Even in debug mode, suppress the raw "Provider List: ..." stdout
+        # banners — litellm's verbose logging already covers diagnostics.
+        litellm.suppress_debug_info = True
     except Exception:
         pass
 
@@ -53,6 +57,11 @@ def _import_litellm():
     try:
         import litellm
         from litellm import acompletion
+
+        # Suppress LiteLLM's "Provider List: https://docs.litellm.ai/docs/providers"
+        # banners printed to stdout on provider-resolution failures (e.g. models
+        # not in LiteLLM's registry, like openrouter/z-ai/* routes).
+        litellm.suppress_debug_info = True
 
         _litellm = litellm
         _acompletion = acompletion
@@ -517,6 +526,14 @@ class StreamingJSONClient:
         #
         #    Fireworks specifically does support reasoning on DeepSeek models,
         #    so the param should be forwarded, not dropped.
+        #
+        # 4. OpenRouter: uses its own *unified* ``reasoning`` object
+        #    ({"effort": ...}) rather than OpenAI-style ``reasoning_effort``.
+        #    LiteLLM only accepts ``reasoning_effort`` for models present in
+        #    its registry — brand-new OpenRouter models (e.g. z-ai/* releases)
+        #    are unmapped and raise UnsupportedParamsError.  We therefore send
+        #    OpenRouter's native shape directly and allowlist it so LiteLLM
+        #    forwards it verbatim (verified against the outgoing request body).
 
         _is_native_openai = (
             not _is_anthropic
@@ -577,6 +594,14 @@ class StreamingJSONClient:
                 effort = _effort_map.get(self.reasoning_effort, "medium")
                 kwargs["thinking"] = {"type": "adaptive"}
                 kwargs["output_config"] = {"effort": effort}
+            elif _supports_effort and _litellm_model_lower.startswith("openrouter/"):
+                # OpenRouter native unified reasoning param (see note above).
+                # LiteLLM forwards this verbatim into the request body.
+                _effort_map = {"low": "low", "medium": "medium", "high": "high"}
+                kwargs["reasoning"] = {
+                    "effort": _effort_map.get(self.reasoning_effort, "medium")
+                }
+                kwargs["allowed_openai_params"] = ["reasoning"]
             else:
                 if _supports_effort:
                     kwargs["reasoning_effort"] = self.reasoning_effort

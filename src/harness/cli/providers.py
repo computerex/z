@@ -358,6 +358,11 @@ def _filter_anthropic_registry_models(
     """
     from litellm import model_cost as _anthropic_cost
 
+    import litellm
+
+    # Suppress LiteLLM's "Provider List: ..." stdout banners.
+    litellm.suppress_debug_info = True
+
     bare = [
         m
         for m, info in _anthropic_cost.items()
