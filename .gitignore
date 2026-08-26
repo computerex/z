@@ -67,3 +67,8 @@ node_modules/
 # Temporary files
 .claude/*.lock
 .forge/
+
+# Benchmarks and local artifacts
+.benchmark_workspace/
+benchmarks/
+error.json
