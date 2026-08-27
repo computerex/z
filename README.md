@@ -1,24 +1,16 @@
 # z
 
-An agentic coding harness I built because I got tired of context-window anxiety and provider lock-in.
+<p align="center">
+  <img src="z.jpg" alt="z terminal" width="800">
+</p>
 
-I use my own API keys. GLM 4.7, GLM 5.2, DeepSeek V4 Flash, DeepSeek V4 Pro — hot-swap mid-session with `/providers use`. No subscriptions, no rate limits I didn't sign up for.
-
-## What makes it different
-
-**Constant streaming.** Every token streams to the terminal as it arrives. Thinking/reasoning content visible in real time — nothing hidden, no "loading..." spinners. Background tool output streams transparently too.
-
-**Telegram remote.** Fire up `z --telegram <token>` and drive your agent from your phone. Walking the dog, taking a dump, whatever — you can still ship.
-
-**Context survives compaction.** Half, quarter, lastTwo strategies with breadcrumbs. Todos persist. Tool results are cached for retrieval. If z already read it, it doesn't re-read it.
-
-**26 providers, one `z`.** Z.AI, DeepSeek, Anthropic, OpenAI, Ollama, Bedrock, Copilot OAuth — all through LiteLLM. Normalizes model names automatically.
+An agentic coding harness for the terminal. Bring your own API keys — hot-swap models mid-session with `/providers use`. No subscriptions.
 
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"
-z --install
+pip install -e .
+z --install   # one-time setup wizard
 z
 ```
 
@@ -28,11 +20,14 @@ Config lives in `~/.z.json`:
 { "api_url": "https://api.z.ai/api/paas/v4/", "api_key": "sk-...", "model": "glm-4.7" }
 ```
 
-Telegram:
+## Highlights
 
-```bash
-z --telegram <bot-token> --telegram-username your_username
-```
+- **26 providers, one client** — Z.AI, DeepSeek, Anthropic, OpenAI, Ollama, Bedrock, Copilot OAuth, OpenRouter, all via LiteLLM.
+- **Constant streaming** — every token, including reasoning, streams live. No spinners.
+- **Telegram remote** — `z --telegram <token>` and drive the agent from your phone.
+- **Context that survives compaction** — half/quarter/lastTwo strategies, todo persistence, tool-result caching.
+- **Claude Code semantics** — CLAUDE.md, hooks, persistent memory, cron tasks, sub-agents, MCP.
+- **19 built-in tools** — file ops, shell, search, web search, image analysis, background processes.
 
 ## Commands
 
@@ -43,10 +38,7 @@ z --telegram <bot-token> --telegram-username your_username
 | `/cost` | Token usage and spend |
 | `/todo` | Todo panel |
 | `!cmd` | Run shell command |
-
-19 built-in tools: file ops, shell, search, web search, image analysis, MCP, background processes, sub-agents.
-
-Borrows Claude Code semantics where they make sense — CLAUDE.md, hooks (PreToolUse, PostToolUse), persistent memory, scheduled tasks (cron).
+| `Ctrl+T` | Toggle reasoning effort |
 
 Plugins: drop a `.py` in `~/.z/plugins/`.
 
