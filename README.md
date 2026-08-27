@@ -40,6 +40,20 @@ Config lives in `~/.z.json`:
 | `!cmd` | Run shell command |
 | `Ctrl+T` | Toggle reasoning effort |
 
+## Screenshots
+
+<p align="center">
+  <img src="setup.jpg" alt="z setup wizard" width="800">
+</p>
+
+<p align="center">
+  <img src="providers.jpg" alt="z provider selection" width="800">
+</p>
+
+<p align="center">
+  <img src="models.jpg" alt="z model selection" width="800">
+</p>
+
 Plugins: drop a `.py` in `~/.z/plugins/`.
 
 MIT
