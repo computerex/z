@@ -257,7 +257,7 @@ def run_install(
 
         # Import OAuth manager
         try:
-            from .providers import get_oauth_manager
+            from ..providers.oauth import get_oauth_manager
 
             oauth_manager = get_oauth_manager()
 
@@ -317,8 +317,8 @@ def run_install(
 
     # Model
     if is_oauth:
-        from .providers import get_codex_models
-        from .providers import get_copilot_models
+        from ..providers.codex_models import get_codex_models
+        from ..providers.copilot_oauth_client import get_copilot_models
 
         if "GitHub Copilot" in provider:
             print(
