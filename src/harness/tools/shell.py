@@ -241,7 +241,17 @@ def _wrap_shell_command(self, command: str, log_path: str) -> str:
             # Double all percent signs so cmd.exe doesn't try to expand them.
             cmd_escaped = command.replace("%", "%%")
             return f'cmd /c "{cmd_escaped}" > "{log_path}" 2>&1'
-    return f'{command} > "{log_path}" 2>&1'
+    # Unix (/bin/sh from create_subprocess_shell).
+    #
+    # Group the command in a subshell so the redirect applies to the ENTIRE
+    # compound chain. Without grouping, `A; B > log 2>&1` sends only B's
+    # output to the log — A's goes to DEVNULL and is silently lost, so the
+    # live display (and the tool result) only ever shows the LAST segment
+    # of a compound command.
+    #
+    # Newlines after `(` and before `)` keep a trailing `# comment` from
+    # swallowing the closing paren, and terminate any pending continuation.
+    return f'(\n{command}\n) > "{log_path}" 2>&1'
 
 
 def _has_bash_chaining(command: str) -> bool:
