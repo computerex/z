@@ -348,6 +348,12 @@ class ClineAgent:
         # Output stream for captured output (default: sys.stdout)
         self._output_stream = output_stream or sys.stdout
 
+        # Interrupt state is process-global for keyboard handling, but each
+        # agent must decide independently whether it observes that state.
+        # Background sub-agents run with enable_interrupt=False and must not be
+        # cancelled by an interrupt intended for the parent prompt.
+        self._interrupt_enabled = True
+
         # Reference to SubAgentManager (only set for parent agent)
         self._sub_agent_manager = sub_agent_manager
 
@@ -1617,6 +1623,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
         # Start keyboard monitoring for escape/Ctrl+C.
         # Keep this enabled even in non-tty wrappers so SIGINT soft-cancel works.
+        self._interrupt_enabled = enable_interrupt
         if enable_interrupt:
             start_monitoring()
 
@@ -1756,7 +1763,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
                 # Check for interrupt BEFORE starting new iteration
                 # This ensures user can stop between iterations
-                if is_interrupted():
+                if self._interrupt_enabled and is_interrupted():
                     log.info("Interrupted before iteration %d", iteration + 1)
                     self.status.clear()
                     self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
@@ -1813,7 +1820,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     self._last_token_count = estimate_messages_tokens(self.messages)
 
                 # Check interrupt before expensive operations
-                if is_interrupted():
+                if self._interrupt_enabled and is_interrupted():
                     log.info("Interrupted before token check")
                     self.status.clear()
                     return "[Interrupted]"
@@ -2064,7 +2071,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 async def _interrupt_watcher(task: asyncio.Task):
                     """Cancel *task* as soon as the interrupt flag is set."""
                     while not task.done():
-                        if is_interrupted():
+                        if self._interrupt_enabled and is_interrupted():
                             task.cancel()
                             return
                         await asyncio.sleep(0.15)
@@ -2118,7 +2125,9 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                                 messages=self.messages,
                                 on_content=on_chunk,
                                 on_reasoning=on_reasoning,
-                                check_interrupt=is_interrupted,
+                                check_interrupt=(
+                                    is_interrupted if self._interrupt_enabled else (lambda: False)
+                                ),
                                 status_line=self.status,
                                 tools=native_tools,
                             )
@@ -2233,7 +2242,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             # Wait with interrupt checking and countdown display
                             _wait_remaining = wait_time
                             for _wi in range(int(wait_time * 10)):
-                                if is_interrupted():
+                                if self._interrupt_enabled and is_interrupted():
                                     self.status.clear()
                                     self.console.print("\n  [yellow]Interrupted during retry wait[/yellow]")
                                     return "[Interrupted]"
