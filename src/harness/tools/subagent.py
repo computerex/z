@@ -43,10 +43,13 @@ async def send_agent_input(self, params: dict) -> str:
         if not inst:
             return f"Error: Sub-agent '{name}' not found."
 
-        # If agent is completed and has output, return cached output
-        # without re-running (avoids unnecessary API calls for retrieval).
-        if inst.status == "completed" and inst.task and inst.task.done() and inst.output:
-            return inst.output
+        # If completed, return its final result instead of replaying the full
+        # rendered terminal transcript. The latter can be ANSI-decorated and
+        # large enough to spill/truncate before the parent sees the verdict.
+        if inst.status == "completed" and inst.task and inst.task.done():
+            return inst.final_result or inst.output or (
+                f"Sub-agent '{name}' completed but produced no final result."
+            )
 
         self.console.print(
             f"  [dim]\u2192[/dim] Sending input to [bold]{name}[/bold]..."
@@ -130,7 +133,11 @@ async def get_agent_output(self, params: dict) -> str:
                     # Task is done, output exists — return it
                     return output_text
             return f"Sub-agent '{name}' is still {inst.status}. Use list_agents(name='{name}') to check its progress."
-        # Return the full cached output
+        # Return the completed task's final result, not the diagnostic terminal
+        # transcript. This preserves the agent's verdict even when the verbose
+        # stream output is huge or contains terminal control sequences.
+        if inst.final_result:
+            return inst.final_result
         output_text = inst.output or ""
         if not output_text and inst.tee:
             output_text = inst.tee.getvalue() or ""

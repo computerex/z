@@ -65,7 +65,8 @@ class SubAgentInstance:
     agent: ClineAgent
     task: Optional[asyncio.Task] = None
     status: str = "created"  # created, running, completed, error
-    output: str = ""
+    output: str = ""  # Rendered terminal transcript (diagnostic only)
+    final_result: str = ""  # Return value from the sub-agent's completed turn
     tee: Optional[TeeWriter] = None
     session_path: Optional[Path] = None
     created_at: float = field(default_factory=time.time)
@@ -231,10 +232,10 @@ class SubAgentManager:
             output_snippet = ""
             if output_text:
                 _MAX_SNIPPET = 500
-                # For running agents: show the last N chars (most recent activity)
-                # For completed agents: show the full output (final result)
-                if inst.status == "completed":
-                    output_snippet = output_text
+                # For completed agents, expose the concise final result rather
+                # than a potentially huge ANSI-decorated terminal transcript.
+                if inst.status == "completed" and inst.final_result:
+                    output_snippet = inst.final_result
                 elif len(output_text) > _MAX_SNIPPET:
                     output_snippet = "[...] " + output_text[-_MAX_SNIPPET:]
                 else:
@@ -315,6 +316,11 @@ class SubAgentManager:
                 input_text,
                 enable_interrupt=False,  # Interrupt handled by main loop
             )
+            # The terminal transcript may be enormous, ANSI-decorated, or
+            # truncated when later passed through a tool result. Keep it for
+            # diagnostics, but retain the agent's final return value separately
+            # as the authoritative completed-task report.
+            instance.final_result = result or ""
             instance.output = instance.tee.getvalue() if instance.tee else ""
             instance.status = "completed"
             instance.completed_at = time.time()
