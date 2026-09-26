@@ -56,6 +56,27 @@ class TeeWriter:
     def clear(self) -> None:
         self.buffer = io.StringIO()
 
+    def replay_to_real(self, max_chars: int = 16000) -> int:
+        """Replay buffered output when a user focuses this agent.
+
+        Background output is intentionally buffered. Without replay, switching
+        focus only shows output generated after the switch, which makes a
+        running agent appear silent if it already produced its first turn.
+        """
+        text = self.getvalue()
+        if not text:
+            return 0
+        if len(text) > max_chars:
+            text = "[... earlier output omitted ...]\n" + text[-max_chars:]
+        try:
+            self.real_stdout.write(text)
+            if not text.endswith("\n"):
+                self.real_stdout.write("\n")
+            self.real_stdout.flush()
+        except Exception:
+            return 0
+        return len(text)
+
 
 @dataclass
 class SubAgentInstance:
@@ -272,6 +293,9 @@ class SubAgentManager:
         if name and name in self._agents:
             inst = self._agents[name]
             if inst.tee:
+                # Show output produced while the agent was in the background,
+                # then continue streaming new output live.
+                inst.tee.replay_to_real()
                 inst.tee.active = True
 
     def check_completed(self) -> Optional[str]:
