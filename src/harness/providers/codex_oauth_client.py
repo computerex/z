@@ -367,8 +367,30 @@ class CodexOAuthClient:
                         f"Codex API error {response.status}: {error_text}"
                     )
 
-                # Process SSE stream
-                async for line in response.content:
+                # Process SSE stream.  Read raw chunks and split on newlines
+                # ourselves: aiohttp's line iterator caps a single line at
+                # 128KB, but Codex `response.completed` events embed the full
+                # response object (including reasoning summaries) and can
+                # exceed that cap, killing the stream with LineTooLong.
+                _sse_buf = b""
+                _SSE_MAX_LINE = 64 * 1024 * 1024  # 64MB safety cap
+
+                async def _sse_lines():
+                    nonlocal _sse_buf
+                    async for chunk in response.content.iter_any():
+                        _sse_buf += chunk
+                        if len(_sse_buf) > _SSE_MAX_LINE:
+                            raise RuntimeError(
+                                "Codex SSE event exceeded 64MB buffer"
+                            )
+                        while b"\n" in _sse_buf:
+                            raw, _sse_buf = _sse_buf.split(b"\n", 1)
+                            yield raw
+                    if _sse_buf:
+                        yield _sse_buf
+                        _sse_buf = b""
+
+                async for line in _sse_lines():
                     # Check for interrupt
                     if check_interrupt and check_interrupt():
                         interrupted = True

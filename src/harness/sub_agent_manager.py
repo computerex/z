@@ -6,8 +6,10 @@ from the parent agent and sibling sub-agents.
 """
 
 import asyncio
+import concurrent.futures
 import io
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,11 +39,17 @@ class TeeWriter:
     def write(self, text: str) -> None:
         self.buffer.write(text)
         if self.active:
-            try:
-                self.real_stdout.write(text)
-                self.real_stdout.flush()
-            except Exception:
-                pass
+            # real_stdout is the patch_stdout proxy in interactive sessions, so
+            # these writes render above the prompt while it is active and pass
+            # straight through otherwise.
+            self._write_real(text)
+
+    def _write_real(self, text: str) -> None:
+        try:
+            self.real_stdout.write(text)
+            self.real_stdout.flush()
+        except Exception:
+            pass
 
     def flush(self) -> None:
         if self.active:
@@ -69,10 +77,12 @@ class TeeWriter:
         if len(text) > max_chars:
             text = "[... earlier output omitted ...]\n" + text[-max_chars:]
         try:
-            self.real_stdout.write(text)
-            if not text.endswith("\n"):
-                self.real_stdout.write("\n")
-            self.real_stdout.flush()
+            def _replay() -> None:
+                self._write_real(text)
+                if not text.endswith("\n"):
+                    self._write_real("\n")
+
+            _replay()
         except Exception:
             return 0
         return len(text)
@@ -84,7 +94,7 @@ class SubAgentInstance:
 
     name: str
     agent: ClineAgent
-    task: Optional[asyncio.Task] = None
+    task: Optional[concurrent.futures.Future] = None  # Thread-safe future on the background loop
     status: str = "created"  # created, running, completed, error
     output: str = ""  # Rendered terminal transcript (diagnostic only)
     final_result: str = ""  # Return value from the sub-agent's completed turn
@@ -113,6 +123,43 @@ class SubAgentManager:
         self._get_session_path = get_session_path_fn
         self._focused_name: Optional[str] = None
 
+        # Dedicated background event loop thread.  Sub-agent coroutines are
+        # scheduled onto this loop so they progress regardless of whether the
+        # main thread is blocked at the prompt, rendering, or idle.
+        self._bg_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._bg_thread: Optional[threading.Thread] = None
+        self._bg_ready = threading.Event()
+
+    # ── Background loop management ────────────────────────────────────
+
+    def _ensure_bg_loop(self) -> asyncio.AbstractEventLoop:
+        """Start (once) and return the dedicated sub-agent event loop."""
+        if self._bg_loop is not None and not self._bg_loop.is_closed():
+            return self._bg_loop
+
+        def _runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._bg_loop = loop
+            self._bg_ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        self._bg_thread = threading.Thread(
+            target=_runner, daemon=True, name="subagent-loop"
+        )
+        self._bg_thread.start()
+        if not self._bg_ready.wait(timeout=10):
+            raise RuntimeError("Sub-agent background loop failed to start")
+        return self._bg_loop
+
+    def _schedule_bg(self, coro) -> "concurrent.futures.Future":
+        """Schedule *coro* on the background loop; returns a thread-safe Future."""
+        loop = self._ensure_bg_loop()
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+
     # ── Public API ────────────────────────────────────────────────────
 
     def create(self, name: str, task_prompt: str) -> str:
@@ -134,9 +181,11 @@ class SubAgentManager:
         # Build session path: underscore prefix prevents collision with parent sessions
         session_path = self._get_session_path(self._workspace, f"_sub_{safe_name}")
 
-        # Create a TeeWriter to capture all output
-        real_stdout = getattr(sys, "__stdout__", sys.stdout)
-        tee = TeeWriter(real_stdout)
+        # Create a TeeWriter to capture all output.  Write through the current
+        # sys.stdout (the patch_stdout proxy in interactive sessions) so that
+        # focused output renders above the prompt instead of being swallowed
+        # by prompt_toolkit's renderer.
+        tee = TeeWriter(sys.stdout)
 
         # Create sub-agent Console that writes through the Tee
         sub_console = Console(file=tee)
@@ -170,8 +219,9 @@ class SubAgentManager:
         )
         self._agents[name] = instance
 
-        # Start background task
-        instance.task = asyncio.create_task(
+        # Start background task on the dedicated sub-agent loop so it runs
+        # independently of the main REPL's event loop.
+        instance.task = self._schedule_bg(
             self._run_agent_task(instance, task_prompt)
         )
         instance.status = "running"
@@ -192,27 +242,35 @@ class SubAgentManager:
         # Wait for any currently running task
         if instance.task and not instance.task.done():
             try:
-                await instance.task
+                await asyncio.wrap_future(instance.task)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 log.warning("Sub-agent '%s' task raised: %s", name, e)
 
         # Start a new turn with the given input
-        instance.task = asyncio.create_task(
+        instance.task = self._schedule_bg(
             self._run_agent_task(instance, input_text)
         )
         instance.status = "running"
-        result = await instance.task
+        result = await asyncio.wrap_future(instance.task)
         return result
 
     def pause(self, name: str) -> bool:
-        """Pause a running sub-agent. Cancels its background task."""
+        """Pause a running sub-agent. Cancels its background future."""
         instance = self._agents.get(name)
         if not instance:
             return False
         if instance.task and not instance.task.done():
             instance.task.cancel()
+            # Give the background loop a moment to process the cancellation so
+            # status/output are updated before the caller inspects them.
+            try:
+                instance.task.result(timeout=5)
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception:
+                pass
         instance.status = "paused"
         self._save_session(instance)
         log.info("Sub-agent '%s' paused.", name)
@@ -225,6 +283,12 @@ class SubAgentManager:
             return False
         if instance.task and not instance.task.done():
             instance.task.cancel()
+            try:
+                instance.task.result(timeout=5)
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception:
+                pass
         self._save_session(instance)
         if self._focused_name == name:
             self._focused_name = None
@@ -313,13 +377,35 @@ class SubAgentManager:
             self._save_session(inst)
 
     def cleanup(self) -> None:
-        """Cancel all background tasks and save sessions."""
+        """Cancel all background tasks, stop the background loop, save sessions."""
         for inst in self._agents.values():
             if inst.task and not inst.task.done():
                 inst.task.cancel()
             self._save_session(inst)
         self._agents.clear()
         self._focused_name = None
+
+        # Drain cancelled tasks, then stop the dedicated loop so the thread
+        # can exit cleanly instead of dying with "Task was destroyed".
+        if self._bg_loop is not None and not self._bg_loop.is_closed():
+            async def _drain_and_stop():
+                await asyncio.sleep(0.1)
+                asyncio.get_running_loop().stop()
+
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    _drain_and_stop(), self._bg_loop
+                )
+                fut.result(timeout=5)
+            except Exception:
+                try:
+                    self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+                except Exception:
+                    pass
+        if self._bg_thread is not None:
+            self._bg_thread.join(timeout=5)
+            self._bg_thread = None
+        self._bg_loop = None
 
     # ── Internals ─────────────────────────────────────────────────────
 

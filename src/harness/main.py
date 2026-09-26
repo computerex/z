@@ -1346,6 +1346,14 @@ if __name__ == '__main__':
         loop.run_until_complete(agent.cleanup_background_procs_async())
         sub_agent_manager.save_all_sessions()
         sub_agent_manager.cleanup()
+        # Let cancelled sub-agent tasks run their cancellation handlers so the
+        # loop doesn't destroy pending tasks at close ("Task was destroyed").
+        try:
+            import asyncio as _asyncio
+
+            loop.run_until_complete(_asyncio.sleep(0.1))
+        except Exception:
+            pass
         save_session()
         # Stop remote providers
         if remote_manager:
@@ -1555,6 +1563,20 @@ if __name__ == '__main__':
                 agent_tag = f" \x1b[38;5;220m[agent:{focused_agent}]\x1b[0m"
             return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str}{agent_tag} \x1b[38;5;243m\u276f\x1b[0m ")
 
+        # Route stdout writes from background tasks (sub-agents, remote) above
+        # the prompt instead of letting them clobber prompt_toolkit's renderer.
+        # patch_stdout's proxy writes through directly when no prompt is active,
+        # so parent-turn printing is unaffected.
+        _stdout_patcher = None
+        if HAS_PROMPT_TOOLKIT:
+            try:
+                from prompt_toolkit.patch_stdout import patch_stdout as _patch_stdout
+
+                _stdout_patcher = _patch_stdout()
+                _stdout_patcher.__enter__()
+            except Exception:
+                _stdout_patcher = None
+
         while True:
             try:
                 # ── Check for remote provider messages (Telegram etc.) ──
@@ -1595,7 +1617,16 @@ if __name__ == '__main__':
                     # Get input (multiline with prompt_toolkit, or simple input)
                     if prompt_session:
                         try:
-                            user_input = prompt_session.prompt(_build_prompt_text, pre_run=_capture_pt_app).strip()
+                            # Run the prompt inside the asyncio loop so that
+                            # background tasks (sub-agents streaming, remote
+                            # message polls) keep progressing while the user
+                            # types. The sync `.prompt()` froze the event loop
+                            # at the input, freezing every background agent.
+                            user_input = loop.run_until_complete(
+                                prompt_session.prompt_async(
+                                    _build_prompt_text, pre_run=_capture_pt_app
+                                )
+                            ).strip()
                             # Check for sub-agent completed while user was typing
                             if sub_agent_manager and (
                                 _cs := sub_agent_manager.check_completed()

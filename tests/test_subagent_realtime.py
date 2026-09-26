@@ -22,3 +22,12 @@ def test_replay_to_real_truncates_old_output():
     tee.replay_to_real(max_chars=10)
 
     assert real.getvalue() == "[... earlier output omitted ...]\n" + "x" * 10 + "\n"
+
+
+def test_active_write_passes_through_to_plain_stdout():
+    real = io.StringIO()
+    tee = TeeWriter(real)
+    tee.active = True
+    tee.write("live output\n")
+
+    assert real.getvalue() == "live output\n"
