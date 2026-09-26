@@ -775,7 +775,11 @@ def run_model_switch_wizard(
     if not aggregate:
         # No models found from any provider (e.g., all are Bedrock/MiniMax)
         # If query looks like a model ID, offer to switch directly
-        if "." in query or "/" in query:
+        # A slash is a strong signal that the user supplied a provider-specific
+        # fully-qualified model ID (for example, Fireworks'
+        # ``accounts/fireworks/models/...``).  Do not treat dots as that signal:
+        # normal model names such as ``glm-5.3`` must remain search queries.
+        if "/" in query:
             console.print(
                 f"  [dim]No searchable providers found. Switching to model '{query}' on current provider...[/dim]"
             )
@@ -810,7 +814,10 @@ def run_model_switch_wizard(
     if not matches:
         # If query looks like a model ID and current provider doesn't support listing,
         # just switch to it directly
-        if "." in query or "/" in query:
+        # Only fully-qualified IDs may bypass search.  Bare names (including
+        # versioned names such as ``glm-5.3``) must not silently become the
+        # active model when the provider model list was fetched successfully.
+        if "/" in query:
             current_cfg = (
                 searchable[0][1]
                 if searchable
