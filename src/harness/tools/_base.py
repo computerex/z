@@ -37,6 +37,26 @@ except Exception:
 log = get_logger("tools")
 
 
+# ── Process-wide tool log id counter ───────────────────────────────────
+# Shared across ALL ToolHandlers instances (parent agent + sub-agents).
+# Per-instance counters made concurrent agents collide on the same
+# .harness_output/cmd_N.log / bg_process_N.log files — one agent's shell
+# redirect holds the file while another tries to truncate it, producing
+# PermissionError on Windows and interleaved output elsewhere.
+import threading
+
+_LOG_ID_LOCK = threading.Lock()
+_LOG_ID_SEQ = 0
+
+
+def next_tool_id() -> int:
+    """Return the next process-wide tool log/background-process id."""
+    global _LOG_ID_SEQ
+    with _LOG_ID_LOCK:
+        _LOG_ID_SEQ += 1
+        return _LOG_ID_SEQ
+
+
 # ── Output protocol file tracking ──────────────────────────────────────
 
 def _track_write(path: Path) -> None:

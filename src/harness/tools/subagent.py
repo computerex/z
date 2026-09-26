@@ -137,7 +137,24 @@ async def get_agent_output(self, params: dict) -> str:
                 if output_text:
                     # Task is done, output exists — return it
                     return output_text
-            return f"Sub-agent '{name}' is still {inst.status}. Use list_agents(name='{name}') to check its progress."
+            # Still running: return a readable tail of the partial output so
+            # the caller can check live progress (stripped of terminal
+            # styling — the tee capture contains ANSI codes).
+            partial = ""
+            if inst.tee:
+                try:
+                    from ..sub_agent_manager import strip_ansi
+                    partial = strip_ansi(inst.tee.getvalue() or "")
+                except Exception:
+                    partial = ""
+            if partial:
+                partial = partial[-1500:].strip()
+                return (
+                    f"Sub-agent '{name}' is still {inst.status}. "
+                    f"Recent output (tail):\n{partial}\n"
+                    f"[Check again later for the final result.]"
+                )
+            return f"Sub-agent '{name}' is still {inst.status} (no output yet). Use list_agents(name='{name}') to check its progress."
         # Return the completed task's final result, not the diagnostic terminal
         # transcript. This preserves the agent's verdict even when the verbose
         # stream output is huge or contains terminal control sequences.

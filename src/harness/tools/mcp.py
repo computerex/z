@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from ..logger import get_logger
-from ._base import HAS_MCP_SDK, log, _track_write
+from ._base import HAS_MCP_SDK, log, _track_write, next_tool_id
 
 # ── Class-level constants ──────────────────────────────────────────────
 
@@ -57,8 +57,7 @@ def __init__(
     
     # Background processes: {id: {"proc": Process, "command": str, "started": float, "log_file": str, "task": Task}}
     self._background_procs: Dict[int, dict] = {}
-    self._next_bg_id = 1
-    self._next_cmd_id = 1  # For unique command log files
+    # (cmd/bg ids come from the process-wide next_tool_id() counter)
     
     # Directory for spilled command output files
     self._output_dir = os.path.join(workspace_path, ".harness_output")
@@ -118,10 +117,13 @@ def _get_bg_log_path(self, proc_id: int) -> str:
 
 
 def _get_cmd_log_path(self) -> str:
-    """Get a unique log file path for a foreground command."""
+    """Get a unique log file path for a foreground command.
+
+    Uses the process-wide id counter so concurrent agents (parent +
+    sub-agents) never collide on the same log file.
+    """
     os.makedirs(self._output_dir, exist_ok=True)
-    cmd_id = self._next_cmd_id
-    self._next_cmd_id += 1
+    cmd_id = next_tool_id()
     return os.path.join(self._output_dir, f"cmd_{cmd_id}.log")
 
 

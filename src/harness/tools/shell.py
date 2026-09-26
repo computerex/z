@@ -20,6 +20,7 @@ from ._base import (
     _decode_powershell_clixml,
     _detect_log_file_encoding,
     kill_process_tree,
+    next_tool_id,
     sanitize_terminal_output,
 )
 from .mcp import _get_bg_log_path, _get_cmd_log_path
@@ -337,8 +338,8 @@ def _kill_proc(self, proc: asyncio.subprocess.Process) -> None:
 def _promote_to_background(self, proc, command: str, start_time: float,
                             log_path: str, output_lines: List[str]) -> str:
     """Promote a foreground process to a tracked background process."""
-    proc_id = self._next_bg_id
-    self._next_bg_id += 1
+    # Process-wide id: concurrent agents must not collide on bg ids
+    proc_id = next_tool_id()
 
     self._background_procs[proc_id] = {
         "proc": proc,
@@ -364,8 +365,7 @@ async def _run_background_command(self, command: str) -> str:
     if not command.strip():
         return "Error: execute_command requires a non-empty <command> parameter."
 
-    proc_id = self._next_bg_id
-    self._next_bg_id += 1
+    proc_id = next_tool_id()
     log_path = _get_bg_log_path(self, proc_id)
 
     # Truncate before launch to avoid stale content from previous sessions

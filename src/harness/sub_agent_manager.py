@@ -8,6 +8,7 @@ from the parent agent and sibling sub-agents.
 import asyncio
 import concurrent.futures
 import io
+import re
 import sys
 import threading
 import time
@@ -21,6 +22,26 @@ from .config import Config
 from .logger import get_logger, log_exception
 
 log = get_logger("sub_agent")
+
+# Strip ANSI/VT100 escape sequences from captured output before using it as
+# plain-text snippets (list_agents progress, partial-output tails). The
+# sub-agent transcript is a live terminal capture and contains styling codes
+# (e.g. per-chunk dim spans around streamed thinking text).
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI/VT100 escape sequences and collapse runs of blank lines."""
+    if not text:
+        return ""
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    # The per-chunk dim styling leaves "\x1b[0m\x1b[2m" boundaries that render
+    # as no space in a terminal; after stripping, lines may contain stray
+    # artifacts. Collapse 3+ consecutive blank lines for snippet readability.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
 
 
 class TeeWriter:
@@ -381,10 +402,15 @@ class SubAgentManager:
                 # than a potentially huge ANSI-decorated terminal transcript.
                 if inst.status == "completed" and inst.final_result:
                     output_snippet = inst.final_result
-                elif len(output_text) > _MAX_SNIPPET:
-                    output_snippet = "[...] " + output_text[-_MAX_SNIPPET:]
                 else:
-                    output_snippet = output_text
+                    # Running agents: strip terminal styling from the live
+                    # transcript so the progress snippet stays readable as
+                    # plain text (the tee capture contains ANSI codes).
+                    output_text = strip_ansi(output_text)
+                    if len(output_text) > _MAX_SNIPPET:
+                        output_snippet = "[...] " + output_text[-_MAX_SNIPPET:]
+                    else:
+                        output_snippet = output_text
 
             result.append({
                 "name": name,

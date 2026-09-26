@@ -2040,6 +2040,18 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         _thinking_line_start = True
                     # Clear status before writing thinking content
                     self.status.clear()
+                    # Batch the per-character dim styling into one span per
+                    # chunk. Writing ESC[2m + char + ESC[0m per character made
+                    # capture streams (sub-agent tee buffers, logs) ~9x larger
+                    # and produced unreadable escape soup in plain-text
+                    # snippets. Terminal rendering is identical.
+                    _seg = []
+
+                    def _flush_seg():
+                        if _seg:
+                            _out.write(f"{_ansi_dim}{''.join(_seg)}{_ansi_reset}")
+                            _seg.clear()
+
                     for c in chunk:
                         if _thinking_line_start:
                             # Skip leading blank lines so the block starts tight.
@@ -2047,15 +2059,17 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                                 continue
                             _out.write(_thinking_prefix)
                             _thinking_line_start = False
-                        if _tty and c != "\n":
-                            _out.write(f"{_ansi_dim}{c}{_ansi_reset}")
-                        else:
+                        if c == "\n":
+                            _flush_seg()
                             _out.write(c)
+                        else:
+                            _seg.append(c)
                         if c not in ("\n", "\r", "\t", " "):
                             _thinking_line_has_text = True
                         if c == "\n":
                             _thinking_line_start = True
                             _thinking_line_has_text = False
+                    _flush_seg()  # emit the trailing partial line of this chunk
                     sys.stdout.flush()
                 if _real_stdout:
                     _real_stdout.flush()
@@ -2529,10 +2543,17 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 )
                 if completion_call:
                     # Filter out attempt_completion — execute only the FIRST remaining tool (1-per-turn policy)
+                    # Exception: create_agent spawns in the batch are executed too
+                    # (non-blocking) so parallel agent dispatch works.
                     actionable_tools = [tc for tc in all_tool_calls if tc.name != "attempt_completion"]
                     if actionable_tools:
                         tc = actionable_tools[0]
-                        ignored_pre = actionable_tools[1:]
+                        spawn_calls = [
+                            t for t in actionable_tools[1:] if t.name == "create_agent"
+                        ]
+                        ignored_pre = [
+                            t for t in actionable_tools[1:] if t.name != "create_agent"
+                        ]
                         log.info(
                             "attempt_completion found alongside %d other tool(s) — executing first tool only: %s",
                             len(actionable_tools),
@@ -2627,6 +2648,28 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                                         content="[Not executed — re-issue this tool call.]",
                                         tool_call_id=_ign.tool_call_id or f"fallback_{_ign.name}",
                                         name=_ign.name,
+                                    )
+                                )
+                            # Execute batched create_agent spawns (non-blocking)
+                            # so parallel dispatch works alongside completion.
+                            for _spawn_tc in spawn_calls:
+                                log.info("Tool exec START (pre-completion batch spawn): %s", _spawn_tc.name)
+                                _spawn_result = await self._execute_tool(_spawn_tc)
+                                log.info(
+                                    "Tool exec DONE (pre-completion batch spawn): %s result_len=%d",
+                                    _spawn_tc.name,
+                                    len(_spawn_result or ""),
+                                )
+                                if _spawn_tc.name not in self.tool_handlers._NO_SPILL_TOOLS:
+                                    _spawn_result = self.tool_handlers.spill_output_to_file(
+                                        _spawn_result, _spawn_tc.name
+                                    )
+                                self.messages.append(
+                                    StreamingMessage(
+                                        role="tool",
+                                        content=_spawn_result,
+                                        tool_call_id=_spawn_tc.tool_call_id or f"fallback_{_spawn_tc.name}",
+                                        name=_spawn_tc.name,
                                     )
                                 )
                             # Synthetic result for the deferred attempt_completion
@@ -2902,8 +2945,23 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 # Execute only the FIRST tool call per turn (1 tool per turn policy).
                 # If the model emitted multiple tool calls, only the first is executed;
                 # the rest are reported back so the model can re-issue them.
+                # EXCEPTION: create_agent calls are non-blocking background
+                # spawns — all of them in the batch are executed so the model
+                # can dispatch several sub-agents in parallel in one turn.
                 tc = all_tool_calls[0]
-                ignored_tools = all_tool_calls[1:]
+                spawn_calls = [
+                    t for t in all_tool_calls[1:] if t.name == "create_agent"
+                ]
+                ignored_tools = [
+                    t for t in all_tool_calls[1:] if t.name != "create_agent"
+                ]
+
+                if spawn_calls:
+                    log.info(
+                        "Batch spawn: executing %d additional create_agent call(s) alongside %s",
+                        len(spawn_calls),
+                        tc.name,
+                    )
 
                 if ignored_tools:
                     log.info(
@@ -3030,6 +3088,32 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             content="[Not executed — 1 tool per turn policy. Re-issue this tool call.]",
                             tool_call_id=_ignored_tc.tool_call_id or f"fallback_{_ignored_tc.name}",
                             name=_ignored_tc.name,
+                        )
+                    )
+
+                # Execute the batched create_agent spawns (non-blocking) and
+                # append their real results so parallel dispatch works within
+                # the 1-tool-per-turn policy.
+                for _spawn_tc in spawn_calls:
+                    _spawn_t0 = time.time()
+                    log.info("Tool exec START (batch spawn): %s", _spawn_tc.name)
+                    _spawn_result = await self._execute_tool(_spawn_tc)
+                    log.info(
+                        "Tool exec DONE (batch spawn): %s elapsed=%.1fs result_len=%d",
+                        _spawn_tc.name,
+                        time.time() - _spawn_t0,
+                        len(_spawn_result or ""),
+                    )
+                    if _spawn_tc.name not in self.tool_handlers._NO_SPILL_TOOLS:
+                        _spawn_result = self.tool_handlers.spill_output_to_file(
+                            _spawn_result, _spawn_tc.name
+                        )
+                    self.messages.append(
+                        StreamingMessage(
+                            role="tool",
+                            content=_spawn_result,
+                            tool_call_id=_spawn_tc.tool_call_id or f"fallback_{_spawn_tc.name}",
+                            name=_spawn_tc.name,
                         )
                     )
 

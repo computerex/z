@@ -55,8 +55,9 @@ class ToolHandlers:
         self.owner_agent = owner_agent
 
         self._background_procs: Dict[int, dict] = {}
-        self._next_bg_id = 1
-        self._next_cmd_id = 1
+        # cmd/bg log ids come from the process-wide counter in
+        # tools._base.next_tool_id() — per-instance counters made concurrent
+        # sub-agents collide on the same .harness_output log files.
 
         self._output_dir = os.path.join(workspace_path, ".harness_output")
         os.makedirs(self._output_dir, exist_ok=True)
