@@ -87,6 +87,9 @@ class StreamingMessage:
     provider_blocks: Optional[List[Dict[str, Any]]] = (
         None  # For compatibility with cline_agent
     )
+    # DeepSeek requires this field to be round-tripped on assistant messages,
+    # including an empty string after tool turns.
+    reasoning_content: Optional[str] = None
     # Native tool calling fields
     tool_calls: Optional[List[Dict[str, Any]]] = None  # For assistant messages
     tool_call_id: Optional[str] = None  # For tool result messages
@@ -109,6 +112,8 @@ class StreamingMessage:
             d["content"] = self.content
             if self.tool_calls:
                 d["tool_calls"] = self.tool_calls
+        if self.reasoning_content is not None:
+            d["reasoning_content"] = self.reasoning_content
         return d
 
 
@@ -130,6 +135,11 @@ class StreamingChatResponse:
     )
     # Native tool calling
     tool_calls: Optional[List[Dict[str, Any]]] = None
+
+
+def _is_deepseek_model(model: str) -> bool:
+    """Whether *model* is a DeepSeek model across direct and gateway IDs."""
+    return "deepseek" in model.lower()
 
 
 def _extract_reasoning_details_text(value: Any) -> str:
@@ -441,8 +451,16 @@ class StreamingJSONClient:
         # Each tool call is identified by its index in the array
         _tool_call_accum: Dict[int, Dict[str, Any]] = {}  # index -> {id, type, function: {name, arguments}}
 
-        # Convert messages to LiteLLM format
-        litellm_messages = [m.to_dict() for m in messages]
+        # Convert messages to LiteLLM format. DeepSeek requires reasoning
+        # content on every assistant message in multi-turn tool workflows;
+        # retain an explicit empty field when the provider omitted it.
+        _deepseek_model = _is_deepseek_model(self.model)
+        litellm_messages = []
+        for message in messages:
+            serialized = message.to_dict()
+            if _deepseek_model and message.role == "assistant":
+                serialized.setdefault("reasoning_content", "")
+            litellm_messages.append(serialized)
 
         # ── Anthropic prompt caching (cache_control) ──────────────────
         # Anthropic's prompt caching requires explicit `cache_control`

@@ -2451,6 +2451,11 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             provider_blocks=getattr(
                                 response, "provider_content_blocks", None
                             ),
+                            reasoning_content=(
+                                response.thinking or ""
+                                if "deepseek" in self.config.model.lower()
+                                else None
+                            ),
                         )
                     )
                     self.messages.append(
@@ -2582,6 +2587,11 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                                     provider_blocks=getattr(
                                         response, "provider_content_blocks", None
                                     ),
+                                    reasoning_content=(
+                                        response.thinking or ""
+                                        if "deepseek" in self.config.model.lower()
+                                        else None
+                                    ),
                                 )
                             )
                             self.messages.append(
@@ -2628,6 +2638,11 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             tool_calls=_raw_tool_calls,
                             provider_blocks=getattr(
                                 response, "provider_content_blocks", None
+                            ),
+                            reasoning_content=(
+                                response.thinking or ""
+                                if "deepseek" in self.config.model.lower()
+                                else None
                             ),
                         )
                     )
@@ -2939,6 +2954,11 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         tool_calls=_raw_tool_calls,
                         provider_blocks=getattr(
                             response, "provider_content_blocks", None
+                        ),
+                        reasoning_content=(
+                            response.thinking or ""
+                            if "deepseek" in self.config.model.lower()
+                            else None
                         ),
                     )
                 )
