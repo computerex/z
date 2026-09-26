@@ -31,9 +31,10 @@ class TeeWriter:
     background) and real-time display (when the user switches focus to it).
     """
 
-    def __init__(self, real_stdout):
+    def __init__(self, real_stdout, dynamic: bool = False):
         self.buffer = io.StringIO()
         self.real_stdout = real_stdout
+        self.dynamic = dynamic  # Resolve sys.stdout at write time (prompt proxy)
         self.active = False  # If True, also writes to real stdout
 
     def write(self, text: str) -> None:
@@ -46,8 +47,12 @@ class TeeWriter:
 
     def _write_real(self, text: str) -> None:
         try:
-            self.real_stdout.write(text)
-            self.real_stdout.flush()
+            # Resolve the destination at write time: while the prompt is on
+            # screen, sys.stdout is the patch_stdout proxy (render above the
+            # prompt); during turns it is the real stdout.
+            out = sys.stdout if self.dynamic else self.real_stdout
+            out.write(text)
+            out.flush()
         except Exception:
             pass
 
@@ -181,11 +186,10 @@ class SubAgentManager:
         # Build session path: underscore prefix prevents collision with parent sessions
         session_path = self._get_session_path(self._workspace, f"_sub_{safe_name}")
 
-        # Create a TeeWriter to capture all output.  Write through the current
-        # sys.stdout (the patch_stdout proxy in interactive sessions) so that
-        # focused output renders above the prompt instead of being swallowed
-        # by prompt_toolkit's renderer.
-        tee = TeeWriter(sys.stdout)
+        # Create a TeeWriter to capture all output.  dynamic=True so live
+        # writes resolve sys.stdout at write time — the patch_stdout proxy
+        # while the prompt is active, real stdout during parent turns.
+        tee = TeeWriter(sys.stdout, dynamic=True)
 
         # Create sub-agent Console that writes through the Tee
         sub_console = Console(file=tee)

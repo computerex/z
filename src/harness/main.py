@@ -1563,20 +1563,6 @@ if __name__ == '__main__':
                 agent_tag = f" \x1b[38;5;220m[agent:{focused_agent}]\x1b[0m"
             return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str}{agent_tag} \x1b[38;5;243m\u276f\x1b[0m ")
 
-        # Route stdout writes from background tasks (sub-agents, remote) above
-        # the prompt instead of letting them clobber prompt_toolkit's renderer.
-        # patch_stdout's proxy writes through directly when no prompt is active,
-        # so parent-turn printing is unaffected.
-        _stdout_patcher = None
-        if HAS_PROMPT_TOOLKIT:
-            try:
-                from prompt_toolkit.patch_stdout import patch_stdout as _patch_stdout
-
-                _stdout_patcher = _patch_stdout()
-                _stdout_patcher.__enter__()
-            except Exception:
-                _stdout_patcher = None
-
         while True:
             try:
                 # ── Check for remote provider messages (Telegram etc.) ──
@@ -1622,11 +1608,22 @@ if __name__ == '__main__':
                             # message polls) keep progressing while the user
                             # types. The sync `.prompt()` froze the event loop
                             # at the input, freezing every background agent.
-                            user_input = loop.run_until_complete(
-                                prompt_session.prompt_async(
-                                    _build_prompt_text, pre_run=_capture_pt_app
-                                )
-                            ).strip()
+                            # patch_stdout is scoped to the prompt ONLY: the
+                            # status line and rich rendering during agent turns
+                            # must keep writing raw ANSI/\r to the real stdout,
+                            # otherwise every spinner frame gets re-rendered as
+                            # its own line with escape bytes eaten.
+                            from prompt_toolkit.patch_stdout import (
+                                patch_stdout as _patch_stdout,
+                            )
+
+                            with _patch_stdout():
+                                user_input = loop.run_until_complete(
+                                    prompt_session.prompt_async(
+                                        _build_prompt_text,
+                                        pre_run=_capture_pt_app,
+                                    )
+                                ).strip()
                             # Check for sub-agent completed while user was typing
                             if sub_agent_manager and (
                                 _cs := sub_agent_manager.check_completed()
