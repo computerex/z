@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+_SUBAGENT_TOOLS_UNAVAILABLE = (
+    "Error: Sub-agent tools are not available from this context — "
+    "this agent cannot manage sub-agents."
+)
+
 async def create_agent(self, params: dict) -> str:
     """Create a sub-agent and start it in the background."""
     name = params.get("name", "").strip()
@@ -14,7 +19,7 @@ async def create_agent(self, params: dict) -> str:
     if not name or not task:
         return "Error: Both 'name' (unique identifier) and 'task' (description) are required."
     if not self.sub_agent_manager:
-        return "Error: Sub-agent system not initialized."
+        return _SUBAGENT_TOOLS_UNAVAILABLE
     try:
         self.sub_agent_manager.create(name, task)
         self.console.print(
@@ -37,7 +42,7 @@ async def send_agent_input(self, params: dict) -> str:
     if not name or input_text is None:
         return "Error: Both 'name' and 'input' are required."
     if not self.sub_agent_manager:
-        return "Error: Sub-agent system not initialized."
+        return _SUBAGENT_TOOLS_UNAVAILABLE
     try:
         inst = self.sub_agent_manager.get(name)
         if not inst:
@@ -65,7 +70,7 @@ async def send_agent_input(self, params: dict) -> str:
 async def list_agents(self, params: dict) -> str:
     """List all sub-agents with current output."""
     if not self.sub_agent_manager:
-        return "Sub-agent system not available."
+        return _SUBAGENT_TOOLS_UNAVAILABLE
     agents = self.sub_agent_manager.list()
     if not agents:
         return "No sub-agents running."
@@ -105,7 +110,7 @@ async def pause_agent(self, params: dict) -> str:
     if not name:
         return "Error: 'name' is required."
     if not self.sub_agent_manager:
-        return "Error: Sub-agent system not initialized."
+        return _SUBAGENT_TOOLS_UNAVAILABLE
     if self.sub_agent_manager.pause(name):
         self.console.print(f"  [yellow]\u23f8[/yellow] Paused sub-agent [bold]{name}[/bold]")
         return f"Sub-agent '{name}' paused."
@@ -118,7 +123,7 @@ async def get_agent_output(self, params: dict) -> str:
     if not name:
         return "Error: 'name' is required."
     if not self.sub_agent_manager:
-        return "Error: Sub-agent system not initialized."
+        return _SUBAGENT_TOOLS_UNAVAILABLE
     try:
         inst = self.sub_agent_manager.get(name)
         if not inst:
@@ -154,7 +159,7 @@ async def delete_agent(self, params: dict) -> str:
     if not name:
         return "Error: 'name' is required."
     if not self.sub_agent_manager:
-        return "Error: Sub-agent system not initialized."
+        return _SUBAGENT_TOOLS_UNAVAILABLE
     if self.sub_agent_manager.delete(name):
         self.console.print(f"  [red]\u2717[/red] Deleted sub-agent [bold]{name}[/bold]")
         return f"Sub-agent '{name}' deleted."

@@ -36,14 +36,23 @@ class TeeWriter:
         self.real_stdout = real_stdout
         self.dynamic = dynamic  # Resolve sys.stdout at write time (prompt proxy)
         self.active = False  # If True, also writes to real stdout
+        self._pending = ""  # Partial line held back for line-buffered passthrough
 
     def write(self, text: str) -> None:
         self.buffer.write(text)
         if self.active:
-            # real_stdout is the patch_stdout proxy in interactive sessions, so
-            # these writes render above the prompt while it is active and pass
-            # straight through otherwise.
-            self._write_real(text)
+            # Line-buffered passthrough: hold back partial lines and flush
+            # only complete lines as a single write. Rich emits styled text
+            # in many small chunks (per ANSI span), so writing per-chunk
+            # through the patch_stdout proxy redraws the prompt after every
+            # chunk — the prompt visibly jumps, partial lines gain extra
+            # newlines, and ANSI sequences get split mid-escape. One write
+            # per complete line avoids all three.
+            self._pending += text
+            if "\n" in self._pending:
+                lines = self._pending.split("\n")
+                self._pending = lines.pop()  # keep the trailing partial line
+                self._write_real("\n".join(lines) + "\n")
 
     def _write_real(self, text: str) -> None:
         try:
@@ -58,6 +67,12 @@ class TeeWriter:
 
     def flush(self) -> None:
         if self.active:
+            # Release any held-back partial line (rare — rich prints are
+            # newline-terminated, so _pending is normally empty at flush).
+            if self._pending:
+                text = self._pending
+                self._pending = ""
+                self._write_real(text)
             try:
                 self.real_stdout.flush()
             except Exception:
@@ -265,6 +280,23 @@ class SubAgentManager:
         """
         instance = self._get(name)
 
+        # Never feed an agent its own completion notification as a new turn.
+        # The REPL routes input to the focused agent, and if a completion
+        # notification ("[SYSTEM: Sub-agent 'X' has completed...]") is routed
+        # back into the same agent, it starts a new turn, completes again,
+        # resets completion_notified, and the notification fires again —
+        # an infinite complete→notify→run loop. Return the cached result.
+        if (
+            instance.status == "completed"
+            and input_text.strip().startswith("[SYSTEM:")
+            and f"'{name}'" in input_text
+        ):
+            log.info(
+                "Refusing to feed completion notification back into sub-agent '%s'",
+                name,
+            )
+            return instance.final_result or instance.output or ""
+
         # Wait for any currently running task
         if instance.task and not instance.task.done():
             try:
@@ -398,6 +430,19 @@ class SubAgentManager:
                 inst.completion_notified = True
                 return name
         return None
+
+    def requeue_notification(self, name: str) -> None:
+        """Undo a check_completed() consumption so the notification fires
+        again on the next idle REPL cycle.
+
+        Used when a completion arrives while the user is mid-typing: their
+        typed input must not be discarded in favor of the notification, so
+        the completion is requeued and delivered once the user's turn is
+        done.
+        """
+        inst = self._agents.get(name)
+        if inst is not None:
+            inst.completion_notified = False
 
     def save_all_sessions(self) -> None:
         """Save all sub-agent sessions for debugging."""

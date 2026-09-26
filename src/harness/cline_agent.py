@@ -416,6 +416,7 @@ class ClineAgent:
             duplicate_detector=self._duplicate_detector,
             context_manager=self.smart_context,
             sub_agent_manager=self._sub_agent_manager,
+            owner_agent=self,
         )
         # Workspace index — built once at startup
         _t0_idx = time.perf_counter()
@@ -1644,6 +1645,13 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
     async def run(self, user_input: str, enable_interrupt: bool = True) -> str:
         """Run the agent with a plain text user request."""
         return await self.run_message(user_input, enable_interrupt=enable_interrupt)
+
+    def interrupts_enabled(self) -> bool:
+        """Whether this agent should observe the global keyboard interrupt
+        state. Background sub-agents run with enable_interrupt=False; their
+        tool implementations (e.g. the shell tool's Esc check) must not react
+        to an interrupt that was meant for the parent prompt."""
+        return self._interrupt_enabled
 
     async def _run_loop(self) -> str:
         """Main agent loop."""

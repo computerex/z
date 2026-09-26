@@ -40,6 +40,7 @@ class ToolHandlers:
         duplicate_detector,
         context_manager=None,
         sub_agent_manager=None,
+        owner_agent=None,
     ):
         self.config = config
         self.console = console
@@ -48,6 +49,10 @@ class ToolHandlers:
         self._duplicate_detector = duplicate_detector
         self._context_manager = context_manager
         self.sub_agent_manager = sub_agent_manager
+        # Owning ClineAgent — used by tools that must respect per-agent
+        # state (e.g. the shell tool skips the global Esc interrupt check
+        # when the owner is a background sub-agent with interrupts off).
+        self.owner_agent = owner_agent
 
         self._background_procs: Dict[int, dict] = {}
         self._next_bg_id = 1

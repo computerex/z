@@ -1565,6 +1565,13 @@ if __name__ == '__main__':
 
         while True:
             try:
+                # True when user_input was injected by the harness itself
+                # (sub-agent completion, cron) rather than typed/remote-sent.
+                # Such input always goes to the PARENT agent — routing it to
+                # a focused sub-agent feeds completions back into the agent
+                # that produced them, creating an infinite notify→run→notify
+                # loop.
+                _system_input = False
                 # ── Check for remote provider messages (Telegram etc.) ──
                 _remote_text = _check_remote_messages()
                 if _remote_text is not None:
@@ -1572,6 +1579,7 @@ if __name__ == '__main__':
                 # ── Check for queued cron tasks before waiting for user input ──
                 elif agent.has_queued_cron_prompts():
                     user_input = "[Scheduled task processing...]"
+                    _system_input = True
                     # Route cron output to the last active remote chat (if any)
                     if _last_remote_chat is not None:
                         from .remote.base import RemoteMessage as _RM
@@ -1590,6 +1598,7 @@ if __name__ == '__main__':
                         f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
                         f"or list_agents(name='{_completed_sa}') to see a summary.]"
                     )
+                    _system_input = True
                     console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
                     if _last_remote_chat is not None:
                         from .remote.base import RemoteMessage as _RM
@@ -1622,16 +1631,23 @@ if __name__ == '__main__':
                                         pre_run=_capture_pt_app,
                                     )
                                 ).strip()
-                            # Check for sub-agent completed while user was typing
+                            # Check for sub-agent completed while user was typing.
+                            # If the user actually typed something, keep THEIR
+                            # input (don't discard it) and requeue the
+                            # notification for the next idle cycle.
                             if sub_agent_manager and (
                                 _cs := sub_agent_manager.check_completed()
                             ):
-                                user_input = (
-                                    f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
-                                    f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
-                                    f"or list_agents(name='{_cs}') to see a summary.]"
-                                )
-                                console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
+                                if user_input:
+                                    sub_agent_manager.requeue_notification(_cs)
+                                else:
+                                    user_input = (
+                                        f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
+                                        f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
+                                        f"or list_agents(name='{_cs}') to see a summary.]"
+                                    )
+                                    _system_input = True
+                                    console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
                                 if _last_remote_chat is not None:
                                     from .remote.base import RemoteMessage as _RM
                                     current_remote_msg = _RM(
@@ -1655,16 +1671,21 @@ if __name__ == '__main__':
                             # ANSI object -> raw string for plain input()
                             _raw = f"{agent.config.model} \u276f "
                             user_input = input(_raw).strip()
-                            # Check for sub-agent completed while user was typing
+                            # Check for sub-agent completed while user was typing.
+                            # Typed input wins; the notification is requeued.
                             if sub_agent_manager and (
                                 _cs := sub_agent_manager.check_completed()
                             ):
-                                user_input = (
-                                    f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
-                                    f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
-                                    f"or list_agents(name='{_cs}') to see a summary.]"
-                                )
-                                console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
+                                if user_input:
+                                    sub_agent_manager.requeue_notification(_cs)
+                                else:
+                                    user_input = (
+                                        f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
+                                        f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
+                                        f"or list_agents(name='{_cs}') to see a summary.]"
+                                    )
+                                    _system_input = True
+                                    console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
                                 if _last_remote_chat is not None:
                                     from .remote.base import RemoteMessage as _RM
                                     current_remote_msg = _RM(
@@ -1691,6 +1712,7 @@ if __name__ == '__main__':
                     # Check if cron tasks fired while at prompt
                     elif agent.has_queued_cron_prompts():
                         user_input = "[Scheduled task processing...]"
+                        _system_input = True
                         # Route cron output to the last active remote chat
                         if _last_remote_chat is not None:
                             from .remote.base import RemoteMessage as _RM
@@ -1709,6 +1731,7 @@ if __name__ == '__main__':
                             f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
                             f"or list_agents(name='{_completed_sa}') to see a summary.]"
                         )
+                        _system_input = True
                         console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
                         # Route to the last active remote chat if any
                         if _last_remote_chat is not None:
@@ -2871,10 +2894,15 @@ if __name__ == '__main__':
                         _echo_remote(f"Unknown command: {cmd}. Type /help for available commands.")
                         continue
 
-                # If focused on a sub-agent, route non-command input to it
+                # If focused on a sub-agent, route non-command input to it.
+                # System-injected input (sub-agent completion notifications,
+                # cron prompts) ALWAYS goes to the parent — a completion
+                # notification routed back into the sub-agent that produced
+                # it makes it run a new turn, complete again, and re-notify
+                # forever (infinite loop).
                 # The sub-agent renders its own output via TeeWriter, so no
                 # need to print the returned result text (avoids double-render).
-                if focused_agent:
+                if focused_agent and not _system_input:
                     try:
                         loop.run_until_complete(
                             sub_agent_manager.run(focused_agent, user_input)

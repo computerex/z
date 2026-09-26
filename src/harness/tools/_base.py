@@ -49,11 +49,19 @@ def _track_write(path: Path) -> None:
         pass
 
 
-def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
+def kill_process_tree(pid: int, timeout: float = 3.0, reap_parent: bool = True) -> None:
     """Kill a process and all its descendants, cross-platform.
     
     Uses psutil to walk the process tree and kill children first,
     then the parent. Works on Windows, Linux, and macOS.
+
+    reap_parent: pass False when the process was spawned via asyncio
+    (create_subprocess_*). The event loop's child watcher owns reaping
+    the direct child — psutil.wait_procs() would os.waitpid() it first,
+    and the watcher would then hit ChildProcessError and log
+    "exit status already read ... returncode 255" with a bogus exit code.
+    On non-asyncio children (subprocess.Popen etc.) keep the default so
+    the tree is fully reaped here.
     """
     try:
         parent = psutil.Process(pid)
@@ -80,8 +88,9 @@ def kill_process_tree(pid: int, timeout: float = 3.0) -> None:
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
     
-    # Wait for all to die
-    _, alive = psutil.wait_procs(children + [parent], timeout=timeout)
+    # Wait for all to die (skip the parent itself for asyncio-owned children)
+    wait_targets = children if not reap_parent else children + [parent]
+    _, alive = psutil.wait_procs(wait_targets, timeout=timeout)
     for p in alive:
         try:
             p.kill()

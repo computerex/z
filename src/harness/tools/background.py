@@ -77,7 +77,8 @@ async def cleanup_background_procs_async(self) -> None:
         try:
             proc = info["proc"]
             if proc.returncode is None:
-                kill_process_tree(proc.pid)
+                # asyncio-owned child: let the loop's child watcher reap it
+                kill_process_tree(proc.pid, reap_parent=False)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=3.0)
                 except (asyncio.TimeoutError, Exception):
@@ -105,7 +106,9 @@ def cleanup_background_procs(self) -> None:
         try:
             proc = info["proc"]
             if proc.returncode is None:
-                kill_process_tree(proc.pid)
+                # asyncio-owned children are reaped by the loop's child
+                # watcher; a psutil reap here races with it (rc 255).
+                kill_process_tree(proc.pid, reap_parent=False)
             if "task" in info and info["task"]:
                 try:
                     info["task"].cancel()
@@ -205,7 +208,9 @@ async def stop_background_process(self, params: Dict[str, str]) -> str:
     if proc.returncode is not None:
         return f"Process [{bg_id}] already exited with code {proc.returncode}"
 
-    kill_process_tree(proc.pid)
+    # asyncio-owned child: the loop's child watcher reaps it (see
+    # kill_process_tree for the double-reap race this avoids)
+    kill_process_tree(proc.pid, reap_parent=False)
     try:
         await asyncio.wait_for(proc.wait(), timeout=3.0)
     except (asyncio.TimeoutError, Exception):

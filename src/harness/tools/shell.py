@@ -26,6 +26,24 @@ from .mcp import _get_bg_log_path, _get_cmd_log_path
 
 log = get_logger("tools")
 
+
+def _owner_interrupts(self) -> bool:
+    """Whether the owning agent observes the global keyboard interrupt state.
+
+    The shell tool polls the process-global Escape/Ctrl+B flags. For
+    background sub-agents (enable_interrupt=False) a stale global flag set at
+    the parent prompt must NOT kill the sub-agent's commands, so the check is
+    gated by the owner agent's interrupts_enabled().
+    """
+    owner = getattr(self, "owner_agent", None)
+    if owner is not None:
+        try:
+            return bool(owner.interrupts_enabled())
+        except Exception:
+            return True
+    return True
+
+
 async def execute_command(self, params: Dict[str, str]) -> str:
     """Execute a shell command with live output display and interrupt support.
 
@@ -85,8 +103,9 @@ async def execute_command(self, params: Dict[str, str]) -> str:
         while proc.returncode is None:
             elapsed = time.time() - start_time
 
-            # Check for interrupt (Esc)
-            if is_interrupted():
+            # Check for interrupt (Esc) — only for agents that observe the
+            # global interrupt state (background sub-agents do not)
+            if _owner_interrupts(self) and is_interrupted():
                 self._kill_proc(proc)
                 self.console.print(f"    [yellow]interrupted[/yellow]")
                 raw_output = self._read_log_file(cmd_log_path)
@@ -94,8 +113,8 @@ async def execute_command(self, params: Dict[str, str]) -> str:
                     raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
                 return f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}" if output else "Command interrupted (no output)"
 
-            # Check for background request (Ctrl+B)
-            if is_background_requested():
+            # Check for background request (Ctrl+B) — parent-only, like Esc
+            if _owner_interrupts(self) and is_background_requested():
                 reset_background()
                 self.console.print(f"    [cyan]→ background[/cyan]")
                 return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)
@@ -295,8 +314,14 @@ def _read_log_file(self, log_path: str) -> str:
 
 
 def _kill_proc(self, proc: asyncio.subprocess.Process) -> None:
-    """Kill a process and its entire process tree."""
-    kill_process_tree(proc.pid)
+    """Kill a process and its entire process tree.
+
+    reap_parent=False: the process was spawned by asyncio, so the event
+    loop's child watcher owns reaping it. Letting psutil wait_procs reap
+    the direct child races with the watcher, which then reports
+    "exit status already read ... returncode 255" and a bogus exit code.
+    """
+    kill_process_tree(proc.pid, reap_parent=False)
 
 
 def _promote_to_background(self, proc, command: str, start_time: float,
