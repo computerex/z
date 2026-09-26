@@ -1608,16 +1608,14 @@ if __name__ == '__main__':
                             # message polls) keep progressing while the user
                             # types. The sync `.prompt()` froze the event loop
                             # at the input, freezing every background agent.
-                            # patch_stdout is scoped to the prompt ONLY: the
-                            # status line and rich rendering during agent turns
-                            # must keep writing raw ANSI/\r to the real stdout,
-                            # otherwise every spinner frame gets re-rendered as
-                            # its own line with escape bytes eaten.
+                            # raw=True: pass sub-agent ANSI output through
+                            # verbatim — the default ANSI re-processing wraps
+                            # every character in its own escape sequence.
                             from prompt_toolkit.patch_stdout import (
                                 patch_stdout as _patch_stdout,
                             )
 
-                            with _patch_stdout():
+                            with _patch_stdout(raw=True):
                                 user_input = loop.run_until_complete(
                                     prompt_session.prompt_async(
                                         _build_prompt_text,

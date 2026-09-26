@@ -99,7 +99,7 @@ class SubAgentInstance:
 
     name: str
     agent: ClineAgent
-    task: Optional[concurrent.futures.Future] = None  # Thread-safe future on the background loop
+    task: Any = None  # asyncio.Task on the main loop, or thread-safe Future fallback
     status: str = "created"  # created, running, completed, error
     output: str = ""  # Rendered terminal transcript (diagnostic only)
     final_result: str = ""  # Return value from the sub-agent's completed turn
@@ -160,10 +160,32 @@ class SubAgentManager:
             raise RuntimeError("Sub-agent background loop failed to start")
         return self._bg_loop
 
-    def _schedule_bg(self, coro) -> "concurrent.futures.Future":
-        """Schedule *coro* on the background loop; returns a thread-safe Future."""
-        loop = self._ensure_bg_loop()
-        return asyncio.run_coroutine_threadsafe(coro, loop)
+    def _schedule_bg(self, coro):
+        """Schedule *coro* for execution.
+
+        Prefers the caller's running event loop (the main loop): asyncio
+        subprocess child watchers only work on the main thread's loop on
+        Unix, so routing sub-agent shell commands through any other loop
+        breaks exit-status delivery ("exit status already read", rc 255).
+        The main loop keeps running while the user types (prompt_async),
+        so main-loop scheduling still executes independently of typing.
+        Falls back to the dedicated background loop only when called from
+        a context with no running loop (tests, embedders).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            return loop.create_task(coro)
+        bg = self._ensure_bg_loop()
+        return asyncio.run_coroutine_threadsafe(coro, bg)
+
+    async def _await_task(self, task) -> str:
+        """Await an asyncio Task or a thread-safe concurrent Future."""
+        if isinstance(task, concurrent.futures.Future):
+            return await asyncio.wrap_future(task)
+        return await task
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -246,7 +268,7 @@ class SubAgentManager:
         # Wait for any currently running task
         if instance.task and not instance.task.done():
             try:
-                await asyncio.wrap_future(instance.task)
+                await self._await_task(instance.task)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -257,7 +279,7 @@ class SubAgentManager:
             self._run_agent_task(instance, input_text)
         )
         instance.status = "running"
-        result = await asyncio.wrap_future(instance.task)
+        result = await self._await_task(instance.task)
         return result
 
     def pause(self, name: str) -> bool:
@@ -267,14 +289,15 @@ class SubAgentManager:
             return False
         if instance.task and not instance.task.done():
             instance.task.cancel()
-            # Give the background loop a moment to process the cancellation so
-            # status/output are updated before the caller inspects them.
-            try:
-                instance.task.result(timeout=5)
-            except concurrent.futures.CancelledError:
-                pass
-            except Exception:
-                pass
+            # Only thread-safe futures can be awaited from this sync context.
+            # asyncio Tasks process their cancellation next loop iteration.
+            if isinstance(instance.task, concurrent.futures.Future):
+                try:
+                    instance.task.result(timeout=5)
+                except concurrent.futures.CancelledError:
+                    pass
+                except Exception:
+                    pass
         instance.status = "paused"
         self._save_session(instance)
         log.info("Sub-agent '%s' paused.", name)
@@ -287,12 +310,13 @@ class SubAgentManager:
             return False
         if instance.task and not instance.task.done():
             instance.task.cancel()
-            try:
-                instance.task.result(timeout=5)
-            except concurrent.futures.CancelledError:
-                pass
-            except Exception:
-                pass
+            if isinstance(instance.task, concurrent.futures.Future):
+                try:
+                    instance.task.result(timeout=5)
+                except concurrent.futures.CancelledError:
+                    pass
+                except Exception:
+                    pass
         self._save_session(instance)
         if self._focused_name == name:
             self._focused_name = None

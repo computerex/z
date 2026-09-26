@@ -22,35 +22,55 @@ def _make_manager(tmp_path):
     return manager
 
 
-def test_schedule_bg_runs_coroutine_without_main_loop(tmp_path):
+def test_schedule_bg_prefers_running_main_loop(tmp_path):
+    """With a running loop, sub-agent tasks must be scheduled on it.
+
+    asyncio subprocess child watchers only work on the main thread's loop
+    on Unix, so main-loop scheduling is required for shell tools to work.
+    """
     manager = _make_manager(tmp_path)
 
     async def probe():
         return asyncio.get_running_loop()
 
-    # No running main-loop here: schedule purely on the background thread.
+    async def run():
+        task = manager._schedule_bg(probe())
+        assert isinstance(task, asyncio.Task)
+        return await manager._await_task(task)
+
+    loop_used = asyncio.run(run())
+    assert loop_used is not None
+    manager.cleanup()
+
+
+def test_schedule_bg_falls_back_to_dedicated_loop_without_running_loop(tmp_path):
+    """No running loop (sync context) → schedule on the dedicated loop thread."""
+    manager = _make_manager(tmp_path)
+
+    async def probe():
+        return asyncio.get_running_loop()
+
+    fut = manager._schedule_bg(probe())  # no running loop here
     bg_loop = manager._ensure_bg_loop()
-    fut = manager._schedule_bg(probe())
     assert fut.result(timeout=5) is bg_loop
     manager.cleanup()
 
 
-def test_subagent_progresses_while_main_loop_is_not_pumped(tmp_path):
-    """Sub-agent must advance even when the main thread never pumps a loop."""
+def test_subagent_scheduled_and_progresses_on_main_loop(tmp_path):
     manager = _make_manager(tmp_path)
 
-    # Invalid API URL: the agent will fail fast — enough to prove it executed
-    # on the background loop without any main-loop pumping.
-    manager.create("independent-agent", "do something")
-    inst = manager.get("independent-agent")
-    assert inst.task is not None
+    async def run():
+        manager.create("main-loop-agent", "do something")
+        inst = manager.get("main-loop-agent")
+        assert isinstance(inst.task, asyncio.Task)
 
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if inst.status in ("completed", "error"):
-            break
-        time.sleep(0.1)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if inst.status in ("completed", "error"):
+                break
+            await asyncio.sleep(0.1)
+        assert inst.status in ("completed", "error")
+        assert inst.task.done()
 
-    assert inst.status in ("completed", "error")
-    assert inst.task.done()
+    asyncio.run(run())
     manager.cleanup()
