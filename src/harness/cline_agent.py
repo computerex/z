@@ -2551,7 +2551,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             tool_elapsed,
                             len(tc_result or ""),
                         )
-                        if is_interrupted():
+                        if self._interrupt_enabled and is_interrupted():
                             self.console.print(
                                 "\n[yellow][STOP] Interrupted by user[/yellow]"
                             )
@@ -2921,7 +2921,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 )
 
                 # Check for interrupt
-                if is_interrupted():
+                if self._interrupt_enabled and is_interrupted():
                     self.console.print(
                         "\n[yellow][STOP] Interrupted by user[/yellow]"
                     )
