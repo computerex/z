@@ -35,6 +35,9 @@ def _owner_interrupts(self) -> bool:
     background sub-agents (enable_interrupt=False) a stale global flag set at
     the parent prompt must NOT kill the sub-agent's commands, so the check is
     gated by the owner agent's interrupts_enabled().
+
+    FOCUSED sub-agents additionally observe their own per-agent signals
+    (set by the focused-agent UI controls) — handled by _own_signal() below.
     """
     owner = getattr(self, "owner_agent", None)
     if owner is not None:
@@ -43,6 +46,22 @@ def _owner_interrupts(self) -> bool:
         except Exception:
             return True
     return True
+
+
+def _own_signal(self, kind: str) -> bool:
+    """Consume a per-agent keyboard signal (focused sub-agents only).
+
+    kind: "interrupt" or "background". Returns True exactly once per signal
+    (consume-on-read). The parent has no agent_signals — it uses the global
+    InterruptState.
+    """
+    owner = getattr(self, "owner_agent", None)
+    if owner is None:
+        return False
+    try:
+        return bool(owner.consumes_own_signal(kind))
+    except Exception:
+        return False
 
 
 async def execute_command(self, params: Dict[str, str]) -> str:
@@ -104,9 +123,11 @@ async def execute_command(self, params: Dict[str, str]) -> str:
         while proc.returncode is None:
             elapsed = time.time() - start_time
 
-            # Check for interrupt (Esc) — only for agents that observe the
-            # global interrupt state (background sub-agents do not)
-            if _owner_interrupts(self) and is_interrupted():
+            # Check for interrupt (Esc) — global state for agents that observe
+            # it (parent), per-agent signal for focused sub-agents
+            if _own_signal(self, "interrupt") or (
+                _owner_interrupts(self) and is_interrupted()
+            ):
                 self._kill_proc(proc)
                 self.console.print(f"    [yellow]interrupted[/yellow]")
                 raw_output = self._read_log_file(cmd_log_path)
@@ -114,8 +135,11 @@ async def execute_command(self, params: Dict[str, str]) -> str:
                     raw_output, f"interrupted_{command.split()[0] if command else 'cmd'}")
                 return f"Command interrupted after {elapsed:.0f}s.\nOutput captured:\n{output}" if output else "Command interrupted (no output)"
 
-            # Check for background request (Ctrl+B) — parent-only, like Esc
-            if _owner_interrupts(self) and is_background_requested():
+            # Check for background request (Ctrl+B) — global for the parent,
+            # per-agent signal for focused sub-agents
+            if _own_signal(self, "background") or (
+                _owner_interrupts(self) and is_background_requested()
+            ):
                 reset_background()
                 self.console.print(f"    [cyan]→ background[/cyan]")
                 return self._promote_to_background(proc, command, start_time, cmd_log_path, output_lines)

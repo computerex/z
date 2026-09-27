@@ -49,6 +49,30 @@ class InterruptState:
 # Global interrupt state
 _interrupt_state = InterruptState()
 
+# Hard-exit request: set by the second Ctrl+C during a parent turn. The agent
+# loop checks this at iteration boundaries and unwinds so the REPL can save
+# sessions and exit gracefully (instead of the process dying mid-turn, which
+# orphaned in-flight sub-agents and lost the parent's turn state).
+_hard_exit_requested = False
+
+
+def request_hard_exit() -> None:
+    """Request a graceful exit at the next agent-loop iteration boundary."""
+    global _hard_exit_requested
+    _hard_exit_requested = True
+    _log.warning("Hard exit requested — unwinding at next iteration boundary")
+
+
+def is_hard_exit_requested() -> bool:
+    """Whether a graceful exit was requested (checked by the agent loop/REPL)."""
+    return _hard_exit_requested
+
+
+def clear_hard_exit() -> None:
+    """Clear the hard-exit request (e.g. at REPL prompt after a saved exit)."""
+    global _hard_exit_requested
+    _hard_exit_requested = False
+
 
 def get_interrupt_state() -> InterruptState:
     """Get the global interrupt state."""
@@ -117,15 +141,18 @@ class KeyboardMonitor:
         self._sigint_installed = True
 
     def _on_sigint(self, signum, frame):
-        """First Ctrl+C → soft interrupt.  Second Ctrl+C → hard exit."""
+        """First Ctrl+C → soft interrupt. Second Ctrl+C → request graceful
+        unwind (the agent loop saves state at the next iteration boundary)
+        instead of hard-killing the process mid-turn."""
         was_already = _interrupt_state.interrupted
         _interrupt_state.trigger("ctrl-c")
         if was_already:
-            _log.warning("Second Ctrl+C — hard exit")
-            if self._orig_sigint and self._orig_sigint != signal.SIG_DFL:
-                self._orig_sigint(signum, frame)
-            else:
-                raise KeyboardInterrupt()
+            _log.warning("Second Ctrl+C — requesting graceful exit")
+            request_hard_exit()
+            # Wake any loop waiting on the interrupt state; the agent loop
+            # observes hard-exit at its next boundary and unwinds. Do NOT
+            # re-raise here: killing the process mid-turn orphans sub-agents
+            # and loses session state.
 
     # ── Monitor loop (persistent) ──────────────────────────────────────
 

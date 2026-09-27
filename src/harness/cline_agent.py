@@ -38,6 +38,7 @@ from .hooks import (
 from .interrupt import (
     is_interrupted,
     is_background_requested,
+    is_hard_exit_requested,
     reset_interrupt,
     get_interrupt_state,
     start_monitoring,
@@ -354,6 +355,21 @@ class ClineAgent:
         # cancelled by an interrupt intended for the parent prompt.
         self._interrupt_enabled = True
 
+        # Per-agent keyboard signals for FOCUSED sub-agents (set by the
+        # focused-agent UI controls: prompt Ctrl+B binding, staged Ctrl+C).
+        # None for the parent — it uses the global InterruptState. Injected by
+        # SubAgentManager.create(); consumed by the shell tool and the loop's
+        # per-iteration interrupt checks.
+        self.agent_signals = None
+
+        # Per-agent token usage (global tracker pools all agents; /agents
+        # displays per-agent cost from this counter).
+        self.agent_usage: Dict[str, int] = {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
         # Reference to SubAgentManager (only set for parent agent)
         self._sub_agent_manager = sub_agent_manager
 
@@ -430,6 +446,7 @@ class ClineAgent:
         # Scheduled tasks (cron) scheduler — created but not started
         self._cron_scheduler: Optional[CronScheduler] = None
         self._qued_cron_prompts: List[str] = []
+        self._pending_system_messages: List[str] = []
 
         # Plugin system — discover and load plugins
         from .plugin_manager import PluginManager
@@ -829,6 +846,11 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         self._cron_scheduler = scheduler
         log.info("Cron scheduler started")
         return scheduler
+
+    def queue_system_message(self, message: str) -> None:
+        """Add a notice to the next user-initiated turn without waking the REPL."""
+        self._pending_system_messages.append(message)
+        log.info("Queued system message (%d chars)", len(message))
 
     def _on_cron_fire(self, prompt: str) -> None:
         """Callback invoked when a cron task fires."""
@@ -1240,6 +1262,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         # Clear session-only cron tasks
         clear_session_tasks()
         self._qued_cron_prompts.clear()
+        self._pending_system_messages.clear()
         debug_print("clear_history: DONE")
 
     def get_token_count(self) -> int:
@@ -1611,6 +1634,13 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     user_content = adapt_content_for_non_vision_model(user_content)
                     log_input = user_label or "[image blocks omitted]"
 
+        # Restore notices are context for the next request, not requests of
+        # their own. Cron prompts use a separate queue that wakes the REPL.
+        if self._pending_system_messages:
+            for message in self._pending_system_messages:
+                self.messages.append(StreamingMessage(role="user", content=message))
+            self._pending_system_messages.clear()
+
         # Add user message
         self.messages.append(StreamingMessage(role="user", content=user_content))
 
@@ -1652,6 +1682,29 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
         tool implementations (e.g. the shell tool's Esc check) must not react
         to an interrupt that was meant for the parent prompt."""
         return self._interrupt_enabled
+
+    def consumes_own_signal(self, kind: str) -> bool:
+        """Consume a per-agent keyboard signal (focused sub-agents only).
+
+        kind: "interrupt" or "background". Returns True if this agent had a
+        pending signal of that kind (consume-on-read). The parent has no
+        agent_signals — it uses the global InterruptState; this returns False.
+        """
+        signals = self.agent_signals
+        if signals is None:
+            return False
+        if kind == "interrupt":
+            return signals.consume_interrupt()
+        if kind == "background":
+            return signals.consume_background()
+        return False
+
+    def _turn_interrupted(self) -> bool:
+        """Loop-level interrupt check: global state (if this agent observes
+        interrupts) OR a pending per-agent signal."""
+        if self._interrupt_enabled and is_interrupted():
+            return True
+        return self.consumes_own_signal("interrupt")
 
     async def _run_loop(self) -> str:
         """Main agent loop."""
@@ -1771,7 +1824,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
 
                 # Check for interrupt BEFORE starting new iteration
                 # This ensures user can stop between iterations
-                if self._interrupt_enabled and is_interrupted():
+                if is_hard_exit_requested():
+                    log.info("Hard exit requested — unwinding before iteration %d", iteration + 1)
+                    self.status.clear()
+                    self.console.print("\n[yellow][STOP] Exiting — saving session (Ctrl+C twice)[/yellow]")
+                    return "[Interrupted - session preserved. Type to continue or start new request]"
+                if self._turn_interrupted():
                     log.info("Interrupted before iteration %d", iteration + 1)
                     self.status.clear()
                     self.console.print("\n[yellow][STOP] Interrupted by user[/yellow]")
@@ -1781,17 +1839,20 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 if self._sub_agent_manager:
                     _completed_sa = self._sub_agent_manager.check_completed()
                     if _completed_sa:
-                        _notif = (
-                            f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
-                            f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
-                            f"or list_agents() to see a summary. "
-                            f"Use send_agent_input(name='{_completed_sa}', input='...') to start a new turn.]"
-                        )
+                        _notif = self._sub_agent_manager.notification_text(_completed_sa)
                         self.messages.append(
                             StreamingMessage(role="user", content=_notif)
                         )
                         log.info("Injected completion notification for sub-agent '%s'", _completed_sa)
-                        self.console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
+                        _sa_inst = self._sub_agent_manager.get(_completed_sa)
+                        _sa_word = (
+                            "failed"
+                            if _sa_inst and getattr(_sa_inst, "status", "") == "error"
+                            else "completed"
+                        )
+                        self.console.print(
+                            f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] {_sa_word}"
+                        )
 
                 # Check for queued cron task firings
                 if self._qued_cron_prompts:
@@ -1828,7 +1889,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     self._last_token_count = estimate_messages_tokens(self.messages)
 
                 # Check interrupt before expensive operations
-                if self._interrupt_enabled and is_interrupted():
+                if self._turn_interrupted():
                     log.info("Interrupted before token check")
                     self.status.clear()
                     return "[Interrupted]"
@@ -2264,7 +2325,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             # Wait with interrupt checking and countdown display
                             _wait_remaining = wait_time
                             for _wi in range(int(wait_time * 10)):
-                                if self._interrupt_enabled and is_interrupted():
+                                if self._turn_interrupted():
                                     self.status.clear()
                                     self.console.print("\n  [yellow]Interrupted during retry wait[/yellow]")
                                     return "[Interrupted]"
@@ -2449,6 +2510,12 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     input_tokens = estimate_messages_tokens(self.messages)
                     output_tokens = estimate_tokens(full_content)
 
+                # Per-agent usage accumulation (the global tracker pools all
+                # agents; /agents shows per-agent cost from this counter).
+                self.agent_usage["calls"] += 1
+                self.agent_usage["input_tokens"] += input_tokens
+                self.agent_usage["output_tokens"] += output_tokens
+
                 self.cost_tracker.record_call(
                     model=self.config.model,
                     input_tokens=input_tokens,
@@ -2580,7 +2647,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                             tool_elapsed,
                             len(tc_result or ""),
                         )
-                        if self._interrupt_enabled and is_interrupted():
+                        if self._turn_interrupted():
                             self.console.print(
                                 "\n[yellow][STOP] Interrupted by user[/yellow]"
                             )
@@ -2987,9 +3054,18 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 )
 
                 # Check for interrupt
-                if self._interrupt_enabled and is_interrupted():
+                if self._turn_interrupted():
                     self.console.print(
                         "\n[yellow][STOP] Interrupted by user[/yellow]"
+                    )
+                    self.messages.append(
+                        StreamingMessage(
+                            role="assistant",
+                            content=full_content,
+                            provider_blocks=getattr(
+                                response, "provider_content_blocks", None
+                            ),
+                        ),
                     )
                     self.messages.append(
                         StreamingMessage(

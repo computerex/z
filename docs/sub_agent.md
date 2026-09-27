@@ -278,7 +278,7 @@ Tool returns: The sub-agent's full response text.
 4. **`cline_agent.py`** — Add `_dispatch_tool` entries
 5. **`harness.py`** — CLI UX: commands, prompt bar, focus, notifications
 
-## 7. UX Flow — Complete Walkthrough
+## 7. UX Flow — Complete Walkthrough## 7. UX Flow — Complete Walkthrough (v3, matches implementation)
 
 ### Creating and Interacting
 
@@ -289,44 +289,76 @@ model ❯ Investigate the error handling in the API layer
 [Parent agent decides to spawn a sub-agent]
 create_agent(name="error-audit", task="Audit all error handling in src/harness/...")
 
-  ✓ Created sub-agent 'error-audit'. Running in background.
+  ✓ Created sub-agent 'error-audit'
 
+[Prompt bar shows ambient state while agents run:  ⚡1  or  ✓1 (unfetched results)]
 [Parent agent continues working on other things...]
 [Sub-agent error-audit completes...]
-[Harness injects notification into parent conversation]
+  ☎ Sub-agent error-audit completed — Found 3 issues in the error paths: ...   ← one-line preview
 
-  [SYSTEM: Sub-agent 'error-audit' has completed. 
-   Use send_agent_input(name='error-audit') to retrieve its output.]
-
-[Parent agent sees this in next API call]
-send_agent_input(name="error-audit", input="What did you find?")
-
-  [error-audit response streams...]
-  Found 3 issues:
-  1. ...
+[SYSTEM: Sub-agent 'error-audit' has completed its task. Use get_agent_output...]
+get_agent_output(name="error-audit")   → every completed turn's result since last fetch
 ```
 
-### Manual User Interaction
+- Completions **and failures** notify — an errored sub-agent never leaves the
+  parent waiting on a zombie.
+- Overlapping turn results are all retained (per-agent result log,
+  consume-on-fetch).
+
+### Focusing (no copy-paste)
 
 ```
-model ❯ /agents
-  Sub-agents:
-    - error-audit: completed
-
-model ❯ /agent error-audit
-Switched to sub-agent 'error-audit'
-
-model [agent:error-audit] ❯ Show me the full report
-[Sub-agent shows its findings...]
-
-model [agent:error-audit] ❯ /agent-back
-Switched back to parent agent
-
-model ❯ 
+Ctrl+E (or F4)      cycle: parent → agent1 → … → agentN → parent
+/agent <TAB>         completes live agent names
+/agent 2             select by index (the /agents table shows numbers)
+/agent error-audit   select by name
+/agent-back (or /back)  return to the parent
 ```
 
-### Keybinding
+While focused on a running agent, the prompt bar shows live state:
+`[agent:error-audit ⧗42s · 1 queued]` — it can never look frozen again. Typed
+input is delivered instantly: a busy agent **queues** it (`⧗ busy — input
+queued`) instead of blocking the terminal; the queued turn's output streams
+live above the prompt.
+
+### Controlling a focused agent
+
+- **Ctrl+B** — background the focused agent's running command (consumed by
+  its shell tool within ~0.15s). NOTE: inside tmux with the default Ctrl+B
+  prefix, the chord is swallowed by tmux — use `/agents` + `/pause` instead.
+- **Ctrl+C (1st)** — interrupt the focused agent's current turn (per-agent
+  signal; takes effect at the next tool/loop boundary).
+- **Ctrl+C (2nd)** — `⚡ N sub-agent(s) active — sessions are saved and
+  resumable. Ctrl+C again to exit.`
+- **Ctrl+C (3rd)** — exit. With no active agents, the legacy double-tap exit
+  is preserved. During parent turns, the second Ctrl+C unwinds gracefully at
+  an iteration boundary (sessions saved, nothing orphaned).
+
+### Direct control without the model
+
+```
+/agents                 numbered table: status, elapsed, per-agent tokens, last-output age
+/agents --watch         live-refreshing table (Ctrl+C stops the watch locally)
+/agents --purge         remove restored sessions from a previous run
+/pause <name>           pause a running agent (flushes its queue)
+/kill <name> --yes      permanently destroy an agent and its session files
+```
+
+### Persistence across restarts
+
+Sub-agent state survives Ctrl+C, crashes, and restarts: a registry
+(`.sessions/_subagents.json`) tracks every agent; on startup the harness
+restores them (banner: `♻ Restored 2 sub-agent session(s) — /agents`), tells
+the parent model, and continues conversations where they left off. Agents
+that were mid-turn at exit restore as `interrupted` with their history
+repaired (dangling tool calls stitched so providers accept the history).
+Completed agents' results are available instantly without re-running.
+
+### Keybindings
 
 | Key | Action |
 |-----|--------|
-| Ctrl+E | Toggle focus: cycle through available sub-agents (like Alt+Tab for agents) |
+| Ctrl+E / F4 | Cycle sub-agent focus (parent → agents → parent) |
+| Ctrl+B | Background the focused agent's running command |
+| Ctrl+C | Staged: stop focused agent → warn+save → exit |
+| Ctrl+Enter | Insert newline (multiline input) || Ctrl+E | Toggle focus: cycle through available sub-agents (like Alt+Tab for agents) |

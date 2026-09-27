@@ -25,20 +25,45 @@ async def create_agent(self, params: dict) -> str:
         self.console.print(
             f"  [green]\u2713[/green] Created sub-agent [bold]{name}[/bold]"
         )
-        return f"Created sub-agent '{name}'. It is running in the background. You will be notified when it completes."
+        warning = ""
+        try:
+            live = len([
+                1 for i in (self.sub_agent_manager.list())
+                if i["status"] in ("running", "created")
+            ])
+            if live >= 8:
+                warning = (
+                    f" Note: {live} agents are now running; each consumes "
+                    f"context and cost independently — consider whether all are needed."
+                )
+        except Exception:
+            pass  # cost warning is best-effort
+        return (
+            f"Created sub-agent '{name}'. It is running in the background. "
+            f"You will be notified when it completes.{warning}"
+        )
     except ValueError as e:
         return f"Error: {e}"
 
 
 async def send_agent_input(self, params: dict) -> str:
-    """Send input to a sub-agent and get its response.
+    """Send input to a sub-agent (multi-turn conversation).
 
-    If the sub-agent has already completed (no longer running), returns the
-    cached output directly without re-running. To start a new conversation
-    turn with a completed sub-agent, provide meaningful new input.
+    Idle agent → runs a turn and returns its response (synchronous chat).
+    Busy agent → by default enqueues and returns a queued-ack immediately
+    (never freezes the parent on a tool call); the result arrives via the
+    completion notification → get_agent_output cycle. Pass wait=true to block
+    until the queued entry's own turn completes.
+
+    To just read a completed agent's output without starting a new turn, use
+    get_agent_output(name).
     """
     name = params.get("name", "").strip()
     input_text = params.get("input", "").strip()
+    wait = params.get("wait", False)
+    if isinstance(wait, str):
+        wait = wait.lower() in ("true", "1", "yes")
+    wait = bool(wait)
     if not name or input_text is None:
         return "Error: Both 'name' and 'input' are required."
     if not self.sub_agent_manager:
@@ -48,18 +73,10 @@ async def send_agent_input(self, params: dict) -> str:
         if not inst:
             return f"Error: Sub-agent '{name}' not found."
 
-        # If completed, return its final result instead of replaying the full
-        # rendered terminal transcript. The latter can be ANSI-decorated and
-        # large enough to spill/truncate before the parent sees the verdict.
-        if inst.status == "completed" and inst.task and inst.task.done():
-            return inst.final_result or inst.output or (
-                f"Sub-agent '{name}' completed but produced no final result."
-            )
-
         self.console.print(
             f"  [dim]\u2192[/dim] Sending input to [bold]{name}[/bold]..."
         )
-        result = await self.sub_agent_manager.run(name, input_text)
+        result = await self.sub_agent_manager.run(name, input_text, wait=wait)
         return result
     except KeyError:
         return f"Error: Sub-agent '{name}' not found."
@@ -128,44 +145,69 @@ async def get_agent_output(self, params: dict) -> str:
         inst = self.sub_agent_manager.get(name)
         if not inst:
             return f"Error: Sub-agent '{name}' not found."
-        if inst.status != "completed":
+
+        # Consume-on-fetch: drain any results recorded since the last fetch
+        # first, so overlapping turn completions are all retrievable.
+        fetch = getattr(self.sub_agent_manager, "fetch_new_results", None)
+        new_results = fetch(name) if fetch else []
+        if new_results:
+            parts = []
+            for r in new_results:
+                if getattr(r, "status", "completed") == "error":
+                    parts.append(
+                        f"[Turn {r.turn_id} FAILED: {r.error}]\n{r.text}"
+                    )
+                elif len(new_results) > 1:
+                    parts.append(f"[Turn {r.turn_id} result]:\n{r.text}")
+                else:
+                    parts.append(r.text)
+            return "\n\n".join(parts)
+
+        # Terminal states (completed or error): return the cached verdict.
+        if inst.status in ("completed", "error"):
+            if inst.status == "error" and inst.last_error:
+                err_line = f"Sub-agent '{name}' failed: {inst.last_error}"
+                if inst.final_result:
+                    return f"{err_line}\n{inst.final_result}"
+                return err_line
+            # Return the completed task's final result, not the diagnostic
+            # terminal transcript. This preserves the agent's verdict even
+            # when the verbose stream output is huge or contains terminal
+            # control sequences.
+            if inst.final_result:
+                return inst.final_result
+            output_text = inst.output or ""
+            if not output_text and inst.tee:
+                output_text = inst.tee.getvalue() or ""
+            if not output_text:
+                return f"Sub-agent '{name}' completed but produced no output."
+            return output_text
+
+        if inst.task and inst.task.done():
             # Race condition: the background task may have finished writing
-            # to the TeeWriter but instance.status hasn't been set to
-            # "completed" yet. Check if the task actually finished.
-            if inst.task and inst.task.done():
-                output_text = inst.tee.getvalue() if inst.tee else ""
-                if output_text:
-                    # Task is done, output exists — return it
-                    return output_text
-            # Still running: return a readable tail of the partial output so
-            # the caller can check live progress (stripped of terminal
-            # styling — the tee capture contains ANSI codes).
-            partial = ""
-            if inst.tee:
-                try:
-                    from ..sub_agent_manager import strip_ansi
-                    partial = strip_ansi(inst.tee.getvalue() or "")
-                except Exception:
-                    partial = ""
-            if partial:
-                partial = partial[-1500:].strip()
-                return (
-                    f"Sub-agent '{name}' is still {inst.status}. "
-                    f"Recent output (tail):\n{partial}\n"
-                    f"[Check again later for the final result.]"
-                )
-            return f"Sub-agent '{name}' is still {inst.status} (no output yet). Use list_agents(name='{name}') to check its progress."
-        # Return the completed task's final result, not the diagnostic terminal
-        # transcript. This preserves the agent's verdict even when the verbose
-        # stream output is huge or contains terminal control sequences.
-        if inst.final_result:
-            return inst.final_result
-        output_text = inst.output or ""
-        if not output_text and inst.tee:
-            output_text = inst.tee.getvalue() or ""
-        if not output_text:
-            return f"Sub-agent '{name}' completed but produced no output."
-        return output_text
+            # to the TeeWriter but instance.status hasn't been updated yet.
+            output_text = inst.tee.getvalue() if inst.tee else ""
+            if output_text:
+                # Task is done, output exists — return it
+                return output_text
+        # Still running: return a readable tail of the partial output so
+        # the caller can check live progress (stripped of terminal
+        # styling — the tee capture contains ANSI codes).
+        partial = ""
+        if inst.tee:
+            try:
+                from ..sub_agent_manager import strip_ansi
+                partial = strip_ansi(inst.tee.getvalue() or "")
+            except Exception:
+                partial = ""
+        if partial:
+            partial = partial[-1500:].strip()
+            return (
+                f"Sub-agent '{name}' is still {inst.status}. "
+                f"Recent output (tail):\n{partial}\n"
+                f"[Check again later for the final result.]"
+            )
+        return f"Sub-agent '{name}' is still {inst.status} (no output yet). Use list_agents(name='{name}') to check its progress."
     except Exception as e:
         return f"Error retrieving output from '{name}': {e}"
 

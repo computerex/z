@@ -194,26 +194,33 @@ TOOL_DEFS: List[ToolDef] = [
             description="Create an independent sub-agent to work on a task concurrently. "
                         "The sub-agent runs in the background and has its own conversation history, "
                         "context, and session - completely isolated from you. "
-                        "You'll be notified when it completes. "
+                        "You'll be notified when it completes (or if it fails). "
                         "To retrieve results: use get_agent_output(name) after completion. "
-                        "To check progress: use list_agents(name) while it runs.",
+                        "To check progress: use list_agents(name) while it runs. "
+                        "Avoid purely-numeric names (the /agent index lookup uses numbers).",
             params=[ToolParam("name", required=True,
                               description="A unique name for the sub-agent (used to reference it later)"),
                     ToolParam("task", required=True,
                               description="The full task description to assign to the sub-agent")]),
     ToolDef("send_agent_input", category="agent",
-            description="Send input/text to a sub-agent and get its response. "
-                        "If the sub-agent is still running a previous task, this waits for it to complete "
-                        "first, then delivers the new input. Enables multi-turn conversation with sub-agents. "
-                        "To simply read a completed agent's output without starting a new turn, use get_agent_output(name).",
+            description="Send input/text to a sub-agent and get its response (multi-turn conversation). "
+                        "If the agent is idle, runs a turn and returns its reply. If the agent is busy, "
+                        "the input is QUEUED and an immediate ack is returned (the result arrives via the "
+                        "completion notification — then use get_agent_output(name)). "
+                        "Pass wait=true to block until the queued entry's own turn completes. "
+                        "To just read a completed agent's output without a new turn, use get_agent_output(name).",
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent to send input to"),
                     ToolParam("input", required=True,
-                              description="The input/text to send to the sub-agent")]),
+                              description="The input/text to send to the sub-agent"),
+                    ToolParam("wait",
+                              description="true = block until the queued entry's turn completes and return its "
+                                          "result (default false: queue with ack when busy)")]),
     ToolDef("list_agents", category="agent",
             description="Check the status of sub-agents. Returns each agent's current state "
-                        "(running/completed/error), how long it's been running, and a snippet of "
-                        "its latest output. This is the RIGHT tool to check on an agent's progress. "
+                        "(running/completed/error/interrupted), how long it's been running, "
+                        "per-agent token usage, and a snippet of its latest output. "
+                        "This is the RIGHT tool to check on an agent's progress. "
                         "Pass name='...' to check a specific agent.",
             params=[ToolParam("name", required=False,
                               description="Agent name to check. Omit to list all agents.")]),
@@ -229,10 +236,12 @@ TOOL_DEFS: List[ToolDef] = [
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent to permanently destroy")]),
     ToolDef("get_agent_output", category="agent",
-            description="Retrieve the full output from a sub-agent that has completed. "
-                        "Returns the complete stdout log with all tool results. "
-                        "This is the RIGHT tool to get results from a finished agent. "
-                        "If the agent is still running, check list_agents(name) first to see its progress.",
+            description="Retrieve new output from a sub-agent. Returns every completed turn's "
+                        "result since your last fetch (consume-on-fetch: a second call returns "
+                        "the last result again only if nothing new arrived). For errored agents "
+                        "returns the error details. If the agent is still running, returns a tail "
+                        "of its recent output to check progress. "
+                        "This is the RIGHT tool to get results from a finished agent.",
             params=[ToolParam("name", required=True,
                               description="The name of the sub-agent whose output to retrieve")]),
     ToolDef("attempt_completion", category="agent",

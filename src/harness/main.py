@@ -111,6 +111,7 @@ from .config import Config, _merge_non_empty, get_global_config_path, load_json_
 
 _mark("import_config")
 from .cline_agent import ClineAgent
+from .interrupt import is_hard_exit_requested, clear_hard_exit
 
 _mark("import_cline_agent")
 from .sub_agent_manager import SubAgentManager
@@ -348,6 +349,9 @@ class HarnessCompleter(Completer):
         "/agents",
         "/agent",
         "/agent-back",
+        "/back",
+        "/pause",
+        "/kill",
         "/clear",
         "/save",
         "/history",
@@ -376,11 +380,27 @@ class HarnessCompleter(Completer):
         "/q",
     ]
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, agent_names_fn=None):
         self.workspace = workspace
+        # Live sub-agent name provider (wired to SubAgentManager by the REPL);
+        # completes "/agent <partial>" with live agent names.
+        self.agent_names_fn = agent_names_fn
 
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
+
+        # Agent-name completion for /agent
+        if text.startswith("/agent ") and self.agent_names_fn:
+            name_part = text[len("/agent "):].strip()
+            try:
+                names = list(self.agent_names_fn() or [])
+            except Exception:
+                names = []
+            # Focused agent first
+            for n in names:
+                if not name_part or n.lower().startswith(name_part.lower()):
+                    yield Completion(n, start_position=-len(name_part))
+            return
 
         # Shell command completion with ! prefix
         if text.startswith("!"):
@@ -564,10 +584,13 @@ class HarnessCompleter(Completer):
 def create_prompt_session(
     history_file: Path,
     workspace: Path,
+    agent_names_fn: Optional[Callable[[], List[str]]] = None,
     on_paste_image_marker: Optional[Callable[[], Optional[str]]] = None,
     on_open_provider_picker: Optional[Callable[[], None]] = None,
     on_open_model_picker: Optional[Callable[[], None]] = None,
     on_toggle_reasoning: Optional[Callable[[], str]] = None,
+    on_background_focused_agent: Optional[Callable[[], None]] = None,
+    on_cycle_agent: Optional[Callable[[], None]] = None,
 ) -> "PromptSession":
     """Create a prompt session with multiline support.
 
@@ -577,6 +600,8 @@ def create_prompt_session(
     - Paste: Multiline paste works automatically
     - Tab: Accept ghost text suggestion, or complete commands and file paths
     - Ctrl+T: Toggle reasoning effort
+    - Ctrl+B: Background the focused sub-agent's running command (inert otherwise)
+    - Ctrl+E / F4: Cycle sub-agent focus (parent → agents → parent)
     """
     if not HAS_PROMPT_TOOLKIT:
         return None
@@ -637,6 +662,35 @@ def create_prompt_session(
                 pt_run_in_terminal(_show)
             event.app.invalidate()
 
+    @bindings.add("c-b", eager=True)
+    def _(event):
+        """Ctrl+B: background the focused sub-agent's running command.
+
+        Inert unless a focused sub-agent has a live task (overriding
+        prompt_toolkit's emacs backward-char default). The binding sets the
+        agent's per-agent background signal; its shell tool promotes the
+        command within its ~0.15s poll. NOTE: inside tmux with the default
+        Ctrl+B prefix, the chord is swallowed by tmux before reaching the app
+        — use /agents + /pause there instead.
+        """
+        if on_background_focused_agent:
+            on_background_focused_agent()
+            event.app.invalidate()
+
+    def _cycle_agent_handler(event):
+        """Ctrl+E / F4: cycle sub-agent focus.
+
+        Overrides prompt_toolkit's emacs end-of-line default (c-e) — the
+        arrow keys and Home still cover line editing at a one-line REPL.
+        F4 is the alias for terminals that eat chords.
+        """
+        if on_cycle_agent:
+            on_cycle_agent()
+            event.app.invalidate()
+
+    bindings.add("c-e", eager=True)(_cycle_agent_handler)
+    bindings.add("f4", eager=True)(_cycle_agent_handler)
+
     @bindings.add("tab", eager=True)
     def _(event):
         """Tab: accept ghost text suggestion, or cycle/open completions."""
@@ -658,7 +712,10 @@ def create_prompt_session(
     history = SafeFileHistory(str(history_file))
 
     # Create completer for commands and file paths
-    completer = HarnessCompleter(workspace)
+    completer = HarnessCompleter(
+        workspace,
+        agent_names_fn=agent_names_fn,
+    )
 
     return PromptSession(
         history=history,
@@ -1228,7 +1285,13 @@ if __name__ == '__main__':
         workspace=workspace,
         get_session_path_fn=get_session_path,
     )
-
+    # Restore sub-agents from the previous run (metadata only; lazy hydration)
+    _restored_subagents = sub_agent_manager.restore()
+    if _restored_subagents:
+        console.print(
+            f"  [dim]\u267b Restored [bold]{_restored_subagents}[/bold] sub-agent "
+            f"session(s) from the previous run — [white]/agents[/white] to view[/dim]"
+        )
     # Create single agent with providers for mode switching
     agent = ClineAgent(
         config,
@@ -1237,6 +1300,21 @@ if __name__ == '__main__':
     )
     _mark("agent_created")
     log.info("Agent created")
+
+    # Tell the parent model about restored sub-agents (queued as a user
+    # message for the next turn, via the same mechanism as cron prompts).
+    if _restored_subagents:
+        _statuses = ", ".join(
+            f"{a['name']} ({a['status']})"
+            for a in sub_agent_manager.list()[:10]
+        )
+        agent.queue_system_message(
+            f"[SYSTEM: {_restored_subagents} sub-agent session(s) restored from "
+            f"the previous harness run — statuses: {_statuses}. Use "
+            f"list_agents() to inspect them, get_agent_output(name) for "
+            f"completed results, or send_agent_input(name, input) to continue "
+            f"an interrupted agent's work.]"
+        )
 
     # ── Schema-driven output validation ─────────────────────────────────
     # --json mode: structured JSON on stdout, NDJSON progress on stderr.
@@ -1449,15 +1527,57 @@ if __name__ == '__main__':
             agent.config.reasoning_effort = new_level
             return new_level
 
+        def _background_focused_agent() -> None:
+            """Ctrl+B at the prompt: request backgrounding of the focused
+            sub-agent's running command (per-agent signal; consumed by its
+            shell tool within ~0.15s)."""
+            if not (focused_agent and sub_agent_manager):
+                return
+            inst = sub_agent_manager.get(focused_agent)
+            task = getattr(inst, "task", None) if inst else None
+            if task is None or task.done():
+                return  # binding inert: nothing running
+            sub_agent_manager.signal(focused_agent, "background")
+            if pt_run_in_terminal:
+                def _show():
+                    print(f"  → background requested for '{focused_agent}'")
+                pt_run_in_terminal(_show)
+
+        def _cycle_agent_focus() -> None:
+            """Ctrl+E / F4: cycle parent → agent1 → … → parent."""
+            nonlocal focused_agent
+            if not sub_agent_manager:
+                return
+            target = sub_agent_manager.next_focus(focused_agent)
+            if target is None and focused_agent is None:
+                return  # empty registry — no-op
+            if target is None:
+                focused_agent = None
+                sub_agent_manager.set_focused(None)
+                if pt_run_in_terminal:
+                    pt_run_in_terminal(
+                        lambda: print("  ▶ switched back to parent agent")
+                    )
+                return
+            focused_agent = target
+            sub_agent_manager.set_focused(target)
+            if pt_run_in_terminal:
+                pt_run_in_terminal(
+                    lambda: print(f"  ▶ switched to sub-agent '{target}'")
+                )
+
         history_file = get_sessions_dir(workspace) / ".history"
         prompt_session = (
             create_prompt_session(
                 history_file,
                 Path(workspace),
+                agent_names_fn=lambda: list(sub_agent_manager._agents.keys()),
                 on_paste_image_marker=_prompt_paste_image_marker,
                 on_open_provider_picker=_open_provider_picker_ui,
                 on_open_model_picker=_open_model_picker_ui,
                 on_toggle_reasoning=_toggle_reasoning_effort,
+                on_background_focused_agent=_background_focused_agent,
+                on_cycle_agent=_cycle_agent_focus,
             )
             if HAS_PROMPT_TOOLKIT
             else None
@@ -1492,6 +1612,12 @@ if __name__ == '__main__':
 
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         focused_agent: Optional[str] = None  # Name of sub-agent currently focused
+        # Staged Ctrl+C counter (sub-agent mode): 0 = fresh, 1 = interrupted a
+        # focused agent, 2 = warned about active sub-agents. Reset whenever
+        # real input is delivered (visible action), so a user who interrupt-
+        # stops an agent and later wants to exit isn't surprised by a
+        # carry-over stage.
+        _ctrl_c_stage: List[int] = [0]
         # User text preserved when a sub-agent completion aborts the prompt —
         # restored as the next prompt's default so typing is never lost.
         _preserved_typed: List[str] = [""]
@@ -1568,11 +1694,109 @@ if __name__ == '__main__':
             if effort != "none":
                 info_parts.append(f"\x1b[38;5;{effort_color}m{effort}\x1b[0m")
             info_str = f" \x1b[38;5;243m·\x1b[0m ".join(info_parts)
-            # Add sub-agent focus indicator
+            # Sub-agent focus tag (stateful) + ambient activity badges.
+            # Tag: [agent:x ⧗42s] while its turn runs, [agent:x ✓] when done,
+            # with a queued count when input is pending.
             agent_tag = ""
-            if focused_agent:
-                agent_tag = f" \x1b[38;5;220m[agent:{focused_agent}]\x1b[0m"
-            return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str}{agent_tag} \x1b[38;5;243m\u276f\x1b[0m ")
+            if focused_agent and sub_agent_manager:
+                inst = sub_agent_manager.get(focused_agent)
+                if inst is not None:
+                    task = getattr(inst, "task", None)
+                    busy = (task is not None and not task.done()) or bool(
+                        getattr(inst, "pending", None)
+                    )
+                    if busy:
+                        started = getattr(inst, "turn_started_at", None) or time.time()
+                        elapsed = max(0, int(time.time() - started))
+                        queued = len(getattr(inst, "pending", None) or [])
+                        q_part = f" · {queued} queued" if queued else ""
+                        agent_tag = (
+                            f" \x1b[38;5;220m[agent:{focused_agent} \u2957{elapsed}s{q_part}]\x1b[0m"
+                        )
+                    else:
+                        agent_tag = f" \x1b[38;5;220m[agent:{focused_agent} \u2713]\x1b[0m"
+            # Ambient badges: running count + completed-with-unfetched-results
+            # count. Cheap stats() — never reads tee buffers at render time.
+            badges = ""
+            if sub_agent_manager and not focused_agent:
+                st = sub_agent_manager.stats()
+                if st["running"]:
+                    badges += f" \x1b[38;5;39m\u26a1{st['running']}\x1b[0m"
+                if st["unread"]:
+                    badges += f" \x1b[38;5;34m\u2713{st['unread']}\x1b[0m"
+            return ANSI(f"\x1b[38;5;240m{ws_display}\x1b[0m \x1b[1m{model_short}\x1b[0m {info_str}{badges}{agent_tag} \x1b[38;5;243m\u276f\x1b[0m ")
+
+        def _notify_subagent_completion(name: str) -> str:
+            """Build the canonical [SYSTEM: ...] notification for a sub-agent
+            completion/error and echo the ☎ line with a one-line preview —
+            often enough for the user to skip switching focus entirely."""
+            text = sub_agent_manager.notification_text(name)
+            _inst = sub_agent_manager.get(name)
+            _word = (
+                "failed"
+                if _inst and getattr(_inst, "status", "") == "error"
+                else "completed"
+            )
+            preview = ""
+            if _inst is not None:
+                _src = getattr(_inst, "final_result", "") or getattr(_inst, "last_error", "") or ""
+                if _src:
+                    try:
+                        from .sub_agent_manager import strip_ansi as _strip
+
+                        _line = _strip(_src).strip().splitlines()
+                        _first = next((l for l in _line if l.strip()), "")
+                        if _first:
+                            preview = _first[:100] + ("…" if len(_first) > 100 else "")
+                    except Exception:
+                        pass
+            console.print(
+                f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{name}[/bold] {_word}"
+                + (f" [dim]— {rich_escape(preview)}[/dim]" if preview else "")
+            )
+            return text
+
+        def _handle_prompt_interrupt(now: float) -> bool:
+            """Handle Ctrl+C at the prompt. Returns True when the REPL should
+            continue; False → propagate (exit).
+
+            Staged machine (only engages when sub-agents are ACTIVE — a
+            finished-only registry keeps the legacy double-tap exit):
+              1. focused agent has a live task → interrupt it (per-agent
+                 signal; takes effect at the next tool boundary)
+              2. warn that N agents are active (sessions saved + resumable)
+              3. exit
+            """
+            nonlocal last_interrupt_time
+            if sub_agent_manager and sub_agent_manager.active_count() > 0:
+                stage = _ctrl_c_stage[0]
+                if stage == 0 and focused_agent:
+                    inst = sub_agent_manager.get(focused_agent)
+                    task = getattr(inst, "task", None) if inst else None
+                    if task is not None and not task.done():
+                        sub_agent_manager.signal(focused_agent, "interrupt")
+                        console.print(
+                            f"\n  [yellow][STOP][/yellow] Interrupted sub-agent "
+                            f"[bold]{focused_agent}[/bold] "
+                            f"[dim](takes effect at the next tool boundary)[/dim]"
+                        )
+                        _ctrl_c_stage[0] = 1
+                        return True
+                if stage <= 1:
+                    n = sub_agent_manager.active_count()
+                    console.print(
+                        f"\n  [yellow]\u26a1 {n} sub-agent(s) active — sessions are "
+                        f"saved and resumable. Ctrl+C again to exit.[/yellow]"
+                    )
+                    _ctrl_c_stage[0] = 2
+                    return True
+                return False  # deliberate third press → exit
+            # Legacy double-tap (no active sub-agents)
+            if now - last_interrupt_time < 2.0:
+                return False
+            last_interrupt_time = now
+            console.print("\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]")
+            return True
 
         while True:
             try:
@@ -1604,13 +1828,8 @@ if __name__ == '__main__':
                 elif sub_agent_manager and (
                     _completed_sa := sub_agent_manager.check_completed()
                 ):
-                    user_input = (
-                        f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
-                        f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
-                        f"or list_agents(name='{_completed_sa}') to see a summary.]"
-                    )
+                    user_input = _notify_subagent_completion(_completed_sa)
                     _system_input = True
-                    console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
                     if _last_remote_chat is not None:
                         from .remote.base import RemoteMessage as _RM
                         current_remote_msg = _RM(
@@ -1653,6 +1872,20 @@ if __name__ == '__main__':
                                         return True
                                     await asyncio.sleep(interval)
 
+                            async def _prompt_ticker(interval: float = 1.0):
+                                """Invalidate the prompt app periodically so
+                                live sub-agent state (⧗ elapsed, badges)
+                                re-renders while the user sits at the prompt.
+                                Never completes — cancelled by the race."""
+                                while True:
+                                    await asyncio.sleep(interval)
+                                    _app = _pt_app_holder.get("app")
+                                    if _app is not None:
+                                        try:
+                                            _app.invalidate()
+                                        except Exception:
+                                            pass
+
                             async def _prompt_race():
                                 _pt_app_holder.pop("app", None)
                                 prompt_task = asyncio.ensure_future(
@@ -1664,14 +1897,43 @@ if __name__ == '__main__':
                                 )
                                 _preserved_typed[0] = ""
                                 if not sub_agent_manager:
-                                    return await prompt_task
+                                    try:
+                                        return await prompt_task
+                                    except KeyboardInterrupt:
+                                        prompt_task.exception()  # retrieve from task
+                                        raise
                                 watch_task = asyncio.ensure_future(
                                     _completion_watch()
                                 )
-                                done, _pending = await asyncio.wait(
-                                    {prompt_task, watch_task},
-                                    return_when=asyncio.FIRST_COMPLETED,
+                                # Ticker only when there is live state to show
+                                _has_live_state = bool(sub_agent_manager._agents)
+                                ticker_task = (
+                                    asyncio.ensure_future(_prompt_ticker())
+                                    if _has_live_state
+                                    else None
                                 )
+                                _race_set = {prompt_task, watch_task}
+                                if ticker_task is not None:
+                                    _race_set.add(ticker_task)
+                                try:
+                                    done, _pending = await asyncio.wait(
+                                        _race_set,
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+                                except KeyboardInterrupt:
+                                    # Retrieve exceptions from all tasks so they
+                                    # aren't reported as "unretrieved" when the
+                                    # event loop shuts down.
+                                    for _t in (prompt_task, watch_task, ticker_task):
+                                        if _t is not None and _t.done() and not _t.cancelled():
+                                            try:
+                                                _t.exception()
+                                            except Exception:
+                                                pass
+                                    raise
+                                for _t in (watch_task, ticker_task):
+                                    if _t is not None and not _t.done():
+                                        _t.cancel()
                                 if watch_task in done:
                                     # A sub-agent completed while the prompt
                                     # was up. Exit the prompt app gracefully,
@@ -1696,8 +1958,11 @@ if __name__ == '__main__':
                                             " notification; returning empty input"
                                         )
                                         return ""
-                                watch_task.cancel()
-                                return await prompt_task
+                                try:
+                                    return await prompt_task
+                                except KeyboardInterrupt:
+                                    prompt_task.exception()  # retrieve from task
+                                    raise
 
                             with _patch_stdout(raw=True):
                                 user_input = loop.run_until_complete(
@@ -1713,13 +1978,8 @@ if __name__ == '__main__':
                                 if user_input:
                                     sub_agent_manager.requeue_notification(_cs)
                                 else:
-                                    user_input = (
-                                        f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
-                                        f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
-                                        f"or list_agents(name='{_cs}') to see a summary.]"
-                                    )
+                                    user_input = _notify_subagent_completion(_cs)
                                     _system_input = True
-                                    console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
                                 if _last_remote_chat is not None:
                                     from .remote.base import RemoteMessage as _RM
                                     current_remote_msg = _RM(
@@ -1729,14 +1989,9 @@ if __name__ == '__main__':
                                         sender_id=_last_remote_chat[1],
                                     )
                         except KeyboardInterrupt:
-                            now = time.time()
-                            if now - last_interrupt_time < 2.0:
-                                raise
-                            last_interrupt_time = now
-                            console.print(
-                                "\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]"
-                            )
-                            continue
+                            if _handle_prompt_interrupt(time.time()):
+                                continue
+                            raise
                     else:
                         try:
                             _pt = _build_prompt_text()
@@ -1751,13 +2006,8 @@ if __name__ == '__main__':
                                 if user_input:
                                     sub_agent_manager.requeue_notification(_cs)
                                 else:
-                                    user_input = (
-                                        f"[SYSTEM: Sub-agent '{_cs}' has completed its task. "
-                                        f"Use get_agent_output(name='{_cs}') to retrieve its full output, "
-                                        f"or list_agents(name='{_cs}') to see a summary.]"
-                                    )
+                                    user_input = _notify_subagent_completion(_cs)
                                     _system_input = True
-                                    console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_cs}[/bold] completed")
                                 if _last_remote_chat is not None:
                                     from .remote.base import RemoteMessage as _RM
                                     current_remote_msg = _RM(
@@ -1767,14 +2017,9 @@ if __name__ == '__main__':
                                         sender_id=_last_remote_chat[1],
                                     )
                         except KeyboardInterrupt:
-                            now = time.time()
-                            if now - last_interrupt_time < 2.0:
-                                raise
-                            last_interrupt_time = now
-                            console.print(
-                                "\n  [dim]Press [white]Ctrl+C[/white] again to exit[/dim]"
-                            )
-                            continue
+                            if _handle_prompt_interrupt(time.time()):
+                                continue
+                            raise
 
                 if not user_input:
                     # Check for remote messages
@@ -1798,13 +2043,8 @@ if __name__ == '__main__':
                     elif sub_agent_manager and (
                         _completed_sa := sub_agent_manager.check_completed()
                     ):
-                        user_input = (
-                            f"[SYSTEM: Sub-agent '{_completed_sa}' has completed its task. "
-                            f"Use get_agent_output(name='{_completed_sa}') to retrieve its full output, "
-                            f"or list_agents(name='{_completed_sa}') to see a summary.]"
-                        )
+                        user_input = _notify_subagent_completion(_completed_sa)
                         _system_input = True
-                        console.print(f"\n  [cyan]\u260e[/cyan] Sub-agent [bold]{_completed_sa}[/bold] completed")
                         # Route to the last active remote chat if any
                         if _last_remote_chat is not None:
                             from .remote.base import RemoteMessage as _RM
@@ -1816,6 +2056,10 @@ if __name__ == '__main__':
                             )
                     else:
                         continue
+
+                # Real input delivered → reset the staged Ctrl+C counter
+                # (visible action: any later Ctrl+C sequence starts fresh).
+                _ctrl_c_stage[0] = 0
 
                 # Handle shell commands with ! prefix
                 if user_input.startswith("!"):
@@ -1942,7 +2186,61 @@ if __name__ == '__main__':
                         continue
 
                     elif cmd == "/agents":
+                        if "--watch" in cmd_arg:
+                            # Live-refreshing table until Ctrl+C (caught
+                            # locally — never reaches the staged Ctrl+C
+                            # machine or the REPL exit).
+                            console.print("  [dim]Watching sub-agents (Ctrl+C to stop)...[/dim]")
+                            try:
+                                while True:
+                                    console.print()
+                                    tbl = Table(
+                                        show_header=False,
+                                        box=None,
+                                        padding=(0, 2),
+                                        pad_edge=False,
+                                    )
+                                    tbl.add_column(width=3)
+                                    tbl.add_column(width=2)
+                                    tbl.add_column("name", style="bold")
+                                    tbl.add_column("status", style="dim")
+                                    tbl.add_column("elapsed", justify="right", style="dim")
+                                    for i, a in enumerate(sub_agent_manager.list(), 1):
+                                        stat = a["status"]
+                                        marker = " "
+                                        if a["name"] == focused_agent:
+                                            marker = "[yellow]\u25b6[/yellow]"
+                                        elif stat == "completed":
+                                            marker = "[green]\u2713[/green]"
+                                        elif stat == "running":
+                                            marker = "[cyan]\u25b6[/cyan]"
+                                        elif stat == "error":
+                                            marker = "[red]\u2717[/red]"
+                                        elapsed = a["elapsed_seconds"]
+                                        elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+                                        tbl.add_row(f"[dim]{i}[/dim]", marker, a["name"], stat, elapsed_str)
+                                    console.print(Panel(tbl, title="[bold]Sub-Agents (live)[/bold]", border_style="yellow", padding=(1, 2)))
+                                    _time_mod.sleep(2.0)
+                            except KeyboardInterrupt:
+                                pass
+                            console.print("  [dim]Stopped watching.[/dim]")
+                            continue
+                        if "--purge" in cmd_arg:
+                            n = sub_agent_manager.purge_restored()
+                            if n:
+                                console.print(f"  [green]\u2713[/green] Purged {n} restored sub-agent session(s)")
+                                _echo_remote(f"Purged {n} restored sub-agent session(s)")
+                            else:
+                                console.print("  [dim]No restored sub-agent sessions to purge.[/dim]")
+                                _echo_remote("No restored sub-agent sessions to purge")
+                            continue
                         agents_list = sub_agent_manager.list()
+                        # Display order: focused → running → completed/interrupted → error
+                        agents_list.sort(key=lambda a: (
+                            0 if a["name"] == focused_agent else
+                            1 if a["status"] in ("running", "created") else
+                            2 if a["status"] in ("completed", "interrupted", "paused") else 3
+                        ))
                         if not agents_list:
                             console.print("  [dim]No sub-agents running.[/dim]")
                             _echo_remote("No sub-agents running")
@@ -1953,13 +2251,14 @@ if __name__ == '__main__':
                                 padding=(0, 2),
                                 pad_edge=False,
                             )
-                            tbl.add_column(width=2)
+                            tbl.add_column(width=3)   # "#"
+                            tbl.add_column(width=2)   # marker
                             tbl.add_column("name", style="bold")
                             tbl.add_column("status", style="dim")
                             tbl.add_column("elapsed", justify="right", style="dim")
-                            for a in agents_list:
+                            for i, a in enumerate(agents_list, 1):
                                 stat = a["status"]
-                                
+
                                 marker = " "
                                 if a["name"] == focused_agent:
                                     marker = "[yellow]\u25b6[/yellow]"
@@ -1969,15 +2268,31 @@ if __name__ == '__main__':
                                     marker = "[cyan]\u25b6[/cyan]"
                                 elif stat == "error":
                                     marker = "[red]\u2717[/red]"
-                                
+                                elif stat == "interrupted":
+                                    marker = "[yellow]\u26a0[/yellow]"
+
                                 elapsed = a["elapsed_seconds"]
                                 elapsed_str = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+                                new_badge = f" [green]+{a.get('new_results', 0)}[/green]" if a.get("new_results") else ""
+                                # Per-agent token cost (from per-response accumulation)
+                                _tok = a.get("tokens") or {}
+                                _tok_str = ""
+                                if _tok.get("calls"):
+                                    _in = _tok.get("input_tokens", 0)
+                                    _out = _tok.get("output_tokens", 0)
+                                    _tok_str = f" [dim]· {_in + _out:,} tok[/dim]"
+                                # Last-output age (working vs hung at a glance)
+                                _age = a.get("last_output_age")
+                                _age_str = f" [dim]· last out {_age}s ago[/dim]" if _age is not None else ""
                                 tbl.add_row(
+                                    f"[dim]{i}[/dim]",
                                     marker,
-                                    a["name"],
+                                    a["name"] + new_badge,
                                     stat,
                                     elapsed_str,
                                 )
+                                if _tok_str or _age_str:
+                                    tbl.add_row("", "", f"[dim]{_tok_str}{_age_str}[/dim]", "", "")
                             console.print()
                             console.print(
                                 Panel(
@@ -1987,17 +2302,41 @@ if __name__ == '__main__':
                                     padding=(1, 2),
                                 )
                             )
-                            console.print("  [dim]Use [white]/agent <name>[/white] to switch, [white]/agent-back[/white] to return[/dim]\n")
+                            console.print("  [dim]Use [white]/agent <#|name>[/white] to switch, [white]/agent-back[/white] to return, [white]Ctrl+E[/white] to cycle[/dim]\n")
                             # Build text summary for remote
-                            _agent_lines = [f"  {'●' if a['name'] == focused_agent else ' '} {a['name']} — {a['status']} ({a['elapsed_seconds']}s)" for a in agents_list]
+                            _agent_lines = [
+                                f"  {i}. {'●' if a['name'] == focused_agent else ' '} {a['name']} — {a['status']} ({a['elapsed_seconds']}s)"
+                                for i, a in enumerate(agents_list, 1)
+                            ]
                             _echo_remote("Sub-Agents:\n" + "\n".join(_agent_lines))
                         continue
 
                     elif cmd == "/agent":
                         if not cmd_arg:
-                            console.print("  [dim]Usage: /agent <sub_agent_name>[/dim]")
+                            # No-arg: print the numbered list (one step from choosing)
+                            agents_list = sub_agent_manager.list()
+                            if not agents_list:
+                                console.print("  [dim]No sub-agents running.[/dim]")
+                                continue
+                            for i, a in enumerate(agents_list, 1):
+                                console.print(f"  [bold]{i}[/bold]. {a['name']} [dim]{a['status']}[/dim]")
+                            console.print("  [dim]Usage: /agent <#|name>[/dim]")
                             continue
                         name = cmd_arg.strip()
+                        # Index selection: "/agent 2"
+                        if name.isdigit():
+                            agents_list = sub_agent_manager.list()
+                            agents_list.sort(key=lambda a: (
+                                0 if a["name"] == focused_agent else
+                                1 if a["status"] in ("running", "created") else
+                                2 if a["status"] in ("completed", "interrupted", "paused") else 3
+                            ))
+                            idx = int(name) - 1
+                            if 0 <= idx < len(agents_list):
+                                name = agents_list[idx]["name"]
+                            else:
+                                console.print(f"  [yellow]\u26a0[/yellow] No sub-agent at index {name} (1-{len(agents_list)})")
+                                continue
                         inst = sub_agent_manager.get(name)
                         if not inst:
                             console.print(f"  [yellow]\u26a0[/yellow] Sub-agent '[bold]{name}[/bold]' not found")
@@ -2006,11 +2345,11 @@ if __name__ == '__main__':
                         focused_agent = name
                         sub_agent_manager.set_focused(name)
                         console.print(f"  [yellow]\u25b6[/yellow] Switched to sub-agent [bold]{name}[/bold]")
-                        console.print("  [dim]Type input to send to it, use /agent-back to return[/dim]\n")
+                        console.print("  [dim]Type input to send to it, use /agent-back or Ctrl+E to return[/dim]\n")
                         _echo_remote(f"Switched to sub-agent '{name}'")
                         continue
 
-                    elif cmd == "/agent-back":
+                    elif cmd in ("/agent-back", "/back"):
                         if not focused_agent:
                             console.print("  [dim]Not currently focused on a sub-agent.[/dim]")
                             continue
@@ -2019,6 +2358,40 @@ if __name__ == '__main__':
                         sub_agent_manager.set_focused(None)
                         console.print(f"  [yellow]\u25b6[/yellow] Switched back to parent agent [dim](from {name})[/dim]")
                         _echo_remote(f"Switched back to parent agent (from {name})")
+                        continue
+
+                    elif cmd == "/pause":
+                        name = cmd_arg.strip()
+                        if not name:
+                            console.print("  [dim]Usage: /pause <sub_agent_name>[/dim]")
+                            continue
+                        if sub_agent_manager.pause(name):
+                            console.print(f"  [yellow]\u23f8[/yellow] Paused sub-agent [bold]{name}[/bold] [dim](flushed its queue; type to it while focused to continue)[/dim]")
+                            _echo_remote(f"Paused sub-agent '{name}'")
+                        else:
+                            console.print(f"  [yellow]\u26a0[/yellow] Sub-agent '[bold]{name}[/bold]' not found")
+                        continue
+
+                    elif cmd == "/kill":
+                        name = cmd_arg.strip()
+                        if not name:
+                            console.print("  [dim]Usage: /kill <sub_agent_name> [--yes][/dim]")
+                            continue
+                        confirmed = "--yes" in name
+                        name = name.replace("--yes", "").strip()
+                        if not sub_agent_manager.get(name):
+                            console.print(f"  [yellow]\u26a0[/yellow] Sub-agent '[bold]{name}[/bold]' not found")
+                            continue
+                        if not confirmed:
+                            console.print(
+                                f"  [red]\u26a0[/red] Permanently destroy sub-agent "
+                                f"[bold]{name}[/bold] and erase its session? "
+                                f"[white]/kill {name} --yes[/white] to confirm."
+                            )
+                            continue
+                        if sub_agent_manager.delete(name):
+                            console.print(f"  [red]\u2717[/red] Deleted sub-agent [bold]{name}[/bold]")
+                            _echo_remote(f"Deleted sub-agent '{name}'")
                         continue
 
                     elif cmd == "/telegram-auth":
@@ -2864,10 +3237,31 @@ if __name__ == '__main__':
                             "  [cyan]/agents[/cyan]              [dim]List running/completed sub-agents[/dim]"
                         )
                         console.print(
-                            "  [cyan]/agent[/cyan] [dim]<name>[/dim]          [dim]Switch focus to a sub-agent[/dim]"
+                            "  [cyan]/agents --watch[/cyan]      [dim]Live-refreshing table (Ctrl+C to stop)[/dim]"
                         )
                         console.print(
-                            "  [cyan]/agent-back[/cyan]          [dim]Return focus to parent agent[/dim]"
+                            "  [cyan]/agents --purge[/cyan]      [dim]Remove restored (previous-run) sub-agent sessions[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/agent[/cyan] [dim]<#|name>[/dim]       [dim]Switch focus by index or name[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/agent-back[/cyan] [dim](/back)[/dim] [dim]Return focus to parent agent[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/pause[/cyan] [dim]<name>[/dim]         [dim]Pause a running sub-agent[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]/kill[/cyan] [dim]<name> --yes[/dim]     [dim]Permanently destroy a sub-agent[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]Ctrl+E[/cyan] / [cyan]F4[/cyan]          [dim]Cycle sub-agent focus[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]Ctrl+B[/cyan]                [dim]Background the focused agent's running command[/dim]"
+                        )
+                        console.print(
+                            "  [cyan]Ctrl+C[/cyan]                [dim]1st: stop focused agent · 2nd: warn+save · 3rd: exit[/dim]"
                         )
                         console.print()
                         console.print("  [bold]Models & Providers[/bold]")
@@ -2972,12 +3366,13 @@ if __name__ == '__main__':
                 # notification routed back into the sub-agent that produced
                 # it makes it run a new turn, complete again, and re-notify
                 # forever (infinite loop).
-                # The sub-agent renders its own output via TeeWriter, so no
-                # need to print the returned result text (avoids double-render).
+                # Input is QUEUED if the agent is busy — the prompt returns
+                # instantly and the agent self-renders its output via the
+                # TeeWriter (no double-print, no frozen terminal).
                 if focused_agent and not _system_input:
                     try:
                         loop.run_until_complete(
-                            sub_agent_manager.run(focused_agent, user_input)
+                            sub_agent_manager.queue_input(focused_agent, user_input)
                         )
                     except KeyError:
                         console.print(f"  [red]\u2717[/red] Sub-agent '[bold]{focused_agent}[/bold]' not found. Switching back.")
@@ -3192,6 +3587,14 @@ if __name__ == '__main__':
                 # Auto-save session after each exchange
                 agent.save_session(str(session_path))
 
+                # Graceful hard-exit (double Ctrl+C during a parent turn):
+                # the agent loop unwound at an iteration boundary; save and exit.
+                if is_hard_exit_requested():
+                    clear_hard_exit()
+                    cleanup_and_save()
+                    console.print("\n  [dim]Session saved. Goodbye![/dim]")
+                    break
+
                 # Send response back to remote provider if input was from one
                 if current_remote_msg is not None and result is not None:
                     _rm = current_remote_msg
@@ -3262,6 +3665,11 @@ if __name__ == '__main__':
 
         # Clean up the event loop
         try:
+            # Suppress asyncio's default exception handler so that
+            # "Task exception was never retrieved" during loop.close()
+            # doesn't cascade into prompt_toolkit trying to schedule
+            # on the already-closed loop.
+            loop.set_exception_handler(lambda loop, ctx: None)
             loop.close()
         except:
             pass
