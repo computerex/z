@@ -1464,26 +1464,37 @@ if __name__ == '__main__':
         )
 
         # Capture a reference to the prompt_toolkit Application so the
-        # background polling thread can wake prompt_toolkit from outside
-        # the event loop (get_app() uses thread-local storage).
-        _pt_app_captured = [False]  # mutable nonlocal singleton
+        # prompt-side completion watcher (and the background polling thread)
+        # can act on the prompt from the event loop (get_app() uses
+        # thread-local storage, so pre_run is the hook point).
+        _pt_app_holder: Dict[str, Any] = {}  # {"app": <prompt_toolkit Application>}
         if remote_manager and remote_manager.has_providers():
             from .remote.base import set_pt_app
 
             def _capture_pt_app():
-                if not _pt_app_captured[0]:
-                    _pt_app_captured[0] = True
-                    try:
-                        from prompt_toolkit.application.current import get_app
-                        set_pt_app(get_app())
-                    except Exception:
-                        pass
+                try:
+                    from prompt_toolkit.application.current import get_app
+
+                    _app = get_app()
+                    _pt_app_holder["app"] = _app
+                    set_pt_app(_app)
+                except Exception:
+                    pass
         else:
+
             def _capture_pt_app():
-                pass  # no remote providers — nothing to capture
+                try:
+                    from prompt_toolkit.application.current import get_app
+
+                    _pt_app_holder["app"] = get_app()
+                except Exception:
+                    pass
 
         last_interrupt_time = 0  # Track time of last Ctrl+C for double-tap exit
         focused_agent: Optional[str] = None  # Name of sub-agent currently focused
+        # User text preserved when a sub-agent completion aborts the prompt —
+        # restored as the next prompt's default so typing is never lost.
+        _preserved_typed: List[str] = [""]
         current_remote_msg: Optional["RemoteMessage"] = None
         # Track the last remote chat that sent a message, for routing cron results
         _last_remote_chat: Optional[tuple[str, str]] = None  # (provider, chat_id)
@@ -1620,16 +1631,77 @@ if __name__ == '__main__':
                             # raw=True: pass sub-agent ANSI output through
                             # verbatim — the default ANSI re-processing wraps
                             # every character in its own escape sequence.
+                            #
+                            # The prompt is RACED against a sub-agent
+                            # completion watcher: while the REPL sits inside
+                            # prompt_async() nothing polls check_completed(),
+                            # so a sub-agent that finishes while the prompt is
+                            # idle would stay silent until the user pressed
+                            # Enter. When the watcher fires first, the prompt
+                            # is exited (preserving any in-progress typing as
+                            # the next prompt's default) and the completion
+                            # notification is delivered immediately below.
                             from prompt_toolkit.patch_stdout import (
                                 patch_stdout as _patch_stdout,
                             )
 
-                            with _patch_stdout(raw=True):
-                                user_input = loop.run_until_complete(
+                            async def _completion_watch(interval: float = 0.5):
+                                """Wait until any sub-agent has an
+                                unconsumed completion notification."""
+                                while True:
+                                    if sub_agent_manager.peek_completed():
+                                        return True
+                                    await asyncio.sleep(interval)
+
+                            async def _prompt_race():
+                                _pt_app_holder.pop("app", None)
+                                prompt_task = asyncio.ensure_future(
                                     prompt_session.prompt_async(
                                         _build_prompt_text,
                                         pre_run=_capture_pt_app,
+                                        default=_preserved_typed[0],
                                     )
+                                )
+                                _preserved_typed[0] = ""
+                                if not sub_agent_manager:
+                                    return await prompt_task
+                                watch_task = asyncio.ensure_future(
+                                    _completion_watch()
+                                )
+                                done, _pending = await asyncio.wait(
+                                    {prompt_task, watch_task},
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if watch_task in done:
+                                    # A sub-agent completed while the prompt
+                                    # was up. Exit the prompt app gracefully,
+                                    # preserving any typed text for the next
+                                    # prompt iteration.
+                                    try:
+                                        _app = _pt_app_holder.get("app")
+                                        if _app is not None and _app.is_running:
+                                            _typed = _app.current_buffer.text
+                                            if _typed:
+                                                _preserved_typed[0] = _typed
+                                            _app.exit(result="")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        return await asyncio.wait_for(
+                                            prompt_task, timeout=5.0
+                                        )
+                                    except Exception:
+                                        log.warning(
+                                            "Prompt did not exit after completion"
+                                            " notification; returning empty input"
+                                        )
+                                        return ""
+                                watch_task.cancel()
+                                return await prompt_task
+
+                            with _patch_stdout(raw=True):
+                                user_input = loop.run_until_complete(
+                                    _prompt_race()
                                 ).strip()
                             # Check for sub-agent completed while user was typing.
                             # If the user actually typed something, keep THEIR

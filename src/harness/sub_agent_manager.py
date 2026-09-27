@@ -457,6 +457,19 @@ class SubAgentManager:
                 return name
         return None
 
+    def peek_completed(self) -> Optional[str]:
+        """Non-consuming variant of check_completed().
+
+        Used by the prompt-side watcher to detect a completion while the
+        REPL sits inside prompt_async() without claiming the notification —
+        the consuming check_completed() call that follows the prompt still
+        owns injecting it.
+        """
+        for name, inst in self._agents.items():
+            if inst.status == "completed" and not inst.completion_notified:
+                return name
+        return None
+
     def requeue_notification(self, name: str) -> None:
         """Undo a check_completed() consumption so the notification fires
         again on the next idle REPL cycle.
