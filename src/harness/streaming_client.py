@@ -3,6 +3,7 @@
 import os
 import asyncio
 import time
+import uuid
 from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass
 
@@ -199,6 +200,26 @@ def _extract_reasoning_from_delta(delta: Any) -> Optional[str]:
     return rc or None
 
 
+def _normalize_base_url(base_url: str) -> str:
+    """Normalise a provider base URL for LiteLLM.
+
+    Users frequently paste the *full* POST endpoint (e.g. opencode's docs list
+    ``https://opencode.ai/inference/go/openai/v1/chat/completions`` as the URL
+    to call).  LiteLLM's OpenAI-compatible handlers append the endpoint path
+    themselves, so a base_url that already ends in the endpoint produces a
+    doubled path (``.../chat/completions/chat/completions``) and a 404.
+    Strip known endpoint suffixes so both forms work.
+    """
+    if not base_url:
+        return ""
+    url = base_url.rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/messages", "/responses"):
+        if url.lower().endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+            break
+    return url
+
+
 def _normalize_model_name(model: str, base_url: str = "") -> str:
     """Normalize model name for LiteLLM.
 
@@ -307,6 +328,7 @@ class StreamingJSONClient:
         max_tokens: int = 4096,
         timeout: float = 120.0,
         max_retries: int = 3,
+        session_id: Optional[str] = None,
     ):
         """Initialize LiteLLM client.
 
@@ -318,9 +340,12 @@ class StreamingJSONClient:
             max_tokens: Maximum tokens to generate
             timeout: Request timeout in seconds
             max_retries: Maximum retry attempts on failure
+            session_id: Stable conversation identifier. Used for providers that
+                require a session header (e.g. opencode.ai ``x-opencode-session``).
+                A per-client UUID is generated when omitted.
         """
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/") if base_url else ""
+        self.base_url = _normalize_base_url(base_url)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -328,6 +353,7 @@ class StreamingJSONClient:
         self.max_retries = max_retries
         self.reasoning_effort: str = "high"  # Set externally by caller
         self.response_format: Optional[Dict[str, Any]] = None  # Set externally for --json mode
+        self.session_id = session_id or uuid.uuid4().hex
 
         # Check if using OAuth token
         self._is_oauth = is_oauth_token(api_key)
@@ -569,17 +595,20 @@ class StreamingJSONClient:
             or self.base_url
             and any(
                 d in self.base_url.lower()
-                for d in ("fireworks.ai", "api.deepseek.com", "api.groq.com")
+                for d in ("fireworks.ai", "api.deepseek.com", "api.groq.com", "opencode.ai")
             )
         )
 
         # Providers that need ``allowed_openai_params`` so LiteLLM forwards
         # ``reasoning_effort`` instead of raising UnsupportedParamsError.
+        # (opencode.ai accepts ``reasoning_effort`` but its models are not in
+        # LiteLLM's registry, so the param is rejected client-side unless
+        # explicitly allow-listed — verified with live requests.)
         _needs_allowed_reasoning_params = (
             self.base_url
             and any(
                 d in self.base_url.lower()
-                for d in ("fireworks.ai", "api.deepinfra.com")
+                for d in ("fireworks.ai", "api.deepinfra.com", "opencode.ai")
             )
         )
 
@@ -595,10 +624,13 @@ class StreamingJSONClient:
         )
 
         # ZAI native reasoning stream (Claude/Cursor-like visible thinking).
-        # Safe no-op for providers that ignore unknown fields.
+        # Only valid for Anthropic/Claude models proxied through Z AI — GLM
+        # and other models reject the ``thinking`` parameter with
+        # UnsupportedParamsError.
         if (
             self.base_url
             and "z.ai" in self.base_url.lower()
+            and _is_anthropic
             and os.environ.get("HARNESS_ENABLE_NATIVE_THINKING", "1") != "0"
         ):
             kwargs["thinking"] = {"type": "enabled"}
@@ -644,6 +676,17 @@ class StreamingJSONClient:
         # /v1/messages for Anthropic).
         if self.base_url and not _is_anthropic and "bedrock" not in self.litellm_model.lower():
             kwargs["api_base"] = self.base_url
+
+        # opencode.ai requires a stable per-conversation session header and
+        # prefers a real agent User-Agent over a generic SDK name (their edge
+        # blocks generic HTTP-library signatures and returns 400 MissingSessionID
+        # without the header — see https://opencode.ai/docs/go/).
+        if self.base_url and "opencode.ai" in self.base_url.lower():
+            extra_headers: Dict[str, str] = {
+                "User-Agent": "z-harness/1.0",
+                "x-opencode-session": self.session_id,
+            }
+            kwargs["extra_headers"] = extra_headers
 
         # Add timeout
         kwargs["timeout"] = self.timeout

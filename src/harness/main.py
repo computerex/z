@@ -831,6 +831,7 @@ async def _final_json_format_call(
         model=agent.config.model,
         temperature=0,               # deterministic for final formatting
         max_tokens=agent.config.max_tokens,
+        session_id=getattr(agent.config, "session_id", None),
     )
     client.response_format = {"type": "json_object"}
 
@@ -1391,6 +1392,10 @@ if __name__ == '__main__':
     # Session management
     current_session = args.session
     session_path = get_session_path(workspace, current_session)
+
+    # Expose the session name on the config so LLM clients can send a stable
+    # per-conversation session header (e.g. opencode.ai `x-opencode-session`).
+    config.session_id = current_session
 
     # Try to resume session unless --new
     if not args.new and session_path.exists():

@@ -64,6 +64,7 @@ class Config:
     workspace_path: Path = field(default_factory=lambda: Path.cwd())
     compaction_threshold: float = 0.85  # Start compaction at 85% of max_tokens
     reasoning_effort: str = "high"  # Reasoning effort: high, medium, low, none
+    session_id: Optional[str] = None  # Stable conversation id for session-aware providers
     plugins: list = field(default_factory=list)         # Extra plugin paths
     plugin_config: dict = field(default_factory=dict)   # Per-plugin config dicts
 

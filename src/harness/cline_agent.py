@@ -1001,6 +1001,15 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                         if getattr(m, "name", None)
                         else {}
                     ),
+                    # DeepSeek round-trip: thinking must survive /resume,
+                    # otherwise the model loses its prior reasoning across
+                    # session restarts (protocol stays valid via the
+                    # request-time setdefault, but the content is lost).
+                    **(
+                        {"reasoning_content": m.reasoning_content}
+                        if getattr(m, "reasoning_content", None)
+                        else {}
+                    ),
                 }
                 for m in self.messages
             ],
@@ -1036,6 +1045,8 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                     tool_calls=m.get("tool_calls"),
                     tool_call_id=m.get("tool_call_id"),
                     name=m.get("name"),
+                    # DeepSeek round-trip: restore prior-turn thinking
+                    reasoning_content=m.get("reasoning_content"),
                 )
                 for m in data["messages"]
             ]
@@ -1499,6 +1510,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
             model=self.config.model,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            session_id=getattr(self.config, "session_id", None),
         )
         client.reasoning_effort = getattr(self.config, "reasoning_effort", "high")
         await client.__aenter__()
@@ -1749,6 +1761,7 @@ Fired task prompts are injected as user messages when the harness is idle (betwe
                 model=self.config.model,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
+                session_id=getattr(self.config, "session_id", None),
             )
             new_client.reasoning_effort = getattr(self.config, "reasoning_effort", "high")
             # Grammar-constrained JSON output (--json flag)
