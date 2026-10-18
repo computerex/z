@@ -371,6 +371,10 @@ def _promote_to_background(self, proc, command: str, start_time: float,
         "started": start_time,
         "logs": output_lines.copy()[-200:],
         "log_file": log_path,
+        # Incremental-check cursor: the lines shown in this promotion
+        # message count as already delivered to the model.
+        "_total_lines": len(output_lines),
+        "_delivered": len(output_lines),
         "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
     }
     self.console.print(f"    [green]→ background[/green] [dim](ID: {proc_id}, PID: {proc.pid})[/dim]")
@@ -379,6 +383,9 @@ def _promote_to_background(self, proc, command: str, start_time: float,
         f"Command sent to background (ID: {proc_id}, PID: {proc.pid}).\n"
         f"Log file: {log_path}\n"
         f"Use read_file on the log file to inspect stdout/stderr at any time.\n"
+        f"Use check_background_process for status: checks are incremental (only new "
+        f"output is returned) and accept \"wait\": <seconds> to block until new "
+        f"output arrives or the process exits.\n"
         f"Output so far:\n{recent}"
     )
 
@@ -426,6 +433,10 @@ async def _run_background_command(self, command: str) -> str:
         "started": time.time(),
         "logs": initial_output.copy(),
         "log_file": log_path,
+        # Incremental-check cursor: the initial output shown in the launch
+        # message counts as already delivered to the model.
+        "_total_lines": len(initial_output),
+        "_delivered": len(initial_output),
         "task": asyncio.create_task(self._background_log_tailer(proc_id, proc, log_path)),
     }
 
@@ -434,7 +445,9 @@ async def _run_background_command(self, command: str) -> str:
         f"Command started in background (ID: {proc_id}, PID: {proc.pid}).\n"
         f"Log file: {log_path}\n"
         f"Use read_file on the log file to inspect stdout/stderr at any time.\n"
-        f"Use check_background_process for status and recent output.\n"
+        f"Use check_background_process for status: checks are incremental (only new "
+        f"output is returned) and accept \"wait\": <seconds> to block until new "
+        f"output arrives or the process exits.\n"
         f"Initial output:\n" + "\n".join(initial_output)
     )
 

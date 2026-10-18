@@ -94,12 +94,19 @@ TOOL_DEFS: List[ToolDef] = [
     ToolDef("list_background_processes", category="shell",
             description="List all background processes (ID, PID, status, elapsed, command)."),
     ToolDef("check_background_process", category="shell",
-            description="Check status and recent logs of a background process. "
-                        "Don't poll in a loop check once, do other work, check later.",
+            description="Check status and output of a background process. "
+                        "Checks are incremental: only output NEW since the last check is "
+                        "returned, and a check with no new output returns a one-line status. "
+                        "For long-running jobs pass wait (seconds) to block until new output "
+                        "arrives or the process exits instead of polling repeatedly.",
             params=[ToolParam("id", required=True,
                               description="The ID of the background process to check"),
                     ToolParam("lines",
-                              description="Number of recent log lines to return (default: 50)")]),
+                              description="Explicitly re-send the last N log lines in full "
+                                          "(default: incremental — only new lines since last check)"),
+                    ToolParam("wait",
+                              description="Seconds to wait for new output or process exit before "
+                                          "responding, max 300 (e.g. 120) — avoids repeated polling")]),
     ToolDef("stop_background_process",  category="shell",
             description="Terminate a background process. ONLY use when the user explicitly asks.",
             params=[ToolParam("id", required=True,
